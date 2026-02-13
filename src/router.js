@@ -142,6 +142,94 @@ function is139Flag(flag) {
     return s.includes('逸动') || s.includes('139') || s.includes('和彩云') || s.includes('移动');
 }
 
+function pickStringField(obj, keys) {
+    const o = obj && typeof obj === 'object' ? obj : {};
+    for (const k of Array.isArray(keys) ? keys : []) {
+        const v = o[k];
+        if (typeof v === 'string' && v.trim()) return v.trim();
+    }
+    return '';
+}
+
+function extractFirstUrl(text) {
+    const raw = String(text || '').trim();
+    if (!raw) return '';
+    const m = raw.match(/https?:\/\/[^\s"'<>]+/i);
+    if (!m) return '';
+    let url = String(m[0] || '').trim();
+    // Trim trailing punctuation commonly attached in copied text.
+    url = url.replace(/[)\],.。;；]+$/g, '');
+    return url;
+}
+
+function decodeMaybeJsonString(v) {
+    if (typeof v !== 'string') return null;
+    const t = v.trim();
+    if (!t) return null;
+    if (!(t.startsWith('{') && t.endsWith('}'))) return null;
+    try {
+        return JSON.parse(t);
+    } catch (_) {
+        return null;
+    }
+}
+
+function pickAnyList(node) {
+    const n = node && typeof node === 'object' ? node : null;
+    if (!n) return [];
+    const cands = [
+        n.list,
+        n.items,
+        n.files,
+        n.data && n.data.list,
+        n.data && n.data.items,
+        n.data && n.data.files,
+        n.data && n.data.data && n.data.data.list,
+        n.data && n.data.data && n.data.data.items,
+        n.data && n.data.data && n.data.data.files,
+    ];
+    for (const c of cands) {
+        if (Array.isArray(c)) return c;
+    }
+    return [];
+}
+
+function pickItemName(item) {
+    const it = item && typeof item === 'object' ? item : {};
+    return (
+        String(it.server_filename || it.file_name || it.filename || it.name || it.title || it.display_name || it.displayName || '').trim()
+    );
+}
+
+function isItemDir(item) {
+    const it = item && typeof item === 'object' ? item : {};
+    if (it.dir === true) return true;
+    if (Number(it.isdir) === 1) return true;
+    if (Number(it.file_type) === 0) return true;
+    if (String(it.type || '').toLowerCase() === 'folder') return true;
+    if (String(it.kind || '').toLowerCase() === 'folder') return true;
+    return false;
+}
+
+function pickItemId(item) {
+    const it = item && typeof item === 'object' ? item : {};
+    return String(it.fid || it.file_id || it.fileId || it.id || it.fs_id || it.fsid || '').trim();
+}
+
+function pickItemToken(item) {
+    const it = item && typeof item === 'object' ? item : {};
+    return String(it.fid_token || it.fidToken || it.token || it.file_token || '').trim();
+}
+
+function encodeB64Json(obj) {
+    try {
+        const s = JSON.stringify(obj && typeof obj === 'object' ? obj : {});
+        return Buffer.from(s, 'utf8').toString('base64');
+    } catch (_) {
+        return '';
+    }
+}
+
 /**
  * A function to initialize the router.
  *
@@ -161,8 +249,10 @@ export default async function router(fastify) {
     fastify.post('/play', async function (request, reply) {
         const body = request && request.body && typeof request.body === 'object' ? request.body : {};
         const flag = typeof body.flag === 'string' ? body.flag : '';
-        const playId = typeof body.id === 'string' ? body.id : '';
-        if (!flag || !playId) return reply.code(400).send({ ok: false, message: 'missing flag/id' });
+        let playId = typeof body.id === 'string' ? body.id : '';
+        const filename = pickStringField(body, ['filename', 'fileName', 'name']);
+        if (!flag) return reply.code(400).send({ ok: false, message: 'missing flag' });
+        if (!playId && !filename) return reply.code(400).send({ ok: false, message: 'missing id/filename' });
 
         const externalOrigin = getExternalOriginFromRequest(request);
 
@@ -181,6 +271,139 @@ export default async function router(fastify) {
         // 1) builtin pan resolver path
         if (panEnabled) {
             let route = isBaiduFlag(flag) ? '/api/baidu/play' : isQuarkFlag(flag) ? '/api/quark/play' : isUcFlag(flag) ? '/api/uc/play' : is139Flag(flag) ? '/api/139/play' : '';
+            const shareUrl =
+                pickStringField(body, ['url', 'shareUrl', 'shareURL', 'share_url']) ||
+                extractFirstUrl(flag) ||
+                '';
+
+            const injectJson = async (url, payload) => {
+                const injected = await fastify.inject({
+                    method: 'POST',
+                    url,
+                    headers: { ...baseHeaders, ...(tvUser ? { 'x-tv-user': tvUser } : {}) },
+                    payload: payload != null ? payload : {},
+                });
+                const parsed = parseJsonSafe(injected.payload);
+                return { statusCode: injected.statusCode || 0, parsed, raw: injected.payload };
+            };
+
+            const resolveBaiduIdByFilename = async () => {
+                if (!shareUrl) return { ok: false, message: 'missing share url (from url/shareUrl/flag)' };
+                const pwd = pickStringField(body, ['pwd', 'pass', 'passcode', 'code', 'password']);
+                const wanted = String(filename || '').trim();
+                if (!wanted) return { ok: false, message: 'missing filename' };
+
+                const seenDirs = new Set();
+                const q = ['']; // '' = root
+                let steps = 0;
+                let ctx = null;
+                while (q.length && steps < 200) {
+                    steps += 1;
+                    const dir = q.shift();
+                    const payload = { url: shareUrl, ...(pwd ? { pwd } : {}), ...(dir ? { dir } : {}) };
+                    const out = await injectJson('/api/baidu/share/list', payload);
+                    const resp = out && out.parsed && typeof out.parsed === 'object' ? out.parsed : null;
+                    if (!resp || resp.ok !== true) continue;
+                    if (!ctx && resp.ctx && typeof resp.ctx === 'object') ctx = resp.ctx;
+                    const list = pickAnyList(resp.data);
+                    for (const it of list) {
+                        const name = pickItemName(it);
+                        if (!name) continue;
+                        if (isItemDir(it)) {
+                            const nextDir = `${dir ? String(dir) : ''}/${name}`.replace(/\/{2,}/g, '/');
+                            const normalized = nextDir.startsWith('/') ? nextDir : `/${nextDir}`;
+                            if (!seenDirs.has(normalized)) {
+                                seenDirs.add(normalized);
+                                q.push(normalized);
+                            }
+                            continue;
+                        }
+                        if (name !== wanted) continue;
+                        const fsid = String((it && (it.fs_id ?? it.fsid)) || '').trim();
+                        if (!fsid) continue;
+                        const shareid = ctx ? String(ctx.shareid || ctx.share_id || '').trim() : '';
+                        const uk = ctx ? String(ctx.uk || ctx.share_uk || '').trim() : '';
+                        const surl = ctx ? String(ctx.surl || '').trim() : '';
+                        if (!shareid || !uk || !surl) return { ok: false, message: 'missing share ctx (surl/shareid/uk)' };
+                        const id = encodeB64Json({ surl, shareid, uk, fs_id: fsid, ...(pwd ? { pwd } : {}) });
+                        if (!id) return { ok: false, message: 'failed to encode id' };
+                        return { ok: true, id };
+                    }
+                }
+                return { ok: false, message: 'file not found in share list' };
+            };
+
+            const resolveQuarkLikeIdByFilename = async (provider) => {
+                const base = provider === 'uc' ? '/api/uc' : '/api/quark';
+                if (!shareUrl) return { ok: false, message: 'missing share url (from url/shareUrl/flag)' };
+                const wanted = String(filename || '').trim();
+                if (!wanted) return { ok: false, message: 'missing filename' };
+                const passcode = pickStringField(body, ['pwd', 'pass', 'passcode', 'code', 'password']);
+
+                const parsed = await injectJson(`${base}/share/parse`, { url: shareUrl });
+                const p = parsed && parsed.parsed && typeof parsed.parsed === 'object' ? parsed.parsed : null;
+                const shareId = p && p.ok === true ? String(p.shareId || '').trim() : '';
+                if (!shareId) return { ok: false, message: 'invalid share url' };
+
+                const seen = new Set();
+                const q = ['0'];
+                let steps = 0;
+                while (q.length && steps < 300) {
+                    steps += 1;
+                    const pdirFid = String(q.shift() || '0').trim() || '0';
+                    if (seen.has(pdirFid)) continue;
+                    seen.add(pdirFid);
+                    const detailOut = await injectJson(`${base}/share/detail`, { shareId, ...(passcode ? { passcode } : {}), pdir_fid: pdirFid });
+                    const d = detailOut && detailOut.parsed && typeof detailOut.parsed === 'object' ? detailOut.parsed : null;
+                    if (!d || d.ok !== true) continue;
+                    const stoken = String(d.stoken || '').trim();
+                    const detail = d.detail && typeof d.detail === 'object' ? d.detail : {};
+                    const list = pickAnyList(detail);
+                    for (const it of list) {
+                        const name = pickItemName(it);
+                        if (!name) continue;
+                        if (isItemDir(it)) {
+                            const id = pickItemId(it);
+                            if (id && id !== '0') q.push(id);
+                            continue;
+                        }
+                        if (name !== wanted) continue;
+                        const fid = pickItemId(it);
+                        const fidToken = pickItemToken(it);
+                        if (!fid) continue;
+                        const id = `${shareId}*${stoken}*${fid}*${fidToken}***${wanted}`;
+                        return { ok: true, id };
+                    }
+                }
+                return { ok: false, message: 'file not found in share detail' };
+            };
+
+            // If caller provided only filename, try resolving it to a provider-specific id first.
+            // Note: this might perform multiple share-detail/list requests for nested directories.
+            if (!playId && filename && route) {
+                if (route === '/api/139/play') {
+                    return reply.code(200).send({ ok: false, url: '', playUrl: '', downloadUrl: '', message: 'filename not supported for 139 (missing id)' });
+                }
+                try {
+                    const res =
+                        route === '/api/baidu/play'
+                            ? await resolveBaiduIdByFilename()
+                            : route === '/api/quark/play'
+                                ? await resolveQuarkLikeIdByFilename('quark')
+                                : route === '/api/uc/play'
+                                    ? await resolveQuarkLikeIdByFilename('uc')
+                                    : { ok: false, message: 'unsupported provider' };
+                    if (!res || res.ok !== true || !res.id) {
+                        return reply.code(200).send({ ok: false, url: '', playUrl: '', downloadUrl: '', message: (res && res.message) ? String(res.message) : 'resolve id failed' });
+                    }
+                    playId = String(res.id || '').trim();
+                    body.id = playId;
+                } catch (e) {
+                    const msg = (e && e.message) ? String(e.message) : String(e);
+                    return reply.code(200).send({ ok: false, url: '', playUrl: '', downloadUrl: '', message: msg.slice(0, 400) });
+                }
+            }
+
             // If the id is already a Quark file id (32-hex), skip save/transfer and request a direct url.
             if (route === '/api/quark/play' && looksLikeHexId32(playId)) {
                 route = '/api/quark/download';
@@ -227,6 +450,9 @@ export default async function router(fastify) {
                 return reply.code(injected.statusCode || 200).send(parsed != null ? parsed : injected.payload);
             }
         }
+
+        // If we reached here with only filename, we cannot proceed (either pan resolver is disabled or the flag didn't match).
+        if (!playId) return reply.code(400).send({ ok: false, message: 'missing id (pan resolver disabled or unsupported flag)' });
 
         // 2) fallback: forward to the site runtime play
         const siteApi =
