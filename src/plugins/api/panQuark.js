@@ -891,8 +891,36 @@ async function getShareDetail({ shareId, stoken, passcode, cookie, pdirFid }) {
   const dir = String(pdirFid || '0').trim() || '0';
   const url = 'https://drive.quark.cn/1/clouddrive/share/sharepage/detail?pr=ucpro&fr=pc';
   const body = { pwd_id: pwdId, stoken: sToken, pdir_fid: dir, _fetch_total: 1, _size: 200 };
-  const detail = await fetchJson(url, { method: 'POST', headers, body: JSON.stringify(body) });
-  return { shareId: pwdId, stoken: sToken, detail, raw };
+
+  // Quark deployments differ:
+  // - some accept POST JSON body
+  // - others accept only GET with query params (405 on POST)
+  const attempts = [
+    async () => await fetchJson(url, { method: 'POST', headers, body: JSON.stringify(body) }),
+    async () => {
+      const u = new URL(url);
+      u.searchParams.set('pwd_id', pwdId);
+      u.searchParams.set('stoken', sToken);
+      u.searchParams.set('pdir_fid', dir);
+      // best-effort pagination knobs (some clients include these)
+      u.searchParams.set('force', '0');
+      u.searchParams.set('_page', '1');
+      u.searchParams.set('_size', '200');
+      u.searchParams.set('_sort', 'file_type:asc,file_name:asc');
+      return await fetchJson(u.toString(), { method: 'GET', headers });
+    },
+  ];
+
+  let lastErr = null;
+  for (const fn of attempts) {
+    try {
+      const detail = await fn();
+      return { shareId: pwdId, stoken: sToken, detail, raw };
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('share detail failed');
 }
 
 async function quarkFileInfo({ fid, cookie }) {
