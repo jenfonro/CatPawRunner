@@ -468,17 +468,24 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 		      const h = __normalizeHost(host);
 		      return !!(h && (h === 'quark.cn' || h.endsWith('.quark.cn')));
 		    };
-		    const __isUcHost = (host) => {
-		      const h = __normalizeHost(host);
-		      // UC APIs / share pages:
-		      // - drive.uc.cn
-		      // - pc-api.uc.cn
-		      // - open-api-drive.uc.cn
-		      return !!(h && (h === 'uc.cn' || h.endsWith('.uc.cn')));
-		    };
-		    const __mkInterceptLogPath = (name) => {
-		      try {
-		        const up = String(name || '').trim().toUpperCase();
+			    const __isUcHost = (host) => {
+			      const h = __normalizeHost(host);
+			      // UC APIs / share pages:
+			      // - drive.uc.cn
+			      // - pc-api.uc.cn
+			      // - open-api-drive.uc.cn
+			      return !!(h && (h === 'uc.cn' || h.endsWith('.uc.cn')));
+			    };
+			    const __is139Host = (host) => {
+			      const h = __normalizeHost(host);
+			      // 139Yun (移动云盘/和彩云):
+			      // - yun.139.com
+			      // - share-kd-njs.yun.139.com
+			      return !!(h && (h === 'yun.139.com' || h.endsWith('.yun.139.com')));
+			    };
+			    const __mkInterceptLogPath = (name) => {
+			      try {
+			        const up = String(name || '').trim().toUpperCase();
 		        const dir = String(process.env.CATPAW_MOCK_LOG_DIR || '').trim();
 		        const id = String(process.env.ONLINE_ID || '').trim() || 'online';
 		        const defaultName = String(name || 'pan') + '-intercept.' + id + '.log';
@@ -677,27 +684,156 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 
 		    // Interceptors (extensible for other pan providers).
 		    const __interceptors = [];
-		    const __quarkInterceptor = (() => {
-		      const enabled = __mockEnabled && __mockTargets.has('quark');
-		      const logPath = __mkInterceptLogPath('quark');
-		      const log = (obj) => __appendInterceptLog(__mockDebug && enabled, logPath, obj);
-		      return {
-		        name: 'quark',
-		        enabled,
-		        matchHost: (hostLike) => __isQuarkHost(hostLike),
-		        log,
-		        mock: (meta) => __quarkMockPayloadFor(meta),
-		      };
-		    })();
-		    if (__quarkInterceptor && __quarkInterceptor.enabled) {
-		      try { __quarkInterceptor.log({ type: 'boot', version: __mockVersion, targets: Array.from(__mockTargets) }); } catch (_) {}
-		      __interceptors.push(__quarkInterceptor);
-		    }
+			    const __quarkInterceptor = (() => {
+			      const enabled = __mockEnabled && __mockTargets.has('quark');
+			      const logPath = __mkInterceptLogPath('quark');
+			      const log = (obj) => __appendInterceptLog(__mockDebug && enabled, logPath, obj);
+			      return {
+			        name: 'quark',
+			        enabled,
+			        matchHost: (hostLike) => __isQuarkHost(hostLike),
+			        log,
+			        mock: (meta) => __quarkMockPayloadFor(meta),
+			      };
+			    })();
+			    if (__quarkInterceptor && __quarkInterceptor.enabled) {
+			      try { __quarkInterceptor.log({ type: 'boot', version: __mockVersion, targets: Array.from(__mockTargets) }); } catch (_) {}
+			      __interceptors.push(__quarkInterceptor);
+			    }
 
-			    const __ucMockPayloadFor = (meta) => {
-			      try {
-			        const pathLike = meta && meta.path ? String(meta.path) : '';
-			        const bodyLike = meta && meta.body ? String(meta.body) : '';
+				    const __pan139MockPayloadFor = (meta) => {
+				      try {
+				        const pathLike = meta && meta.path ? String(meta.path) : '';
+				        const bodyLike = meta && meta.body ? String(meta.body) : '';
+				        const nowS = () => Math.floor(Date.now() / 1000);
+				        const __key = Buffer.from('PVGDwmcvfs1uV3d1', 'utf8');
+				        const __b64Normalize = (s) => {
+				          try {
+				            let t = String(s == null ? '' : s).trim();
+				            if (!t) return '';
+				            t = t.replace(/\s+/g, '');
+				            t = t.replace(/-/g, '+').replace(/_/g, '/');
+				            const mod = t.length % 4;
+				            if (mod === 2) t += '==';
+				            else if (mod === 3) t += '=';
+				            return t;
+				          } catch (_) {
+				            return '';
+				          }
+				        };
+				        const __aesDec = (b64) => {
+				          const raw = Buffer.from(__b64Normalize(b64), 'base64');
+				          if (!raw || raw.length < 17) return '';
+				          const iv = raw.subarray(0, 16);
+				          const ct = raw.subarray(16);
+				          const decipher = nodeCrypto.createDecipheriv('aes-128-cbc', __key, iv);
+				          decipher.setAutoPadding(true);
+				          const out = Buffer.concat([decipher.update(ct), decipher.final()]);
+				          return out.toString('utf8');
+				        };
+				        const __aesEnc = (plainText) => {
+				          const iv = nodeCrypto.randomBytes(16);
+				          const cipher = nodeCrypto.createCipheriv('aes-128-cbc', __key, iv);
+				          cipher.setAutoPadding(true);
+				          const ct = Buffer.concat([cipher.update(Buffer.from(String(plainText || ''), 'utf8')), cipher.final()]);
+				          return Buffer.concat([iv, ct]).toString('base64');
+				        };
+
+				        const isOutLinkInfo = pathLike.includes('/IOutLink/getOutLinkInfoV6');
+
+				        const parseOutlinkReq = () => {
+				          try {
+				            const parsedBody = __tryParseJson(bodyLike);
+				            const enc = typeof parsedBody === 'string' ? parsedBody : typeof bodyLike === 'string' ? bodyLike.trim() : '';
+				            const dec = __aesDec(enc);
+				            const obj = __tryParseJson(dec) || {};
+				            const req = obj && typeof obj === 'object' ? obj.getOutLinkInfoReq : null;
+				            const linkID = req && typeof req === 'object' ? String(req.linkID || '').trim() : '';
+				            const pCaID = req && typeof req === 'object' ? String(req.pCaID || '').trim() : '';
+				            return { linkID, pCaID };
+				          } catch (_) {
+				            return { linkID: '', pCaID: '' };
+				          }
+				        };
+
+				        if (isOutLinkInfo) {
+				          const { linkID, pCaID } = parseOutlinkReq();
+				          const mkId = (salt) => {
+				            try {
+				              const s = String(salt || '');
+				              return nodeCrypto.createHash('md5').update(s, 'utf8').digest('hex');
+				            } catch (_) {
+				              return '0'.repeat(32);
+				            }
+				          };
+
+				          const p = String(pCaID || '').trim() || 'root';
+				          const coID = mkId('139:co:' + (linkID || '') + ':' + p);
+				          const outObj = {
+				            code: 0,
+				            message: 'ok',
+				            data: {
+				              caLst: null,
+				              coLst: [
+				                {
+				                  coType: 3,
+				                  coName: 'placeholder.mp4',
+				                  coID,
+				                  coSize: 874 * 1024 * 1024,
+				                },
+				              ],
+				            },
+				          };
+				          const enc = __aesEnc(JSON.stringify(outObj));
+				          return { kind: 'outlink_info', payload: JSON.stringify(enc) };
+				        }
+
+				        return {
+				          kind: 'blocked',
+				          payload: JSON.stringify({
+				            status: 200,
+				            code: 1,
+				            message: 'blocked by CATPAW_MOCK',
+				            provider: '139',
+				            path: pathLike,
+				            timestamp: nowS(),
+				            data: {},
+				          }),
+				        };
+				      } catch (_) {}
+				      return {
+				        kind: 'blocked',
+				        payload: JSON.stringify({
+			          status: 200,
+			          code: 1,
+			          message: 'blocked by CATPAW_MOCK',
+			          provider: '139',
+			          timestamp: Math.floor(Date.now() / 1000),
+			          data: {},
+			        }),
+			      };
+			    };
+			    const __pan139Interceptor = (() => {
+			      const enabled = __mockEnabled && __mockTargets.has('139');
+			      const logPath = __mkInterceptLogPath('139');
+			      const log = (obj) => __appendInterceptLog(__mockDebug && enabled, logPath, obj);
+			      return {
+			        name: '139',
+			        enabled,
+			        matchHost: (hostLike) => __is139Host(hostLike),
+			        log,
+			        mock: (meta) => __pan139MockPayloadFor(meta),
+			      };
+			    })();
+			    if (__pan139Interceptor && __pan139Interceptor.enabled) {
+			      try { __pan139Interceptor.log({ type: 'boot', version: __mockVersion, targets: Array.from(__mockTargets) }); } catch (_) {}
+			      __interceptors.push(__pan139Interceptor);
+			    }
+
+				    const __ucMockPayloadFor = (meta) => {
+				      try {
+				        const pathLike = meta && meta.path ? String(meta.path) : '';
+				        const bodyLike = meta && meta.body ? String(meta.body) : '';
 			        const nowS = () => Math.floor(Date.now() / 1000);
 			        const isToken = pathLike.startsWith('/1/clouddrive/share/sharepage/token');
 			        const isDetail = pathLike.startsWith('/1/clouddrive/share/sharepage/detail');
@@ -1130,10 +1266,11 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 		            }
 		          }
 
-	          let provider = '';
-	          if (__isQuarkHost(host)) provider = 'quark';
-	          else if (host.endsWith('uc.cn') || host.includes('open-api-drive.uc.cn')) provider = 'uc';
-	          else if (host.endsWith('baidu.com')) provider = 'baidu';
+		          let provider = '';
+		          if (__isQuarkHost(host)) provider = 'quark';
+		          else if (__isUcHost(host) || host.includes('open-api-drive.uc.cn')) provider = 'uc';
+		          else if (__is139Host(host)) provider = '139';
+		          else if (host.endsWith('baidu.com')) provider = 'baidu';
 
 		          if (provider) {
 		            const cookie = pickCookie(provider);
