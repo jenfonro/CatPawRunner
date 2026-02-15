@@ -7,17 +7,6 @@ import { findAvailablePortInRange } from './tool.js';
 const children = new Map(); // id -> { child, entry, port }
 const starting = new Map(); // id -> Promise<startResult>
 
-function readJsonFileSafe(filePath) {
-    try {
-        if (!filePath || !fs.existsSync(filePath)) return null;
-        const raw = fs.readFileSync(filePath, 'utf8');
-        const parsed = raw && raw.trim() ? JSON.parse(raw) : null;
-        return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
-    } catch (_) {
-        return null;
-    }
-}
-
 function getRootDir() {
     // Prefer the executable directory for pkg builds so `db.json` can sit next to the exe.
     try {
@@ -58,9 +47,6 @@ function findOnlineEntry(onlineDir) {
 
 export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[online]', entry: entryOverride = '' } = {}) {
     const rootDir = getRootDir();
-    const cfgPath = path.resolve(rootDir, 'config.json');
-    const cfg = readJsonFileSafe(cfgPath) || {};
-    const panMock = !!cfg.pan_mock;
     const onlineDir = path.resolve(rootDir, 'custom_spider');
     const entry =
         entryOverride && typeof entryOverride === 'string' && entryOverride.trim()
@@ -416,47 +402,11 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 	      }
 	      return '';
 	    };
-		    // Unified mock/debug switches:
-		    // - CATPAW_MOCK=1 enables interceptors (default target: quark)
-			    // - CATPAW_MOCK_PROVIDER=uc | quark | 139 | baidu (single) or CATPAW_MOCK_PROVIDERS=uc,quark,139,baidu
-		    // - CATPAW_MOCK_DEBUG (optional): when set, '1' enables log; any other value disables
-		    const __mockEnabled =
-		      String(process.env.CATPAW_MOCK || '').trim() === '1' ||
-		      // Backward-compat: the previous env name.
-		      String(process.env.CATPAW_BLOCK_QUARK || '').trim() === '1';
-		    const __mockDebug = (() => {
-		      try {
-		        if (!__mockEnabled) return false;
-		        const v = String(process.env.CATPAW_MOCK_DEBUG || '').trim();
-		        if (!v) return true;
-		        return v === '1';
-		      } catch (_) {
-		        return !!__mockEnabled;
-		      }
-		    })();
-			    const __mockTargets = (() => {
-		      const out = new Set();
-		      try {
-		        if (String(process.env.CATPAW_BLOCK_QUARK || '').trim() === '1') out.add('quark');
-		      } catch (_) {}
-		      try {
-		        const single = String(process.env.CATPAW_MOCK_PROVIDER || '').trim().toLowerCase();
-		        if (single) out.add(single);
-		      } catch (_) {}
-		      try {
-		        const list = String(process.env.CATPAW_MOCK_PROVIDERS || '').trim().toLowerCase();
-		        if (list) {
-		          list
-		            .split(',')
-		            .map((s) => String(s || '').trim())
-		            .filter(Boolean)
-		            .forEach((s) => out.add(s));
-		        }
-		      } catch (_) {}
-		      if (!out.size && __mockEnabled) out.add('quark');
-		      return out;
-			    })();
-			    const __mockVersion = 'catpaw-mock-2026-02-15a';
+		    // Legacy mock/tape/trace debugging removed (cookie injection only).
+		    const __mockEnabled = false;
+		    const __mockDebug = false;
+		    const __mockTargets = new Set();
+		    const __mockVersion = 'catpaw-runtime';
 			    const __normalizeHost = (raw) => {
 			      try {
 			        let h = String(raw == null ? '' : raw).trim().toLowerCase();
@@ -549,43 +499,12 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 				      }
 				    };
 				    const __mkInterceptLogPath = (name) => {
-				      try {
-				        const up = String(name || '').trim().toUpperCase();
-			        const dirRaw = String(process.env.CATPAW_MOCK_LOG_DIR || '').trim();
-			        const dir = dirRaw ? (path.isAbsolute(dirRaw) ? dirRaw : path.resolve(__logRoot, dirRaw)) : '';
-			        const id = String(process.env.ONLINE_ID || '').trim() || 'online';
-			        const defaultName = String(name || 'pan') + '-intercept.' + id + '.log';
-			        const p =
-			          String(process.env['CATPAW_MOCK_' + up + '_LOG_PATH'] || '').trim() ||
-			          String(process.env['CATPAW_BLOCK_' + up + '_LOG_PATH'] || '').trim() ||
-			          (name === 'quark'
-			            ? (String(process.env.CATPAW_BLOCK_QUARK_LOG_PATH || '').trim() || String(process.env.CATPAW_QUARK_LOG_PATH || '').trim())
-			            : '') ||
-			          (dir ? path.resolve(dir, defaultName) : '');
-			        if (p) return path.isAbsolute(p) ? p : path.resolve(__logRoot, p);
-			      } catch (_) {}
-			      try {
-			        const id = String(process.env.ONLINE_ID || '').trim() || 'online';
-			        const base = String(name || 'pan') + '-intercept.';
-			        return path.resolve(__logRoot, base + id + '.log');
-			      } catch (_) {
-			        return '';
-			      }
+				      return '';
 			    };
 			    const __appendInterceptLog = (enabled, logPath, obj) => {
-			      try {
-			        if (!enabled || !logPath) return;
-			        const line = JSON.stringify({ t: Date.now(), ...obj });
-			        fs.appendFileSync(logPath, line + String.fromCharCode(10));
-			      } catch (_) {}
+			      return;
 			    };
-			    const __wantMockStack = (() => {
-			      try {
-			        return String(process.env.CATPAW_MOCK_STACK || '').trim() === '1';
-			      } catch (_) {
-			        return false;
-			      }
-			    })();
+			    const __wantMockStack = false;
 
 			    // Tape (record/replay) for pan-provider HTTP flows.
 			    // - CATPAW_TAPE=record|replay|off
@@ -596,54 +515,11 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			    // - CATPAW_TAPE_STRICT=1 (replay: throw if missing; default passthrough)
 			    // - CATPAW_TAPE_REQ_LIMIT_BYTES (default 262144; 0 => unlimited)
 			    // - CATPAW_TAPE_RES_LIMIT_BYTES (default 2097152; 0 => unlimited)
-			    const __tapeMode = (() => {
-			      try {
-			        const v = String(process.env.CATPAW_TAPE || '').trim().toLowerCase();
-			        if (v === 'record' || v === 'replay' || v === 'off') return v;
-			        return 'off';
-			      } catch (_) {
-			        return 'off';
-			      }
-			    })();
-			    const __tapeStrict = String(process.env.CATPAW_TAPE_STRICT || '').trim() === '1';
-			    const __tapeReqLimit = (() => {
-			      try {
-			        const v = Number(String(process.env.CATPAW_TAPE_REQ_LIMIT_BYTES || '').trim() || '262144');
-			        if (!Number.isFinite(v)) return 262144;
-			        if (v === 0) return Number.MAX_SAFE_INTEGER;
-			        return v > 0 ? Math.floor(v) : 262144;
-			      } catch (_) {
-			        return 262144;
-			      }
-			    })();
-			    const __tapeResLimit = (() => {
-			      try {
-			        const v = Number(String(process.env.CATPAW_TAPE_RES_LIMIT_BYTES || '').trim() || '2097152');
-			        if (!Number.isFinite(v)) return 2097152;
-			        if (v === 0) return Number.MAX_SAFE_INTEGER;
-			        return v > 0 ? Math.floor(v) : 2097152;
-			      } catch (_) {
-			        return 2097152;
-			      }
-			    })();
-			    const __tapeTargets = (() => {
-			      const out = new Set();
-			      try {
-			        const single = String(process.env.CATPAW_TAPE_PROVIDER || '').trim().toLowerCase();
-			        if (single) out.add(single);
-			      } catch (_) {}
-			      try {
-			        const list = String(process.env.CATPAW_TAPE_PROVIDERS || '').trim().toLowerCase();
-			        if (list) {
-			          list
-			            .split(',')
-			            .map((s) => String(s || '').trim())
-			            .filter(Boolean)
-			            .forEach((s) => out.add(s));
-			        }
-			      } catch (_) {}
-			      return out;
-			    })();
+			    const __tapeMode = 'off';
+			    const __tapeStrict = false;
+			    const __tapeReqLimit = 262144;
+			    const __tapeResLimit = 2097152;
+			    const __tapeTargets = new Set();
 			    const __mkTapePath = (provider) => {
 			      try {
 			        const id = String(process.env.ONLINE_ID || '').trim() || 'online';
@@ -2562,43 +2438,26 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 		            const timer = setTimeout(() => finish({ ok: false, timeout: true, port: expectedPort }), timeoutMs);
 		        });
 
-	    const onlineLogPath = wantDebug ? path.resolve(rootDir, `online-runtime.${key}.log`) : '';
-	    let chosenPort = p;
-		    for (let attempt = 0; attempt < 6; attempt += 1) {
-		        const mockProviders = 'quark,uc,139,baidu,tianyi';
-		        const mockEnv = panMock
-		            ? {
-		                CATPAW_MOCK: '1',
-		                CATPAW_MOCK_PROVIDER: '',
-		                CATPAW_MOCK_PROVIDERS: mockProviders,
-		                CATPAW_BLOCK_QUARK: '',
-		            }
-		            : {
-		                // Force disable even if parent process env has it set.
-		                CATPAW_MOCK: '',
-		                CATPAW_MOCK_PROVIDER: '',
-		                CATPAW_MOCK_PROVIDERS: '',
-		                CATPAW_BLOCK_QUARK: '',
-		            };
-		        const child = spawn(process.execPath, [bootstrapPath], {
-		            stdio,
-		            cwd: rootDir,
-		            env: {
-		                ...process.env,
-		                // Where to write intercept logs / tapes by default (so users can find them easily).
-		                CATPAW_LOG_ROOT: process.cwd(),
-		                DEV_HTTP_PORT: String(chosenPort),
-		                PORT: String(chosenPort),
-		                HTTP_PORT: String(chosenPort),
-		                ONLINE_ID: String(key),
-		                ONLINE_ENTRY: entry,
-		                ONLINE_CWD: rootDir,
-		                CATPAW_DEBUG_LOG: onlineLogPath,
-		                NODE_PATH: rootDir,
-		                ...mockEnv,
-		            },
-		        });
-		        children.set(key, { child, entry, port: chosenPort });
+		    const onlineLogPath = wantDebug ? path.resolve(rootDir, `online-runtime.${key}.log`) : '';
+		    let chosenPort = p;
+			    for (let attempt = 0; attempt < 6; attempt += 1) {
+			        const baseEnv = { ...process.env };
+			        const child = spawn(process.execPath, [bootstrapPath], {
+			            stdio,
+			            cwd: rootDir,
+			            env: {
+			                ...baseEnv,
+			                DEV_HTTP_PORT: String(chosenPort),
+			                PORT: String(chosenPort),
+			                HTTP_PORT: String(chosenPort),
+			                ONLINE_ID: String(key),
+			                ONLINE_ENTRY: entry,
+			                ONLINE_CWD: rootDir,
+			                CATPAW_DEBUG_LOG: onlineLogPath,
+			                NODE_PATH: rootDir,
+			            },
+			        });
+			        children.set(key, { child, entry, port: chosenPort });
 
 	    // When debugging online runtimes, capture child output:
 	    // - dev: if CATPAW_LOG_FILE is set, forward to parent stdout/stderr (which are already redirected to file in dev.js)

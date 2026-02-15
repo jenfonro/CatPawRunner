@@ -3,7 +3,7 @@
 // - POST /api/189/share/info
 // - POST /api/189/share/list
 // - POST /api/189/file/download
-// - POST /api/189/play  (id: shareId*fileId*fileName)
+// - POST /api/189/play  (id: fileId*shareId*fileName)
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -431,20 +431,12 @@ async function login189WithPassword({ username, password }) {
   return { cookie, jar };
 }
 
-let tianyiCookieMemo = '';
 let tianyiLoginInFlight = null;
 
 async function ensure189Cookie({ forceRefresh = false } = {}) {
   const cfg = read189AccountFromConfig();
   const existing = toStr(cfg.cookie).trim();
-  if (!forceRefresh) {
-    const memo = toStr(tianyiCookieMemo).trim();
-    if (memo) return { cookie: memo, refreshed: false };
-    if (existing) {
-      tianyiCookieMemo = existing;
-      return { cookie: existing, refreshed: false };
-    }
-  }
+  if (!forceRefresh && existing) return { cookie: existing, refreshed: false };
 
   const username = toStr(cfg.username).trim();
   const password = toStr(cfg.password);
@@ -477,8 +469,6 @@ async function ensure189Cookie({ forceRefresh = false } = {}) {
           next.account = account;
           writeJsonFileAtomic(cfgPath, next);
         } catch (_) {}
-
-        tianyiCookieMemo = cookie;
         return cookie;
       } finally {
         tianyiLoginInFlight = null;
@@ -526,10 +516,51 @@ async function tianyiGetShareInfoByCode({ shareCode, accessCode, cookie }) {
   });
 }
 
+function pickTianyiResCode(resp) {
+  const r = resp && typeof resp === 'object' && !Array.isArray(resp) ? resp : null;
+  if (!r) return { code: null, msg: '' };
+  const codeRaw =
+    Object.prototype.hasOwnProperty.call(r, 'res_code')
+      ? r.res_code
+      : Object.prototype.hasOwnProperty.call(r, 'resCode')
+        ? r.resCode
+        : Object.prototype.hasOwnProperty.call(r, 'code')
+          ? r.code
+          : null;
+  const msgRaw =
+    Object.prototype.hasOwnProperty.call(r, 'res_message')
+      ? r.res_message
+      : Object.prototype.hasOwnProperty.call(r, 'resMessage')
+        ? r.resMessage
+        : Object.prototype.hasOwnProperty.call(r, 'message')
+          ? r.message
+          : '';
+  const code = Number.isFinite(Number(codeRaw)) ? Math.trunc(Number(codeRaw)) : codeRaw == null ? null : String(codeRaw);
+  const msg = toStr(msgRaw).trim();
+  return { code, msg };
+}
+
+function assertTianyiOk(resp, ctx) {
+  const { code, msg } = pickTianyiResCode(resp);
+  if (code === null) return;
+  if (code === 0 || code === '0') return;
+  const err = new Error(`${toStr(ctx).trim() || 'tianyi'}: ${msg || 'request failed'} (${String(code)})`);
+  err.body = resp;
+  err.res_code = code;
+  err.res_message = msg;
+  throw err;
+}
+
+function isTianyiSessionExpiredError(err) {
+  const m = toStr(err && err.message).toLowerCase();
+  if (!m) return false;
+  return m.includes('invalidsessionkey') || m.includes('usersessionbo is null') || m.includes('session expired');
+}
+
 async function tianyiListShareDir({ shareId, fileId, shareMode, pageNum, pageSize, orderBy, descending, accessCode, cookie }) {
   const fid = toStr(fileId || '0').trim() || '0';
   const desc = typeof descending === 'boolean' ? (descending ? 'true' : 'false') : toStr(descending || 'true');
-  const qsBase = {
+  const url = buildUrl('/api/open/share/listShareDir.action', {
     key: 'noCache',
     noCache: String(Math.random()),
     shareId,
@@ -543,21 +574,11 @@ async function tianyiListShareDir({ shareId, fileId, shareMode, pageNum, pageSiz
     orderBy: toStr(orderBy || 'lastOpTime').trim() || 'lastOpTime',
     descending: desc,
     ...(accessCode ? { accessCode } : {}),
-  };
-
-  const tryOnce = async (isFolder) => {
-    const url = buildUrl('/api/open/share/listShareDir.action', { ...qsBase, isFolder: isFolder ? 'true' : 'false' });
-    return await fetchTianyiJson(url, { method: 'GET', headers: buildTianyiHeaders({ cookie, referer: 'https://cloud.189.cn/' }) });
-  };
-
-  // The upstream API is picky about params; try folder mode first, then retry as file mode if it 400s.
-  try {
-    return await tryOnce(true);
-  } catch (e) {
-    const msg = toStr(e && e.message).toLowerCase();
-    if (msg.includes('http 400')) return await tryOnce(false);
-    throw e;
-  }
+  });
+  return await fetchTianyiJson(url, {
+    method: 'GET',
+    headers: buildTianyiHeaders({ cookie, referer: 'https://cloud.189.cn/' }),
+  });
 }
 
 async function tianyiGetFileDownloadUrl({ shareId, fileId, dt, accessCode, cookie }) {
@@ -605,6 +626,7 @@ export const apiPlugins = [
           const ensured = await ensure189Cookie();
           const cookie = toStr(ensured.cookie).trim();
           const out = await tianyiGetShareInfoByCode({ shareCode, accessCode, cookie });
+          assertTianyiOk(out.data, 'tianyi share info');
           return { ok: true, shareCode, info: out.data, rawText: out.text };
         } catch (e) {
           return reply.code(502).send({ ok: false, message: (e && e.message) || String(e) });
@@ -632,6 +654,7 @@ export const apiPlugins = [
             accessCode,
             cookie,
           });
+          assertTianyiOk(out.data, 'tianyi share list');
           return { ok: true, shareId, fileId, detail: out.data, rawText: out.text };
         } catch (e) {
           return reply.code(502).send({ ok: false, message: (e && e.message) || String(e) });
@@ -647,19 +670,27 @@ export const apiPlugins = [
         if (!fileId) return reply.code(400).send({ ok: false, message: 'missing fileId' });
 
         try {
-          const ensured = await ensure189Cookie();
+          let ensured = await ensure189Cookie();
           let cookie = toStr(ensured.cookie).trim();
           if (!cookie && ensured && ensured.missingCred) {
             return reply.code(400).send({ ok: false, message: 'missing 189 cookie; set account["189"].cookie or account["189"].username/password in config.json' });
           }
-          let out = await tianyiGetFileDownloadUrl({ shareId, fileId, dt: body.dt, accessCode, cookie });
-          // If cookie is missing/expired, try a forced refresh once.
-          if (!out || !out.data || extractFirstUrlFromTianyiDownloadResp(out.data) === '') {
-            const ensured2 = await ensure189Cookie({ forceRefresh: true });
-            cookie = toStr(ensured2.cookie).trim();
+          let out;
+          try {
             out = await tianyiGetFileDownloadUrl({ shareId, fileId, dt: body.dt, accessCode, cookie });
+            assertTianyiOk(out.data, 'tianyi file download');
+          } catch (e) {
+            if (isTianyiSessionExpiredError(e)) {
+              ensured = await ensure189Cookie({ forceRefresh: true });
+              cookie = toStr(ensured.cookie).trim();
+              out = await tianyiGetFileDownloadUrl({ shareId, fileId, dt: body.dt, accessCode, cookie });
+              assertTianyiOk(out.data, 'tianyi file download');
+            } else {
+              throw e;
+            }
           }
           const url0 = extractFirstUrlFromTianyiDownloadResp(out.data);
+          if (!url0) return reply.code(502).send({ ok: false, message: 'empty download url', data: out.data, rawText: out.text });
           const url = url0 ? await resolveFinalUrl(url0) : '';
           return { ok: true, shareId, fileId, url, data: out.data, rawText: out.text };
         } catch (e) {
@@ -679,19 +710,26 @@ export const apiPlugins = [
         if (!fileId) return reply.code(400).send({ ok: false, message: 'missing fileId (from id/fileId)' });
 
         try {
-          const ensured = await ensure189Cookie();
+          let ensured = await ensure189Cookie();
           let cookie = toStr(ensured.cookie).trim();
           if (!cookie && ensured && ensured.missingCred) {
             return reply.code(400).send({ ok: false, message: 'missing 189 cookie; set account["189"].cookie or account["189"].username/password in config.json' });
           }
-          let out = await tianyiGetFileDownloadUrl({ shareId, fileId, dt: body.dt, accessCode, cookie });
-          let url = extractFirstUrlFromTianyiDownloadResp(out.data);
-          if (!url) {
-            const ensured2 = await ensure189Cookie({ forceRefresh: true });
-            cookie = toStr(ensured2.cookie).trim();
+          let out;
+          try {
             out = await tianyiGetFileDownloadUrl({ shareId, fileId, dt: body.dt, accessCode, cookie });
-            url = extractFirstUrlFromTianyiDownloadResp(out.data);
+            assertTianyiOk(out.data, 'tianyi play');
+          } catch (e) {
+            if (isTianyiSessionExpiredError(e)) {
+              ensured = await ensure189Cookie({ forceRefresh: true });
+              cookie = toStr(ensured.cookie).trim();
+              out = await tianyiGetFileDownloadUrl({ shareId, fileId, dt: body.dt, accessCode, cookie });
+              assertTianyiOk(out.data, 'tianyi play');
+            } else {
+              throw e;
+            }
           }
+          let url = extractFirstUrlFromTianyiDownloadResp(out.data);
           if (!url) return reply.code(502).send({ ok: false, message: 'empty download url', data: out.data, rawText: out.text });
           url = await resolveFinalUrl(url);
           return {

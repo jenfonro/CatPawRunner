@@ -1,6 +1,5 @@
 {
   "proxy": "",
-  "pan_mock": false,
   "panBuiltinResolverEnabled": true,
   "onlineConfigs": [
     {
