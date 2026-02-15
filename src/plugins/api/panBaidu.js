@@ -223,6 +223,75 @@ function looksLikeCookieString(v) {
   return !!(s && s.includes('='));
 }
 
+function resolveRuntimeRootDir() {
+  try {
+    if (process && process.pkg && typeof process.execPath === 'string' && process.execPath) {
+      return path.dirname(process.execPath);
+    }
+  } catch {}
+  try {
+    const envRoot = typeof process.env.NODE_PATH === 'string' ? process.env.NODE_PATH.trim() : '';
+    if (envRoot) return path.resolve(envRoot);
+  } catch {}
+  return process.cwd();
+}
+
+function atomicWriteFile(filePath, content) {
+  const dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const tmp = path.resolve(dir, `.${path.basename(filePath)}.tmp.${process.pid}.${Date.now()}`);
+  fs.writeFileSync(tmp, content, 'utf8');
+  fs.renameSync(tmp, filePath);
+}
+
+function readTextFileSafe(filePath) {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return '';
+    return fs.readFileSync(filePath, 'utf8');
+  } catch {
+    return '';
+  }
+}
+
+function getErrorLogPath() {
+  try {
+    return path.resolve(resolveRuntimeRootDir(), 'error.log');
+  } catch {
+    return path.resolve(process.cwd(), 'error.log');
+  }
+}
+
+function upsertErrorLogBySurl(record) {
+  const r = record && typeof record === 'object' && !Array.isArray(record) ? record : null;
+  const surl = String((r && r.surl) || '').trim();
+  if (!surl) return;
+
+  const logPath = getErrorLogPath();
+  const raw = readTextFileSafe(logPath);
+  const map = new Map();
+  for (const line of raw.split(/\r?\n/)) {
+    const s = String(line || '').trim();
+    if (!s) continue;
+    try {
+      const obj = JSON.parse(s);
+      const key = String((obj && obj.surl) || '').trim();
+      if (key) map.set(key, obj);
+    } catch {}
+  }
+  map.set(surl, { t: Date.now(), provider: 'baidu', ...r });
+  const out = Array.from(map.entries())
+    .sort((a, b) => a[0].localeCompare(b[0], 'en'))
+    .map(([, v]) => JSON.stringify(v))
+    .join('\n');
+  atomicWriteFile(logPath, `${out}\n`);
+}
+
+function isBaiduNeedPwdError(err) {
+  const msg = String((err && err.message) || '').toLowerCase();
+  if (!msg) return false;
+  return msg.includes('密码') || msg.includes('提取码') || msg.includes('访问码') || msg.includes('need') && msg.includes('pwd');
+}
+
 async function readDbRoot(server) {
   try {
     const _ = server;
@@ -595,6 +664,14 @@ function decodePlayIdToJson(id) {
   }
 }
 
+function encodePlayIdFromJson(decodedObj, fileName) {
+  const obj = decodedObj && typeof decodedObj === 'object' && !Array.isArray(decodedObj) ? decodedObj : {};
+  const name = String(fileName || '').trim();
+  const b64 = Buffer.from(JSON.stringify(obj), 'utf8').toString('base64');
+  // Match existing decode logic: `decodePlayIdToJson` strips `|||...` suffix and extracts name via `extractNameFromTvServerId`.
+  return name ? `${b64}|||${name}` : b64;
+}
+
 function extractNameFromTvServerId(rawId) {
   const idStr = String(rawId || '');
   if (!idStr) return '';
@@ -887,6 +964,57 @@ const apiPlugins = [
         const root = await readDbRoot(req.server);
         const cookie = getBaiduCookieFromDbRoot(root);
         return { ok: true, hasCookie: !!cookie, features: { transferSupportsFlagId: true } };
+      });
+
+      // List share root files and return 0119-style `vod_play_url`.
+      // Input: { flag: "百度xxx-<surl>#..." , pwd? }  Output: { ok, vod_play_url }
+      instance.post('/list', async (req, reply) => {
+        const body = req && typeof req.body === 'object' ? req.body : {};
+        const flag = String(body.flag || '').trim();
+        const surl = parseSurlFromFlag(flag);
+        if (!surl) {
+          reply.code(400);
+          return { ok: false, message: 'missing/invalid flag (expected: 百度*-<surl>)' };
+        }
+        const root = await readDbRoot(req.server);
+        const baseCookie = getBaiduCookieFromDbRoot(root);
+        if (!baseCookie) {
+          reply.code(400);
+          return { ok: false, message: 'missing baidu cookie' };
+        }
+        try {
+          const pwd = String(body.pwd || body.pass || body.password || '').trim();
+          const rootList = await shareListRootScript({ baseCookie, surl, pwd });
+          const { shareid, uk } = rootList.ctx || {};
+          const list = getShareListArray(rootList.data);
+          const parts = [];
+          for (const it of list) {
+            if (!it || typeof it !== 'object') continue;
+            if (Number(it.isdir) === 1) continue;
+            const name = String(it.server_filename || it.filename || it.name || '').trim();
+            const fsid = String(it.fs_id || it.fsid || it.fsId || '').trim();
+            if (!name || !fsid) continue;
+            const playJson = { shareid, uk, fs_id: fsid, surl, pwd, realName: name };
+            const id = encodePlayIdFromJson(playJson, name);
+            parts.push(`${name}$${id}`);
+          }
+          return { ok: true, vod_play_url: parts.join('#') };
+        } catch (e) {
+          try {
+            const pwd2 = String(body.pwd || body.pass || body.password || '').trim();
+            if (isBaiduNeedPwdError(e)) {
+              upsertErrorLogBySurl({
+                api: '/api/baidu/list',
+                surl,
+                needPwd: true,
+                pwdProvided: !!pwd2,
+                message: String((e && e.message) || e).slice(0, 400),
+              });
+            }
+          } catch {}
+          reply.code(502);
+          return { ok: false, ...normalizeBaiduErr(e) };
+        }
       });
 
       instance.get('/auth/bdstoken', async (req, reply) => {

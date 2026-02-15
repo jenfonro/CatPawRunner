@@ -776,6 +776,18 @@ export const apiPlugins = [
           const isFolder = typeof info.isFolder === 'boolean' ? info.isFolder : String(info.isFolder || '').toLowerCase() === 'true';
           if (!shareId) return reply.code(502).send({ ok: false, message: 'tianyi share info: missing shareId', info });
           if (shareInfoRequiresAccessCode(info) && !accessCode) {
+            try {
+              upsertErrorLogByShareCode({
+                provider: '189',
+                api: '/api/189/list',
+                shareCode,
+                shareId,
+                needAccessCode: true,
+                accessCodeProvided: false,
+                code: info && Object.prototype.hasOwnProperty.call(info, 'res_code') ? info.res_code : null,
+                message: 'tianyi share requires accessCode',
+              });
+            } catch {}
             return reply.code(401).send({ ok: false, needAccessCode: true, message: 'tianyi share requires accessCode', shareCode, shareId, fileId: rootFileId });
           }
 

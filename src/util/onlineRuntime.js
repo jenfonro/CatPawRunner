@@ -402,10 +402,40 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 	      }
 	      return '';
 	    };
-		    // Legacy mock/tape/trace debugging removed (cookie injection only).
-		    const __mockEnabled = false;
-		    const __mockDebug = false;
-		    const __mockTargets = new Set();
+		    // Intercept capture (record request meta) for pan providers.
+		    // Enable via env: CATPAW_INTERCEPT=1
+		    // Optional: CATPAW_INTERCEPT_PROVIDERS=quark,uc,139,baidu,tianyi
+		    const __interceptEnabled = String(process.env.CATPAW_INTERCEPT || '').trim() === '1';
+		    const __interceptBodyLimit = (() => {
+		      const v = String(process.env.CATPAW_INTERCEPT_BODY_LIMIT || '').trim();
+		      if (!v) return 262144;
+		      const n = Math.trunc(Number(v));
+		      if (!Number.isFinite(n) || n < 0) return 262144;
+		      return n;
+		    })();
+		    const __interceptTargets = (() => {
+		      try {
+		        const raw = String(process.env.CATPAW_INTERCEPT_PROVIDERS || 'quark,uc,139,baidu,tianyi');
+		        const parts = raw.split(',').map((s) => String(s || '').trim()).filter(Boolean);
+		        return new Set(parts);
+		      } catch (_) {
+		        return new Set(['quark', 'uc', '139', 'baidu', 'tianyi']);
+		      }
+		    })();
+
+		    // Mock is separate; keep disabled by default.
+		    const __mockEnabled = String(process.env.CATPAW_MOCK || '').trim() === '1';
+		    const __mockDebug = String(process.env.CATPAW_MOCK_DEBUG || '').trim() === '1';
+		    const __mockTargets = (() => {
+		      try {
+		        const raw = String(process.env.CATPAW_MOCK_PROVIDERS || process.env.CATPAW_MOCK_PROVIDER || '').trim();
+		        if (!raw) return new Set();
+		        const parts = raw.split(',').map((s) => String(s || '').trim()).filter(Boolean);
+		        return new Set(parts);
+		      } catch (_) {
+		        return new Set();
+		      }
+		    })();
 		    const __mockVersion = 'catpaw-runtime';
 			    const __normalizeHost = (raw) => {
 			      try {
@@ -499,12 +529,231 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 				      }
 				    };
 				    const __mkInterceptLogPath = (name) => {
-				      return '';
+				      try {
+				        const id = String(process.env.ONLINE_ID || '').trim() || 'online';
+				        const n = String(name || '').trim() || 'pan';
+				        const file = String(n) + '-intercept.' + String(id) + '.log';
+				        const dirRaw = String(process.env.CATPAW_INTERCEPT_DIR || '').trim();
+				        const dir = dirRaw
+				          ? (path.isAbsolute(dirRaw) ? dirRaw : path.resolve(__logRoot, dirRaw))
+				          : path.resolve(__logRoot, 'debug_log');
+				        const full = dir ? path.resolve(dir, file) : path.resolve(file);
+				        return path.isAbsolute(full) ? full : path.resolve(__logRoot, full);
+				      } catch (_) {
+				        return '';
+				      }
 			    };
 			    const __appendInterceptLog = (enabled, logPath, obj) => {
-			      return;
+			      try {
+			        if (!enabled) return;
+			        const p = String(logPath || '').trim();
+			        if (!p) return;
+			        try {
+			          const dir = path.dirname(p);
+			          if (dir && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+			        } catch (_) {}
+			        const o = obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : { value: obj };
+			        if (!Object.prototype.hasOwnProperty.call(o, 't')) o.t = Date.now();
+			        fs.appendFileSync(p, JSON.stringify(o) + String.fromCharCode(10));
+			      } catch (_) {}
 			    };
 			    const __wantMockStack = false;
+
+			    const __safeSlice = (s, limit) => {
+			      try {
+			        const t = typeof s === 'string' ? s : s == null ? '' : String(s);
+			        const n = Number.isFinite(Number(limit)) ? Math.trunc(Number(limit)) : 0;
+			        if (n <= 0) return t;
+			        return t.length > n ? t.slice(0, n) : t;
+			      } catch (_) {
+			        return '';
+			      }
+			    };
+
+			    const __parseUrlEncoded = (raw) => {
+			      try {
+			        const s = typeof raw === 'string' ? raw : raw == null ? '' : String(raw);
+			        const out = {};
+			        for (const part of s.split('&')) {
+			          const p = String(part || '').trim();
+			          if (!p) continue;
+			          const idx = p.indexOf('=');
+			          const k = idx >= 0 ? p.slice(0, idx) : p;
+			          const v = idx >= 0 ? p.slice(idx + 1) : '';
+			          if (!k) continue;
+			          const key = decodeURIComponent(k.replace(/\\+/g, '%20'));
+			          const val = decodeURIComponent(v.replace(/\\+/g, '%20'));
+			          out[key] = val;
+			        }
+			        return out;
+			      } catch (_) {
+			        return {};
+			      }
+			    };
+
+			    const __extractInterceptCreds = (provider, host, pathLike, headersObj, bodyStr) => {
+			      try {
+			        const prov = String(provider || '').trim();
+			        const pth = String(pathLike || '').trim();
+			        const hdrs = headersObj && typeof headersObj === 'object' ? headersObj : {};
+			        const body = typeof bodyStr === 'string' ? bodyStr : bodyStr == null ? '' : String(bodyStr);
+			        const bodyLower = body.toLowerCase();
+
+			        const qs = (() => {
+			          try {
+			            const u = new URL('https://x.invalid' + pth);
+			            const m = {};
+			            for (const [k, v] of u.searchParams.entries()) m[k] = v;
+			            return m;
+			          } catch (_) {
+			            return {};
+			          }
+			        })();
+
+			        const jsonBody = (() => {
+			          try {
+			            const j = __tryParseJson(body);
+			            return j && typeof j === 'object' && !Array.isArray(j) ? j : null;
+			          } catch (_) {
+			            return null;
+			          }
+			        })();
+			        const formBody = (() => {
+			          try {
+			            // Only parse as form when it looks like k=v&k2=v2.
+			            if (!body || !body.includes('=') || body.trim().startsWith('{') || body.trim().startsWith('[')) return {};
+			            return __parseUrlEncoded(body);
+			          } catch (_) {
+			            return {};
+			          }
+			        })();
+
+			        if (prov === 'quark' || prov === 'uc') {
+			          const pwd_id =
+			            String(qs.pwd_id || '').trim() ||
+			            String((jsonBody && (jsonBody.pwd_id || jsonBody.share_id || jsonBody.shareId)) || '').trim();
+			          const passcode =
+			            String(qs.passcode || qs.pwd || '').trim() ||
+			            String((jsonBody && (jsonBody.passcode || jsonBody.pwd || jsonBody.password)) || '').trim();
+			          const hasPassword = !!passcode || bodyLower.includes('passcode=') || bodyLower.includes('pwd=');
+			          return { pwd_id, passcode, hasPassword };
+			        }
+
+			        if (prov === 'tianyi') {
+			          const shareCode = String(qs.shareCode || qs.sharecode || '').trim();
+			          const accessCode =
+			            String(qs.accessCode || qs.accesscode || '').trim() ||
+			            String((jsonBody && (jsonBody.accessCode || jsonBody.accesscode)) || '').trim() ||
+			            String((formBody && (formBody.accessCode || formBody.accesscode || formBody.pwd || formBody.pass)) || '').trim();
+			          const hasPassword = !!accessCode || bodyLower.includes('accesscode=') || bodyLower.includes('pwd=');
+			          return { shareCode, accessCode, hasPassword };
+			        }
+
+			        if (prov === 'baidu') {
+			          const shorturl = String(qs.shorturl || '').trim();
+			          const pwd =
+			            String(qs.pwd || qs.pass || '').trim() ||
+			            String((jsonBody && (jsonBody.pwd || jsonBody.pass || jsonBody.password)) || '').trim() ||
+			            String((formBody && (formBody.pwd || formBody.pass || formBody.password)) || '').trim();
+			          const hasPassword = !!pwd || bodyLower.includes('pwd=');
+			          return { shorturl, pwd, hasPassword };
+			        }
+
+			        if (prov === '139') {
+			          const looksLikeOutlink = pth.includes('/IOutLink/');
+			          if (!looksLikeOutlink) return {};
+			          const __key = Buffer.from('PVGDwmcvfs1uV3d1', 'utf8');
+			          const __b64Normalize = (s) => {
+			            try {
+			              let t = String(s == null ? '' : s).trim();
+			              if (!t) return '';
+			              t = t.replace(/\s+/g, '');
+			              t = t.replace(/-/g, '+').replace(/_/g, '/');
+			              const mod = t.length % 4;
+			              if (mod === 2) t += '==';
+			              else if (mod === 3) t += '=';
+			              return t;
+			            } catch (_) {
+			              return '';
+			            }
+			          };
+			          const __aesDec = (b64) => {
+			            try {
+			              const raw = Buffer.from(__b64Normalize(b64), 'base64');
+			              if (!raw || raw.length < 17) return '';
+			              const iv = raw.subarray(0, 16);
+			              const ct = raw.subarray(16);
+			              const decipher = nodeCrypto.createDecipheriv('aes-128-cbc', __key, iv);
+			              decipher.setAutoPadding(true);
+			              const out = Buffer.concat([decipher.update(ct), decipher.final()]);
+			              return out.toString('utf8');
+			            } catch (_) {
+			              return '';
+			            }
+			          };
+			          const encBody = (() => {
+			            try {
+			              if (jsonBody && typeof jsonBody === 'string') return String(jsonBody);
+			              if (typeof body === 'string') {
+			                const j = __tryParseJson(body);
+			                if (typeof j === 'string') return String(j);
+			              }
+			            } catch (_) {}
+			            return typeof body === 'string' ? body.trim() : '';
+			          })();
+			          const dec = __aesDec(encBody);
+			          const obj = __tryParseJson(dec) || {};
+			          const req = obj && typeof obj === 'object' ? (obj.getOutLinkInfoReq || obj.dlFromOutLinkReq || obj.dlFromOutLinkReqV3 || null) : null;
+			          const linkID = req && typeof req === 'object' ? String(req.linkID || '').trim() : '';
+			          const pCaID = req && typeof req === 'object' ? String(req.pCaID || '').trim() : '';
+			          const contentId = req && typeof req === 'object' ? String(req.contentId || '').trim() : '';
+			          return { linkID, pCaID, contentId, hasPassword: false };
+			        }
+
+			        void host;
+			        void hdrs;
+			        return { hasPassword: false };
+			      } catch (_) {
+			        return { hasPassword: false };
+			      }
+			    };
+
+			    const __placeholderCache = (() => {
+			      try {
+			        const existing = globalThis.__catpaw_placeholder_cache;
+			        if (existing && typeof existing === 'object') return existing;
+			      } catch (_) {}
+			      const created = { quark: new Map(), uc: new Map(), baidu: new Map(), tianyi: new Map(), '139': new Map() };
+			      try { globalThis.__catpaw_placeholder_cache = created; } catch (_) {}
+			      return created;
+			    })();
+
+			    const __sanitizeSeg = (raw, maxLen) => {
+			      try {
+			        let s = String(raw == null ? '' : raw).trim();
+			        if (!s) return '';
+			        // Keep only safe ASCII for filenames; replace others to underscore.
+			        s = s.replace(/[^a-zA-Z0-9]+/g, '_');
+			        s = s.replace(/^_+|_+$/g, '');
+			        const n = Number.isFinite(Number(maxLen)) ? Math.max(1, Math.trunc(Number(maxLen))) : 64;
+			        if (s.length > n) s = s.slice(0, n);
+			        return s;
+			      } catch (_) {
+			        return '';
+			      }
+			    };
+
+			    const __mkPlaceholderFileName = (provider, shareCode, password) => {
+			      const prov = String(provider || '').trim();
+			      const pw = __sanitizeSeg(password, 64);
+			      if (prov === 'tianyi') {
+			        const sc = __sanitizeSeg(shareCode, 80) || 'share';
+			        const tail = pw || 'nopass';
+			        return sc + '-' + tail + '.MP4';
+			      }
+			      // Other providers: encode only whether a passcode exists.
+			      return (pw || 'nopass') + '.mp4';
+			    };
 
 			    // Tape (record/replay) for pan-provider HTTP flows.
 			    // - CATPAW_TAPE=record|replay|off
@@ -668,6 +917,11 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			        if (__isQuarkTokenPath(pathLike)) {
 			          const parsed = __tryParseJson(bodyLike) || {};
 			          const pwdId = parsed && typeof parsed === 'object' ? (parsed.pwd_id || parsed.pwdId || '') : '';
+			          const passcode = parsed && typeof parsed === 'object' ? (parsed.passcode || parsed.pwd || parsed.password || '') : '';
+			          try {
+			            const k = String(pwdId || '').trim();
+			            if (k) __placeholderCache.quark.set(k, { shareCode: k, password: String(passcode || '').trim() });
+			          } catch (_) {}
 			          const stoken = __mkMockStoken(pwdId);
 			          const root = { status: 200, code: 0, message: 'ok', timestamp: nowS(), data: { stoken } };
 			          return { kind: 'token', payload: JSON.stringify(root) };
@@ -695,10 +949,12 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			          const fid = md5hex('fid:' + pwdId + ':' + pdirFid);
 			          const shareFidToken = md5hex('share_fid_token:' + pwdId + ':' + (sToken || ''));
 			          const fidToken = md5hex('fid_token:' + fid + ':' + (sToken || ''));
+			          const passcode2 = (() => { try { const hit = __placeholderCache.quark.get(String(pwdId || '').trim()); return hit && hit.password ? String(hit.password) : ''; } catch (_) { return ''; } })();
+			          const fileName = __mkPlaceholderFileName('quark', pwdId, passcode2);
 
 			          const listItem = {
 			            fid,
-				            file_name: 'placeholder.mp4',
+				            file_name: fileName,
 			            pdir_fid: pdirFid || '0',
 			            category: 1,
 			            file_type: 1,
@@ -794,9 +1050,9 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 		    // Interceptors (extensible for other pan providers).
 		    const __interceptors = [];
 			    const __quarkInterceptor = (() => {
-			      const enabled = __mockEnabled && __mockTargets.has('quark');
+			      const enabled = (__interceptEnabled && __interceptTargets.has('quark')) || (__mockEnabled && __mockTargets.has('quark'));
 			      const logPath = __mkInterceptLogPath('quark');
-			      const log = (obj) => __appendInterceptLog(__mockDebug && enabled, logPath, obj);
+			      const log = (obj) => __appendInterceptLog((__interceptEnabled && __interceptTargets.has('quark')) || (__mockDebug && __mockEnabled && __mockTargets.has('quark')), logPath, obj);
 			      return {
 			        name: 'quark',
 			        enabled,
@@ -806,7 +1062,10 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			      };
 			    })();
 			    if (__quarkInterceptor && __quarkInterceptor.enabled) {
-			      try { __quarkInterceptor.log({ type: 'boot', version: __mockVersion, targets: Array.from(__mockTargets) }); } catch (_) {}
+			      try {
+			        if (__interceptEnabled && __interceptTargets.has('quark')) __quarkInterceptor.log({ type: 'boot', mode: 'intercept', version: __mockVersion, targets: Array.from(__interceptTargets) });
+			        if (__mockEnabled && __mockTargets.has('quark')) __quarkInterceptor.log({ type: 'boot', mode: 'mock', version: __mockVersion, targets: Array.from(__mockTargets) });
+			      } catch (_) {}
 			      __interceptors.push(__quarkInterceptor);
 			    }
 
@@ -867,6 +1126,10 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 
 				        if (isOutLinkInfo) {
 				          const { linkID, pCaID } = parseOutlinkReq();
+				          try {
+				            const k = String(linkID || '').trim();
+				            if (k) __placeholderCache['139'].set(k, { shareCode: k, password: '' });
+				          } catch (_) {}
 				          const mkId = (salt) => {
 				            try {
 				              const s = String(salt || '');
@@ -886,7 +1149,7 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 				              coLst: [
 				                {
 				                  coType: 3,
-				                  coName: 'placeholder.mp4',
+				                  coName: __mkPlaceholderFileName('139', linkID || 'link', ''),
 				                  coID,
 				                  coSize: 874 * 1024 * 1024,
 				                },
@@ -923,9 +1186,9 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			      };
 			    };
 			    const __pan139Interceptor = (() => {
-			      const enabled = __mockEnabled && __mockTargets.has('139');
+			      const enabled = (__interceptEnabled && __interceptTargets.has('139')) || (__mockEnabled && __mockTargets.has('139'));
 			      const logPath = __mkInterceptLogPath('139');
-			      const log = (obj) => __appendInterceptLog(__mockDebug && enabled, logPath, obj);
+			      const log = (obj) => __appendInterceptLog((__interceptEnabled && __interceptTargets.has('139')) || (__mockDebug && __mockEnabled && __mockTargets.has('139')), logPath, obj);
 			      return {
 			        name: '139',
 			        enabled,
@@ -935,7 +1198,10 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			      };
 			    })();
 			    if (__pan139Interceptor && __pan139Interceptor.enabled) {
-			      try { __pan139Interceptor.log({ type: 'boot', version: __mockVersion, targets: Array.from(__mockTargets) }); } catch (_) {}
+			      try {
+			        if (__interceptEnabled && __interceptTargets.has('139')) __pan139Interceptor.log({ type: 'boot', mode: 'intercept', version: __mockVersion, targets: Array.from(__interceptTargets) });
+			        if (__mockEnabled && __mockTargets.has('139')) __pan139Interceptor.log({ type: 'boot', mode: 'mock', version: __mockVersion, targets: Array.from(__mockTargets) });
+			      } catch (_) {}
 			      __interceptors.push(__pan139Interceptor);
 			    }
 
@@ -952,6 +1218,15 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			          try { return urlObj ? String(urlObj.searchParams.get(k) || '') : ''; } catch (_) { return ''; }
 			        };
 			        const surl = qp('surl') || qp('shorturl') || '';
+			        const pwdFromBody = (() => {
+			          try {
+			            const m = String(bodyLike || '').match(/(?:^|&|\\?)pwd=([^&]+)/);
+			            if (!m) return '';
+			            return decodeURIComponent(String(m[1] || '').replace(/\\+/g, '%20')).trim();
+			          } catch (_) {
+			            return '';
+			          }
+			        })();
 
 			        const md5hex = (s) => {
 			          try {
@@ -987,6 +1262,10 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			        };
 
 				        if (pathLike.startsWith('/share/verify')) {
+				          try {
+				            const k = String(surl || '').trim();
+				            if (k) __placeholderCache.baidu.set(k, { shareCode: k, password: pwdFromBody });
+				          } catch (_) {}
 				          // Baidu share passcode verify. Set BDCLND to mimic real behavior.
 				          const randsk = 'mock_randsk';
 				          const payload = JSON.stringify({ errno: 0, err_msg: 'ok', request_id: Date.now(), surl, t: nowS(), randsk });
@@ -1002,6 +1281,11 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 				        }
 
 				        if (pathLike.startsWith('/share/list')) {
+				          const hitPwd = (() => { try { const hit = __placeholderCache.baidu.get(String(surl || '').trim()); return hit && hit.password ? String(hit.password) : ''; } catch (_) { return ''; } })();
+				          const fileName2 = __mkPlaceholderFileName('baidu', surl || 'surl', hitPwd);
+				          const filePath2 = '/' + fileName2;
+				          fileItem.server_filename = fileName2;
+				          fileItem.path = filePath2;
 				          const payloadObj = {
 				            errno: 0,
 				            err_msg: 'ok',
@@ -1046,20 +1330,23 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			        }),
 			      };
 			    };
-			    const __baiduInterceptor = (() => {
-			      const enabled = __mockEnabled && __mockTargets.has('baidu');
-			      const logPath = __mkInterceptLogPath('baidu');
-			      const log = (obj) => __appendInterceptLog(__mockDebug && enabled, logPath, obj);
-			      return {
-			        name: 'baidu',
-			        enabled,
-			        matchHost: (hostLike) => __isBaiduPanHost(hostLike),
+				    const __baiduInterceptor = (() => {
+				      const enabled = (__interceptEnabled && __interceptTargets.has('baidu')) || (__mockEnabled && __mockTargets.has('baidu'));
+				      const logPath = __mkInterceptLogPath('baidu');
+				      const log = (obj) => __appendInterceptLog((__interceptEnabled && __interceptTargets.has('baidu')) || (__mockDebug && __mockEnabled && __mockTargets.has('baidu')), logPath, obj);
+				      return {
+				        name: 'baidu',
+				        enabled,
+				        matchHost: (hostLike) => __isBaiduPanHost(hostLike),
 			        log,
 			        mock: (meta) => __baiduMockPayloadFor(meta),
 			      };
-			    })();
+				    })();
 				    if (__baiduInterceptor && __baiduInterceptor.enabled) {
-				      try { __baiduInterceptor.log({ type: 'boot', version: __mockVersion, targets: Array.from(__mockTargets) }); } catch (_) {}
+				      try {
+				        if (__interceptEnabled && __interceptTargets.has('baidu')) __baiduInterceptor.log({ type: 'boot', mode: 'intercept', version: __mockVersion, targets: Array.from(__interceptTargets) });
+				        if (__mockEnabled && __mockTargets.has('baidu')) __baiduInterceptor.log({ type: 'boot', mode: 'mock', version: __mockVersion, targets: Array.from(__mockTargets) });
+				      } catch (_) {}
 				      __interceptors.push(__baiduInterceptor);
 				    }
 
@@ -1121,6 +1408,10 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 				        const isListDir = pathLike.startsWith('/api/open/share/listShareDir.action');
 
 				        const shareCode = qp('shareCode') || '';
+				        const accessCodeQ = qp('accessCode') || qp('accesscode') || '';
+				        if (shareCode) {
+				          try { __placeholderCache.tianyi.set(String(shareCode), { shareCode: String(shareCode), password: String(accessCodeQ || '') }); } catch (_) {}
+				        }
 				        if (isShareInfo && !shareCode) {
 				          return {
 				            kind: 'bad_request',
@@ -1137,7 +1428,7 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 				        const shareId = isShareInfo ? shareIdFromCode : (shareIdQ ? Number(shareIdQ) : 0);
 				        const fileId = isShareInfo ? fileIdFromCode : (fileIdQ || '');
 				        // Put shareCode into the filename for easy recovery later.
-				        const fileName = shareCode ? String(shareCode) : '';
+				        const fileName = shareCode ? __mkPlaceholderFileName('tianyi', shareCode, accessCodeQ) : '';
 				        const fileSize = 874 * 1024 * 1024;
 				        const brHeaders = {
 				          'content-type': 'application/json;charset=UTF-8',
@@ -1156,7 +1447,7 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 				          const payloadObj = {
 				            res_code: 0,
 				            res_message: '成功',
-				            accessCode: '',
+				            accessCode: accessCodeQ || '',
 				            creator: { iconURL: '', nickName: 'mock', oper: false, ownerAccount: '', superVip: 0, vip: 0 },
 				            expireTime: 0,
 				            expireType: 0,
@@ -1216,7 +1507,8 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 				              headers: { 'content-type': 'application/json;charset=UTF-8' },
 				            };
 				          }
-				          const fileName2 = shareCode2;
+				          const accessCode2 = (() => { try { const hit = __placeholderCache.tianyi.get(String(shareCode2)); return hit && hit.password ? String(hit.password) : ''; } catch (_) { return ''; } })();
+				          const fileName2 = __mkPlaceholderFileName('tianyi', shareCode2, accessCode2);
 				          // Tianyi list response items use id/name/size/md5/mediaType (not fileId).
 				          const idNum = (() => {
 				            try {
@@ -1287,9 +1579,9 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 				      };
 				    };
 				    const __tianyiInterceptor = (() => {
-				      const enabled = __mockEnabled && __mockTargets.has('tianyi');
+				      const enabled = (__interceptEnabled && __interceptTargets.has('tianyi')) || (__mockEnabled && __mockTargets.has('tianyi'));
 				      const logPath = __mkInterceptLogPath('tianyi');
-				      const log = (obj) => __appendInterceptLog(__mockDebug && enabled, logPath, obj);
+				      const log = (obj) => __appendInterceptLog((__interceptEnabled && __interceptTargets.has('tianyi')) || (__mockDebug && __mockEnabled && __mockTargets.has('tianyi')), logPath, obj);
 				      return {
 				        name: 'tianyi',
 				        enabled,
@@ -1299,7 +1591,10 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 				      };
 				    })();
 				    if (__tianyiInterceptor && __tianyiInterceptor.enabled) {
-				      try { __tianyiInterceptor.log({ type: 'boot', version: __mockVersion, targets: Array.from(__mockTargets) }); } catch (_) {}
+				      try {
+				        if (__interceptEnabled && __interceptTargets.has('tianyi')) __tianyiInterceptor.log({ type: 'boot', mode: 'intercept', version: __mockVersion, targets: Array.from(__interceptTargets) });
+				        if (__mockEnabled && __mockTargets.has('tianyi')) __tianyiInterceptor.log({ type: 'boot', mode: 'mock', version: __mockVersion, targets: Array.from(__mockTargets) });
+				      } catch (_) {}
 				      __interceptors.push(__tianyiInterceptor);
 				    }
 
@@ -1330,6 +1625,11 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 				        if (isToken) {
 				          const parsed = __tryParseJson(bodyLike) || {};
 				          const pwdId = parsed && typeof parsed === 'object' ? (parsed.pwd_id || parsed.pwdId || '') : '';
+				          const passcode = parsed && typeof parsed === 'object' ? (parsed.passcode || parsed.pwd || parsed.password || '') : '';
+				          try {
+				            const k = String(pwdId || '').trim();
+				            if (k) __placeholderCache.uc.set(k, { shareCode: k, password: String(passcode || '').trim() });
+				          } catch (_) {}
 				          const stoken = __mkMockStoken(pwdId);
 				          const root = { status: 200, code: 0, message: 'ok', timestamp: nowS(), data: { stoken } };
 				          return { kind: 'token', payload: JSON.stringify(root) };
@@ -1363,10 +1663,12 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			          const fid = md5hex2('uc:fid:' + pwdId + ':' + pdirFid);
 			          const shareFidToken = md5hex2('uc:share_fid_token:' + pwdId + ':' + (sToken || ''));
 			          const fidToken = md5hex2('uc:fid_token:' + fid + ':' + (sToken || ''));
+			          const passcode2 = (() => { try { const hit = __placeholderCache.uc.get(String(pwdId || '').trim()); return hit && hit.password ? String(hit.password) : ''; } catch (_) { return ''; } })();
+			          const fileName = __mkPlaceholderFileName('uc', pwdId, passcode2);
 			          const ts = Date.now();
 			          const listItem = {
 			            fid,
-				            file_name: 'placeholder.mp4',
+				            file_name: fileName,
 			            pdir_fid: pdirFid || '0',
 			            category: 1,
 			            file_type: 1,
@@ -1461,19 +1763,22 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 		      };
 		    };
 			    const __ucInterceptor = (() => {
-			      const enabled = __mockEnabled && __mockTargets.has('uc');
+			      const enabled = (__interceptEnabled && __interceptTargets.has('uc')) || (__mockEnabled && __mockTargets.has('uc'));
 			      const logPath = __mkInterceptLogPath('uc');
-			      const log = (obj) => __appendInterceptLog(__mockDebug && enabled, logPath, obj);
+			      const log = (obj) => __appendInterceptLog((__interceptEnabled && __interceptTargets.has('uc')) || (__mockDebug && __mockEnabled && __mockTargets.has('uc')), logPath, obj);
 			      return {
-		        name: 'uc',
-		        enabled,
-		        matchHost: (hostLike) => __isUcHost(hostLike),
+			        name: 'uc',
+			        enabled,
+			        matchHost: (hostLike) => __isUcHost(hostLike),
 		        log,
 		        mock: (meta) => __ucMockPayloadFor(meta),
 		      };
 			    })();
 			    if (__ucInterceptor && __ucInterceptor.enabled) {
-			      try { __ucInterceptor.log({ type: 'boot', version: __mockVersion, targets: Array.from(__mockTargets) }); } catch (_) {}
+			      try {
+			        if (__interceptEnabled && __interceptTargets.has('uc')) __ucInterceptor.log({ type: 'boot', mode: 'intercept', version: __mockVersion, targets: Array.from(__interceptTargets) });
+			        if (__mockEnabled && __mockTargets.has('uc')) __ucInterceptor.log({ type: 'boot', mode: 'mock', version: __mockVersion, targets: Array.from(__mockTargets) });
+			      } catch (_) {}
 			      __interceptors.push(__ucInterceptor);
 			    }
 		    const __pickInterceptor = (hostLike) => {
@@ -1484,6 +1789,53 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 		      } catch (_) {}
 		      return null;
 		    };
+
+					    // Intercept capture for scripts using fetch (Node 18+ / undici) - pass-through.
+					    try {
+					      if (__interceptEnabled && __interceptTargets && __interceptTargets.size && typeof globalThis.fetch === 'function' && !globalThis.__catpaw_intercept_fetch_patched) {
+					        globalThis.__catpaw_intercept_fetch_patched = true;
+					        const __origFetchIntercept = globalThis.fetch.bind(globalThis);
+					        globalThis.fetch = function interceptedFetch(input, init) {
+					          try {
+					            const method = init && typeof init === 'object' && init.method ? String(init.method).toUpperCase() : 'GET';
+					            const url =
+					              typeof input === 'string'
+					                ? input
+					                : input && typeof input === 'object' && typeof input.url === 'string'
+					                  ? input.url
+					                  : '';
+					            const host = __normalizeHost(url);
+					            const provider = __providerForHost(host);
+					            if (provider && __interceptTargets.has(provider)) {
+					              const hdrs = init && typeof init === 'object' && init.headers && typeof init.headers === 'object' ? init.headers : {};
+					              const bodyRaw = init && typeof init === 'object' && init.body != null ? init.body : null;
+					              const bodyStr = typeof bodyRaw === 'string' ? bodyRaw : '';
+					              const pth = (() => {
+					                try {
+					                  const u = new URL(url);
+					                  return String(u.pathname || '') + String(u.search || '');
+					                } catch (_) {
+					                  return '';
+					                }
+					              })();
+					              const creds = __extractInterceptCreds(provider, host, pth, hdrs, bodyStr);
+					              const lp = __mkInterceptLogPath(provider);
+					              __appendInterceptLog(true, lp, {
+					                type: 'fetch',
+					                provider,
+					                host,
+					                method,
+					                url,
+					                headers: hdrs,
+					                body: __safeSlice(bodyStr, 4096),
+					                creds,
+					              });
+					            }
+					          } catch (_) {}
+					          return __origFetchIntercept(input, init);
+					        };
+					      }
+					    } catch (_) {}
 
 					    // Best-effort block for scripts using fetch (Node 18+ / undici).
 					    try {
@@ -1511,7 +1863,10 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 				              try {
 				                const bodyRaw = init && typeof init === 'object' && init.body != null ? init.body : null;
 				                const bodyStr = typeof bodyRaw === 'string' ? bodyRaw : '';
-				                it0.log({ type: 'fetch', host: __normalizeHost(url), method, url, body: bodyStr.slice(0, 4096), stack: __callStack });
+				                const u2 = (() => { try { return new URL(url); } catch (_) { return null; } })();
+				                const pth2 = u2 ? String(u2.pathname || '') + String(u2.search || '') : '';
+				                const creds = __extractInterceptCreds(it0 && it0.name ? it0.name : '', __normalizeHost(url), pth2, init && typeof init === 'object' ? (init.headers || {}) : {}, bodyStr);
+				                it0.log({ type: 'fetch', provider: it0 && it0.name ? it0.name : '', host: __normalizeHost(url), method, url, body: bodyStr.slice(0, 4096), creds, stack: __callStack });
 				              } catch (_) {}
 				              try {
 					                const u = new URL(url);
@@ -1938,13 +2293,16 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			                        const body = buf.length ? buf.toString('utf8').slice(0, 4096) : '';
 			                        try { this._meta.body = body; } catch (_) {}
 				                        try {
+				                          const creds = __extractInterceptCreds(interceptor && interceptor.name ? interceptor.name : '', this._meta.host || '', this._meta.path || '', this._meta.headers || {}, body);
 				                          interceptor.log({
 				                          type: 'http',
+				                          provider: interceptor && interceptor.name ? interceptor.name : '',
 				                          host: this._meta.host || '',
 				                          method: this._meta.method || '',
 			                          path: this._meta.path || '',
 			                          headers: this._meta.headers || {},
 				                          body,
+				                          creds,
 				                          stack: this._meta.stack || '',
 				                          });
 				                        } catch (_) {}
@@ -2059,23 +2417,89 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 		          else if (__isUcHost(host) || host.includes('open-api-drive.uc.cn')) provider = 'uc';
 		          else if (__is139Host(host)) provider = '139';
 		          else if (__isBaiduPanHost(host) || host.endsWith('baidu.com')) provider = 'baidu';
+		          else if (__isTianyiHost(host)) provider = 'tianyi';
 
+		          // Cookie injection (legacy behavior).
 		          if (provider) {
 		            const cookie = pickCookie(provider);
-            if (cookie) {
-              const hdrs = (isUrl ? null : options && typeof options === 'object' ? options.headers : null) || {};
-              const lower = Object.keys(hdrs).reduce((m, k) => { m[String(k).toLowerCase()] = k; return m; }, {});
-              const ckKey = lower['cookie'] || 'Cookie';
-              const cur = hdrs[ckKey];
-              const curStr = cur == null ? '' : String(cur);
-              if (!curStr.trim()) {
-                hdrs[ckKey] = cookie;
-                if (!isUrl && options && typeof options === 'object') options.headers = hdrs;
-              }
-            }
+		            if (cookie) {
+		              const hdrs = (isUrl ? null : options && typeof options === 'object' ? options.headers : null) || {};
+		              const lower = Object.keys(hdrs).reduce((m, k) => { m[String(k).toLowerCase()] = k; return m; }, {});
+		              const ckKey = lower['cookie'] || 'Cookie';
+		              const cur = hdrs[ckKey];
+		              const curStr = cur == null ? '' : String(cur);
+		              if (!curStr.trim()) {
+		                hdrs[ckKey] = cookie;
+		                if (!isUrl && options && typeof options === 'object') options.headers = hdrs;
+		              }
+		            }
+		          }
+	        } catch (_) {}
+
+	        // Intercept capture (pass-through): record request meta + extracted share code / pwd.
+	        const __cb0 = typeof cb === 'function' ? cb : null;
+	        const __meta0 = (() => {
+	          try {
+	            if (!__interceptEnabled) return null;
+	            const prov = __providerForHost(host);
+	            if (!prov || !__interceptTargets.has(prov)) return null;
+	            const method = options && typeof options === 'object' && options.method ? String(options.method).toUpperCase() : 'GET';
+	            const pth = options && typeof options === 'object' && typeof options.path === 'string' ? String(options.path) : isUrl ? String(options.pathname || '') + String(options.search || '') : '';
+	            const hdrs = options && typeof options === 'object' && options.headers && typeof options.headers === 'object' ? options.headers : {};
+	            return { provider: prov, host, method, path: pth, headers: hdrs };
+	          } catch (_) {
+	            return null;
+	          }
+	        })();
+	        const __logPath0 = __meta0 ? __mkInterceptLogPath(__meta0.provider) : '';
+	        let __chunks0 = __meta0 ? [] : null;
+	        let __chunkBytes0 = 0;
+
+	        const req = orig.call(mod, options, function patchedCb(res) {
+	          try { if (__cb0) __cb0(res); } catch (_) {}
+	        });
+	        try {
+	          if (__meta0 && req && typeof req.write === 'function' && typeof req.end === 'function') {
+	            const __origWrite = req.write.bind(req);
+	            const __origEnd = req.end.bind(req);
+	            req.write = function patchedWrite(chunk, enc, cb2) {
+	              try {
+	                if (__chunks0 && __interceptBodyLimit >= 0) {
+	                  const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk || ''), typeof enc === 'string' ? enc : 'utf8');
+	                  const room = __interceptBodyLimit === 0 ? b.length : Math.max(0, __interceptBodyLimit - __chunkBytes0);
+	                  if (__interceptBodyLimit === 0 || room > 0) {
+	                    const take = __interceptBodyLimit === 0 ? b.length : Math.min(b.length, room);
+	                    if (take > 0) {
+	                      __chunks0.push(b.subarray(0, take));
+	                      __chunkBytes0 += take;
+	                    }
+	                  }
+	                }
+	              } catch (_) {}
+	              return __origWrite(chunk, enc, cb2);
+	            };
+	            req.end = function patchedEnd(chunk, enc, cb2) {
+	              try {
+	                if (chunk != null) req.write(chunk, enc);
+	              } catch (_) {}
+	              try {
+	                const body = __chunks0 && __chunks0.length ? Buffer.concat(__chunks0).toString('utf8') : '';
+	                const creds = __extractInterceptCreds(__meta0.provider, __meta0.host, __meta0.path, __meta0.headers, body);
+	                __appendInterceptLog(true, __logPath0, {
+	                  type: 'http',
+	                  provider: __meta0.provider,
+	                  host: __meta0.host,
+	                  method: __meta0.method,
+	                  path: __meta0.path,
+	                  headers: __meta0.headers || {},
+	                  body: __safeSlice(body, 4096),
+	                  creds,
+	                });
+	              } catch (_) {}
+	              return __origEnd(chunk, enc, cb2);
+	            };
 	          }
 	        } catch (_) {}
-	        const req = orig.call(mod, options, cb);
 	        return req;
 	      };
 	    };
@@ -2440,8 +2864,28 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 
 		    const onlineLogPath = wantDebug ? path.resolve(rootDir, `online-runtime.${key}.log`) : '';
 		    let chosenPort = p;
+
+		    const interceptFromConfig = (() => {
+		        try {
+		            const cfgPath = path.resolve(rootDir, 'config.json');
+		            if (!fs.existsSync(cfgPath)) return false;
+		            const raw = fs.readFileSync(cfgPath, 'utf8');
+		            const parsed = raw && raw.trim() ? JSON.parse(raw) : {};
+		            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+		            return !!parsed.pan_mock;
+		        } catch (_) {
+		            return false;
+		        }
+		    })();
+
 			    for (let attempt = 0; attempt < 6; attempt += 1) {
 			        const baseEnv = { ...process.env };
+			        if (interceptFromConfig && !String(baseEnv.CATPAW_INTERCEPT || '').trim()) {
+			            baseEnv.CATPAW_INTERCEPT = '1';
+			        }
+			        if (interceptFromConfig && !String(baseEnv.CATPAW_INTERCEPT_PROVIDERS || '').trim()) {
+			            baseEnv.CATPAW_INTERCEPT_PROVIDERS = 'quark,uc,139,baidu,tianyi';
+			        }
 			        const child = spawn(process.execPath, [bootstrapPath], {
 			            stdio,
 			            cwd: rootDir,
