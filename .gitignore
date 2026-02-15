@@ -10,3 +10,5 @@ custom_spider/*.mjs
 custom_spider/*.remote.json
 custom_spider/.catpaw_online_runtime_bootstrap.cjs
 custom_spider/online/
+*-intercept.*.log
+*-tape.*.jsonl

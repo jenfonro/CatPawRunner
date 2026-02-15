@@ -13,7 +13,6 @@ let server = null;
 let configWatchTimer = null;
 let configWatchLastMtime = 0;
 let onlineLastEntry = '';
-let onlineLastPanMock = null;
 const onlineRuntimePorts = new Map(); // id -> port
 
 let shutdownHooksInstalled = false;
@@ -253,20 +252,6 @@ export async function start(config) {
 
     const syncAndMaybeRestartOnline = async (reason) => {
         try {
-            let panMock = false;
-            try {
-                const cfgPath2 = path.resolve(runtimeRoot, 'config.json');
-                if (fs.existsSync(cfgPath2)) {
-                    const raw = fs.readFileSync(cfgPath2, 'utf8');
-                    const parsed = raw && raw.trim() ? JSON.parse(raw) : {};
-                    panMock = !!(parsed && typeof parsed === 'object' ? parsed.pan_mock : false);
-                }
-            } catch (_) {
-                panMock = false;
-            }
-            const panMockChanged = onlineLastPanMock !== null && onlineLastPanMock !== panMock;
-            onlineLastPanMock = panMock;
-
             const res = await applyOnlineConfigs({rootDir: runtimeRoot});
             if (res && res.skipped) {
                 // Config does not manage online scripts; keep legacy behavior (run whatever exists in custom_spider/).
@@ -304,7 +289,7 @@ export async function start(config) {
                 const curPort = onlineRuntimePorts.get(id);
                 const needPort = !curPort;
                 const port = needPort ? await findAvailablePortInRange(30000, 39999) : curPort;
-                const shouldRestart = panMockChanged || needPort || !!r.downloaded;
+                const shouldRestart = needPort || !!r.downloaded;
                 if (shouldRestart) {
                     try {
                         stopOnlineRuntime(id);

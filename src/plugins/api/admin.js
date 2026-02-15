@@ -218,7 +218,6 @@ function readSettingsFromConfig(root) {
     const cfg = root && typeof root === 'object' ? root : {};
     return {
         proxy: typeof cfg.proxy === 'string' ? cfg.proxy : '',
-        pan_mock: !!cfg.pan_mock,
         panBuiltinResolverEnabled: !!cfg.panBuiltinResolverEnabled,
         goProxyApi: typeof cfg.goProxyApi === 'string' ? cfg.goProxyApi : '',
         corsAllowOrigins: Array.isArray(cfg.corsAllowOrigins) ? cfg.corsAllowOrigins : [],
@@ -557,7 +556,6 @@ export const apiPlugins = [
                 const next = { ...prev };
 
                 if (Object.prototype.hasOwnProperty.call(body, 'proxy')) next.proxy = typeof body.proxy === 'string' ? body.proxy : '';
-                if (Object.prototype.hasOwnProperty.call(body, 'pan_mock')) next.pan_mock = !!body.pan_mock;
                 if (Object.prototype.hasOwnProperty.call(body, 'panBuiltinResolverEnabled'))
                     next.panBuiltinResolverEnabled = !!body.panBuiltinResolverEnabled;
                 if (Object.prototype.hasOwnProperty.call(body, 'goProxyApi'))
