@@ -7,6 +7,17 @@ import { findAvailablePortInRange } from './tool.js';
 const children = new Map(); // id -> { child, entry, port }
 const starting = new Map(); // id -> Promise<startResult>
 
+function readJsonFileSafe(filePath) {
+    try {
+        if (!filePath || !fs.existsSync(filePath)) return null;
+        const raw = fs.readFileSync(filePath, 'utf8');
+        const parsed = raw && raw.trim() ? JSON.parse(raw) : null;
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+    } catch (_) {
+        return null;
+    }
+}
+
 function getRootDir() {
     // Prefer the executable directory for pkg builds so `db.json` can sit next to the exe.
     try {
@@ -47,6 +58,9 @@ function findOnlineEntry(onlineDir) {
 
 export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[online]', entry: entryOverride = '' } = {}) {
     const rootDir = getRootDir();
+    const cfgPath = path.resolve(rootDir, 'config.json');
+    const cfg = readJsonFileSafe(cfgPath) || {};
+    const panMock = !!cfg.pan_mock;
     const onlineDir = path.resolve(rootDir, 'custom_spider');
     const entry =
         entryOverride && typeof entryOverride === 'string' && entryOverride.trim()
@@ -362,8 +376,17 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 	  globalThis.exports = globalThis.module.exports;
 	  globalThis.require = typeof globalThis.require === 'function' ? globalThis.require : require;
 	  globalThis.__filename = entry;
-	  const __onlineCwd = (typeof process.env.ONLINE_CWD === 'string' && process.env.ONLINE_CWD.trim()) ? process.env.ONLINE_CWD.trim() : process.cwd();
-	  globalThis.__dirname = path.resolve(__onlineCwd);
+		  const __onlineCwd = (typeof process.env.ONLINE_CWD === 'string' && process.env.ONLINE_CWD.trim()) ? process.env.ONLINE_CWD.trim() : process.cwd();
+		  const __logRoot = (() => {
+		    try {
+		      const v = String(process.env.CATPAW_LOG_ROOT || '').trim();
+		      if (!v) return path.resolve(__onlineCwd);
+		      return path.isAbsolute(v) ? v : path.resolve(__onlineCwd, v);
+		    } catch (_) {
+		      return path.resolve(__onlineCwd);
+		    }
+		  })();
+		  globalThis.__dirname = path.resolve(__onlineCwd);
 
   try {
     const md5hex = (s) => nodeCrypto.createHash('md5').update(String(s || ''), 'utf8').digest('hex');
@@ -483,43 +506,246 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			      // - share-kd-njs.yun.139.com
 			      return !!(h && (h === 'yun.139.com' || h.endsWith('.yun.139.com')));
 			    };
-			    const __isBaiduPanHost = (host) => {
-			      const h = __normalizeHost(host);
-			      // Baidu Netdisk share endpoints (script side):
-			      // - pan.baidu.com
-			      // Some flows may also touch other subdomains, but start with the share domain.
-			      return !!(h && (h === 'pan.baidu.com' || h.endsWith('.pan.baidu.com')));
-			    };
-			    const __mkInterceptLogPath = (name) => {
+				    const __isBaiduPanHost = (host) => {
+				      const h = __normalizeHost(host);
+				      // Baidu Netdisk share endpoints (script side):
+				      // - pan.baidu.com
+				      // Some flows may also touch other subdomains, but start with the share domain.
+				      return !!(h && (h === 'pan.baidu.com' || h.endsWith('.pan.baidu.com')));
+				    };
+				    const __isTianyiHost = (host) => {
+				      const h = __normalizeHost(host);
+				      // Tianyi Cloud (天翼云盘/189):
+				      // - cloud.189.cn
+				      // - content.21cn.com
+				      // Some flows also hit other *.189.cn / *.21cn.com hosts, so match broadly.
+				      return !!(
+				        h &&
+				        (
+				          h === 'cloud.189.cn' ||
+				          h.endsWith('.cloud.189.cn') ||
+				          h === 'content.21cn.com' ||
+				          h.endsWith('.content.21cn.com') ||
+				          h === '189.cn' ||
+				          h.endsWith('.189.cn') ||
+				          h === '21cn.com' ||
+				          h.endsWith('.21cn.com')
+				        )
+				      );
+				    };
+				    const __providerForHost = (host) => {
+				      try {
+				        const h = __normalizeHost(host);
+				        if (!h) return '';
+			        if (__isQuarkHost(h)) return 'quark';
+			        if (__isUcHost(h) || h.includes('open-api-drive.uc.cn')) return 'uc';
+			        if (__is139Host(h)) return '139';
+			        if (__isBaiduPanHost(h) || h.endsWith('baidu.com')) return 'baidu';
+				        // Tianyi hosts vary; allow broad suffix match.
+				        if (__isTianyiHost(h)) return 'tianyi';
+				        return '';
+				      } catch (_) {
+				        return '';
+				      }
+				    };
+				    const __mkInterceptLogPath = (name) => {
+				      try {
+				        const up = String(name || '').trim().toUpperCase();
+			        const dirRaw = String(process.env.CATPAW_MOCK_LOG_DIR || '').trim();
+			        const dir = dirRaw ? (path.isAbsolute(dirRaw) ? dirRaw : path.resolve(__logRoot, dirRaw)) : '';
+			        const id = String(process.env.ONLINE_ID || '').trim() || 'online';
+			        const defaultName = String(name || 'pan') + '-intercept.' + id + '.log';
+			        const p =
+			          String(process.env['CATPAW_MOCK_' + up + '_LOG_PATH'] || '').trim() ||
+			          String(process.env['CATPAW_BLOCK_' + up + '_LOG_PATH'] || '').trim() ||
+			          (name === 'quark'
+			            ? (String(process.env.CATPAW_BLOCK_QUARK_LOG_PATH || '').trim() || String(process.env.CATPAW_QUARK_LOG_PATH || '').trim())
+			            : '') ||
+			          (dir ? path.resolve(dir, defaultName) : '');
+			        if (p) return path.isAbsolute(p) ? p : path.resolve(__logRoot, p);
+			      } catch (_) {}
 			      try {
-			        const up = String(name || '').trim().toUpperCase();
-		        const dir = String(process.env.CATPAW_MOCK_LOG_DIR || '').trim();
-		        const id = String(process.env.ONLINE_ID || '').trim() || 'online';
-		        const defaultName = String(name || 'pan') + '-intercept.' + id + '.log';
-		        const p =
-		          String(process.env['CATPAW_MOCK_' + up + '_LOG_PATH'] || '').trim() ||
-		          String(process.env['CATPAW_BLOCK_' + up + '_LOG_PATH'] || '').trim() ||
-		          (name === 'quark'
-		            ? (String(process.env.CATPAW_BLOCK_QUARK_LOG_PATH || '').trim() || String(process.env.CATPAW_QUARK_LOG_PATH || '').trim())
-		            : '') ||
-		          (dir ? path.resolve(dir, defaultName) : '');
-		        if (p) return p;
-		      } catch (_) {}
-		      try {
-		        const id = String(process.env.ONLINE_ID || '').trim() || 'online';
-		        const base = String(name || 'pan') + '-intercept.';
-		        return path.resolve(__onlineCwd, base + id + '.log');
-		      } catch (_) {
-		        return '';
-		      }
-		    };
-		    const __appendInterceptLog = (enabled, logPath, obj) => {
-		      try {
-		        if (!enabled || !logPath) return;
-		        const line = JSON.stringify({ t: Date.now(), ...obj });
-		        fs.appendFileSync(logPath, line + String.fromCharCode(10));
-		      } catch (_) {}
-		    };
+			        const id = String(process.env.ONLINE_ID || '').trim() || 'online';
+			        const base = String(name || 'pan') + '-intercept.';
+			        return path.resolve(__logRoot, base + id + '.log');
+			      } catch (_) {
+			        return '';
+			      }
+			    };
+			    const __appendInterceptLog = (enabled, logPath, obj) => {
+			      try {
+			        if (!enabled || !logPath) return;
+			        const line = JSON.stringify({ t: Date.now(), ...obj });
+			        fs.appendFileSync(logPath, line + String.fromCharCode(10));
+			      } catch (_) {}
+			    };
+			    const __wantMockStack = (() => {
+			      try {
+			        return String(process.env.CATPAW_MOCK_STACK || '').trim() === '1';
+			      } catch (_) {
+			        return false;
+			      }
+			    })();
+
+			    // Tape (record/replay) for pan-provider HTTP flows.
+			    // - CATPAW_TAPE=record|replay|off
+			    // - CATPAW_TAPE_PROVIDER=tianyi|quark|uc|139|baidu (single) or CATPAW_TAPE_PROVIDERS=a,b,c
+			    // - CATPAW_TAPE_DIR=/path/to/dir (optional)
+			    // - CATPAW_TAPE_PATH=/path/to/file.jsonl (optional, single file for all providers)
+			    // - CATPAW_TAPE_<PROVIDER>_PATH=/path/to/file.jsonl (optional, per provider)
+			    // - CATPAW_TAPE_STRICT=1 (replay: throw if missing; default passthrough)
+			    // - CATPAW_TAPE_REQ_LIMIT_BYTES (default 262144; 0 => unlimited)
+			    // - CATPAW_TAPE_RES_LIMIT_BYTES (default 2097152; 0 => unlimited)
+			    const __tapeMode = (() => {
+			      try {
+			        const v = String(process.env.CATPAW_TAPE || '').trim().toLowerCase();
+			        if (v === 'record' || v === 'replay' || v === 'off') return v;
+			        return 'off';
+			      } catch (_) {
+			        return 'off';
+			      }
+			    })();
+			    const __tapeStrict = String(process.env.CATPAW_TAPE_STRICT || '').trim() === '1';
+			    const __tapeReqLimit = (() => {
+			      try {
+			        const v = Number(String(process.env.CATPAW_TAPE_REQ_LIMIT_BYTES || '').trim() || '262144');
+			        if (!Number.isFinite(v)) return 262144;
+			        if (v === 0) return Number.MAX_SAFE_INTEGER;
+			        return v > 0 ? Math.floor(v) : 262144;
+			      } catch (_) {
+			        return 262144;
+			      }
+			    })();
+			    const __tapeResLimit = (() => {
+			      try {
+			        const v = Number(String(process.env.CATPAW_TAPE_RES_LIMIT_BYTES || '').trim() || '2097152');
+			        if (!Number.isFinite(v)) return 2097152;
+			        if (v === 0) return Number.MAX_SAFE_INTEGER;
+			        return v > 0 ? Math.floor(v) : 2097152;
+			      } catch (_) {
+			        return 2097152;
+			      }
+			    })();
+			    const __tapeTargets = (() => {
+			      const out = new Set();
+			      try {
+			        const single = String(process.env.CATPAW_TAPE_PROVIDER || '').trim().toLowerCase();
+			        if (single) out.add(single);
+			      } catch (_) {}
+			      try {
+			        const list = String(process.env.CATPAW_TAPE_PROVIDERS || '').trim().toLowerCase();
+			        if (list) {
+			          list
+			            .split(',')
+			            .map((s) => String(s || '').trim())
+			            .filter(Boolean)
+			            .forEach((s) => out.add(s));
+			        }
+			      } catch (_) {}
+			      return out;
+			    })();
+			    const __mkTapePath = (provider) => {
+			      try {
+			        const id = String(process.env.ONLINE_ID || '').trim() || 'online';
+			        const up = String(provider || '').trim().toUpperCase();
+			        const dirRaw = String(process.env.CATPAW_TAPE_DIR || '').trim();
+			        const dir = dirRaw
+			          ? (path.isAbsolute(dirRaw) ? dirRaw : path.resolve(__logRoot, dirRaw))
+			          : __logRoot;
+			        const globalPath = String(process.env.CATPAW_TAPE_PATH || '').trim();
+			        const perPath = String(process.env['CATPAW_TAPE_' + up + '_PATH'] || '').trim();
+			        const chosen = perPath || globalPath || (dir ? path.resolve(dir, String(provider || 'pan') + '-tape.' + id + '.jsonl') : '');
+			        if (!chosen) return '';
+			        return path.isAbsolute(chosen) ? chosen : path.resolve(__logRoot, chosen);
+			      } catch (_) {
+			        return '';
+			      }
+			    };
+			    const __stableQuery = (pathLike) => {
+			      try {
+			        const u = new URL('https://x.invalid' + String(pathLike || ''));
+			        const ignore = new Set(
+			          String(process.env.CATPAW_TAPE_IGNORE_QS || 'noCache,_,t,ts,timestamp,rand,random,r,cacheBust')
+			            .split(',')
+			            .map((s) => String(s || '').trim())
+			            .filter(Boolean)
+			        );
+			        const pairs = [];
+			        for (const [k, v] of u.searchParams.entries()) {
+			          if (ignore.has(k)) continue;
+			          pairs.push([k, v]);
+			        }
+			        pairs.sort((a, b) => (a[0] === b[0] ? (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0) : a[0] < b[0] ? -1 : 1));
+			        const qs = pairs.map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v)).join('&');
+			        return String(u.pathname || '') + (qs ? '?' + qs : '');
+			      } catch (_) {
+			        return String(pathLike || '');
+			      }
+			    };
+			    const __tapeKey = (provider, method, host, pathLike, bodyStr) => {
+			      try {
+			        const p = String(provider || '');
+			        const m = String(method || 'GET').toUpperCase();
+			        const h = __normalizeHost(host);
+			        const pth = __stableQuery(pathLike);
+			        let bodySig = '';
+			        try {
+			          const b = typeof bodyStr === 'string' ? bodyStr : '';
+			          if (b && b.length <= 8192) bodySig = nodeCrypto.createHash('sha256').update(b, 'utf8').digest('hex');
+			        } catch (_) {}
+			        return [p, m, h, pth, bodySig].join('|');
+			      } catch (_) {
+			        return '';
+			      }
+			    };
+			    const __loadTape = (provider) => {
+			      const tapePath = __mkTapePath(provider);
+			      if (!tapePath) return null;
+			      try {
+			        if (!fs.existsSync(tapePath)) return { tapePath, map: new Map() };
+			        const raw = fs.readFileSync(tapePath, 'utf8');
+			        // NOTE: This code is embedded into a generated bootstrap template string.
+			        // Avoid backslash escape sequences here; they are easy to break when embedded.
+			        const nl = String.fromCharCode(10);
+			        const cr = String.fromCharCode(13);
+			        const lines = raw
+			          .split(nl)
+			          .map((line) => (line && line.endsWith(cr) ? line.slice(0, -1) : line))
+			          .filter(Boolean);
+			        const map = new Map();
+			        for (const line of lines) {
+			          let obj = null;
+			          try { obj = JSON.parse(line); } catch (_) { obj = null; }
+			          if (!obj || typeof obj !== 'object') continue;
+			          const key = typeof obj.key === 'string' ? obj.key : '';
+			          if (!key) continue;
+			          const arr = map.get(key) || [];
+			          arr.push(obj);
+			          map.set(key, arr);
+			        }
+			        return { tapePath, map };
+			      } catch (_) {
+			        return { tapePath, map: new Map() };
+			      }
+			    };
+			    const __tapeState = (() => {
+			      try {
+			        if (__tapeMode !== 'replay') return null;
+			        const state = new Map();
+			        for (const p of Array.from(__tapeTargets)) state.set(p, __loadTape(p));
+			        return state;
+			      } catch (_) {
+			        return null;
+			      }
+			    })();
+			    const __appendTape = (provider, entry) => {
+			      try {
+			        const tapePath = __mkTapePath(provider);
+			        if (!tapePath) return;
+			        const line = JSON.stringify(entry);
+			        fs.appendFileSync(tapePath, line + String.fromCharCode(10));
+			      } catch (_) {}
+			    };
 			    const __tryParseJson = (text) => {
 			      try {
 			        const t = typeof text === 'string' ? text.trim() : '';
@@ -956,15 +1182,255 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			        mock: (meta) => __baiduMockPayloadFor(meta),
 			      };
 			    })();
-			    if (__baiduInterceptor && __baiduInterceptor.enabled) {
-			      try { __baiduInterceptor.log({ type: 'boot', version: __mockVersion, targets: Array.from(__mockTargets) }); } catch (_) {}
-			      __interceptors.push(__baiduInterceptor);
-			    }
+				    if (__baiduInterceptor && __baiduInterceptor.enabled) {
+				      try { __baiduInterceptor.log({ type: 'boot', version: __mockVersion, targets: Array.from(__mockTargets) }); } catch (_) {}
+				      __interceptors.push(__baiduInterceptor);
+				    }
 
-				    const __ucMockPayloadFor = (meta) => {
+				    const __tianyiMockPayloadFor = (meta) => {
 				      try {
+				        const __tianyiShareCodeCache = (() => {
+				          try {
+				            const existing = globalThis.__catpaw_tianyi_sharecode_cache;
+				            if (existing && typeof existing === 'object') {
+				              if (!(existing.byShareId && typeof existing.byShareId.get === 'function')) existing.byShareId = new Map();
+				              if (!(existing.byFileId && typeof existing.byFileId.get === 'function')) existing.byFileId = new Map();
+				              return existing;
+				            }
+				          } catch (_) {}
+				          const created = { byShareId: new Map(), byFileId: new Map() };
+				          try { globalThis.__catpaw_tianyi_sharecode_cache = created; } catch (_) {}
+				          return created;
+				        })();
 				        const pathLike = meta && meta.path ? String(meta.path) : '';
-				        const bodyLike = meta && meta.body ? String(meta.body) : '';
+				        const nowMs = () => Date.now();
+				        const nowS = () => Math.floor(Date.now() / 1000);
+				        const brotliB64 = (obj) => {
+				          try {
+				            const zlib = require('zlib');
+				            const buf = Buffer.from(JSON.stringify(obj), 'utf8');
+				            const out = zlib.brotliCompressSync(buf);
+				            return out.toString('base64');
+				          } catch (_) {
+				            return '';
+				          }
+				        };
+				        const md5hex = (s) => {
+				          try {
+				            return nodeCrypto.createHash('md5').update(String(s || ''), 'utf8').digest('hex');
+				          } catch (_) {
+				            return '0'.repeat(32);
+				          }
+				        };
+				        const digitsId = (salt, digits) => {
+				          try {
+				            const h = md5hex(String(salt || ''));
+				            const bi = BigInt('0x' + h);
+				            const mod = 10n ** BigInt(Math.max(1, Number(digits) || 1));
+				            const out = (bi % mod).toString(10);
+				            return out.padStart(Math.max(1, Number(digits) || 1), '0');
+				          } catch (_) {
+				            return String(Date.now());
+				          }
+				        };
+				        const qp = (k) => {
+				          try {
+				            const u = new URL('https://cloud.189.cn' + pathLike);
+				            return String(u.searchParams.get(k) || '');
+				          } catch (_) {
+				            return '';
+				          }
+				        };
+				        const isShareInfo = pathLike.startsWith('/api/open/share/getShareInfoByCodeV2.action');
+				        const isListDir = pathLike.startsWith('/api/open/share/listShareDir.action');
+
+				        const shareCode = qp('shareCode') || '';
+				        if (isShareInfo && !shareCode) {
+				          return {
+				            kind: 'bad_request',
+				            payload: JSON.stringify({ res_code: 1, res_message: 'missing shareCode' }),
+				            statusCode: 200,
+				            headers: { 'content-type': 'application/json;charset=UTF-8' },
+				          };
+				        }
+				        const shareIdQ = qp('shareId') || '';
+				        const fileIdQ = qp('fileId') || qp('shareDirFileId') || '';
+				        // Real Tianyi uses numeric shareId and fileId; generate stable digits from shareCode.
+				        const shareIdFromCode = shareCode ? Number(digitsId('tianyi:share:' + shareCode, 14)) : 0;
+				        const fileIdFromCode = shareCode ? digitsId('tianyi:file:' + shareCode, 17) : '';
+				        const shareId = isShareInfo ? shareIdFromCode : (shareIdQ ? Number(shareIdQ) : 0);
+				        const fileId = isShareInfo ? fileIdFromCode : (fileIdQ || '');
+				        // Put shareCode into the filename for easy recovery later.
+				        const fileName = shareCode ? String(shareCode) : '';
+				        const fileSize = 874 * 1024 * 1024;
+				        const brHeaders = {
+				          'content-type': 'application/json;charset=UTF-8',
+				          // The real Tianyi API responses are brotli-compressed in practice.
+				          // 0119.js/its HTTP client expects the runtime to auto-decompress when this header is present.
+				          'content-encoding': 'br',
+				        };
+
+				        if (isShareInfo) {
+				          try {
+				            if (shareCode) {
+				              try { __tianyiShareCodeCache.byShareId.set(String(shareId), String(shareCode)); } catch (_) {}
+				              try { __tianyiShareCodeCache.byFileId.set(String(fileId), String(shareCode)); } catch (_) {}
+				            }
+				          } catch (_) {}
+				          const payloadObj = {
+				            res_code: 0,
+				            res_message: '成功',
+				            accessCode: '',
+				            creator: { iconURL: '', nickName: 'mock', oper: false, ownerAccount: '', superVip: 0, vip: 0 },
+				            expireTime: 0,
+				            expireType: 0,
+				            fileCreateDate: new Date(nowMs()).toISOString().slice(0, 19).replace('T', ' '),
+				            fileId: String(fileId),
+				            fileLastOpTime: new Date(nowMs()).toISOString().slice(0, 19).replace('T', ' '),
+				            fileName,
+				            fileSize,
+				            fileType: 'mp4',
+				            isFolder: false,
+				            mediaType: 3,
+				            needAccessCode: 0,
+				            reviewStatus: 1,
+				            shareDate: nowMs(),
+				            shareId,
+				            shareMode: 3,
+				            shareType: 1,
+				          };
+				          return {
+				            kind: 'share_info',
+				            payload: JSON.stringify(payloadObj),
+				            payloadB64: brotliB64(payloadObj),
+				            statusCode: 200,
+				            headers: brHeaders,
+				          };
+				        }
+
+				        if (isListDir) {
+				          if (!shareIdQ && !fileIdQ) {
+				            return {
+				              kind: 'bad_request',
+				              payload: JSON.stringify({ res_code: 1, res_message: 'missing shareId/fileId' }),
+				              statusCode: 200,
+				              headers: { 'content-type': 'application/json;charset=UTF-8' },
+				            };
+				          }
+				          const shareCode2 = (() => {
+				            try {
+				              if (shareIdQ) {
+				                const v = __tianyiShareCodeCache.byShareId.get(String(shareIdQ));
+				                if (v) return String(v);
+				              }
+				            } catch (_) {}
+				            try {
+				              if (fileIdQ) {
+				                const v = __tianyiShareCodeCache.byFileId.get(String(fileIdQ));
+				                if (v) return String(v);
+				              }
+				            } catch (_) {}
+				            return '';
+				          })();
+				          if (!shareCode2) {
+				            return {
+				              kind: 'bad_request',
+				              payload: JSON.stringify({ res_code: 1, res_message: 'shareCode not cached yet' }),
+				              statusCode: 200,
+				              headers: { 'content-type': 'application/json;charset=UTF-8' },
+				            };
+				          }
+				          const fileName2 = shareCode2;
+				          // Tianyi list response items use id/name/size/md5/mediaType (not fileId).
+				          const idNum = (() => {
+				            try {
+				              return (BigInt(fileIdQ || fileId) + 1n).toString(10);
+				            } catch (_) {
+				              return fileIdQ || fileId;
+				            }
+				          })();
+				          const payloadObj = {
+				            res_code: 0,
+				            res_message: '成功',
+				            expireTime: 0,
+				            expireType: 0,
+				            lastRev: String(nowS()),
+				            fileListAO: {
+				              count: 1,
+				              fileListSize: 1,
+				              fileList: [
+				                {
+				                  createDate: new Date(nowMs()).toISOString().slice(0, 19).replace('T', ' '),
+				                  fileCata: 1,
+				                  icon: { largeUrl: '', smallUrl: '' },
+				                  id: Number(idNum),
+				                  lastOpTime: new Date(nowMs()).toISOString().slice(0, 19).replace('T', ' '),
+				                  md5: md5hex('tianyi:md5:' + (shareCode2 || shareCode) + ':' + fileName2),
+				                  mediaType: 3,
+				                  name: fileName2,
+				                  rev: String(nowS()),
+				                  size: fileSize,
+				                  starLabel: 2,
+				                },
+				              ],
+				              folderList: [],
+				            },
+				          };
+				          return {
+				            kind: 'list_dir',
+				            payload: JSON.stringify(payloadObj),
+				            payloadB64: brotliB64(payloadObj),
+				            statusCode: 200,
+				            headers: brHeaders,
+				          };
+				        }
+
+				        return {
+				          kind: 'blocked',
+				          payload: JSON.stringify({
+				            status: 200,
+				            code: 1,
+				            message: 'blocked by CATPAW_MOCK',
+				            provider: 'tianyi',
+				            path: pathLike,
+				            timestamp: nowS(),
+				            data: {},
+				          }),
+				        };
+				      } catch (_) {}
+				      return {
+				        kind: 'blocked',
+				        payload: JSON.stringify({
+				          status: 200,
+				          code: 1,
+				          message: 'blocked by CATPAW_MOCK',
+				          provider: 'tianyi',
+				          timestamp: Math.floor(Date.now() / 1000),
+				          data: {},
+				        }),
+				      };
+				    };
+				    const __tianyiInterceptor = (() => {
+				      const enabled = __mockEnabled && __mockTargets.has('tianyi');
+				      const logPath = __mkInterceptLogPath('tianyi');
+				      const log = (obj) => __appendInterceptLog(__mockDebug && enabled, logPath, obj);
+				      return {
+				        name: 'tianyi',
+				        enabled,
+				        matchHost: (hostLike) => __isTianyiHost(hostLike),
+				        log,
+				        mock: (meta) => __tianyiMockPayloadFor(meta),
+				      };
+				    })();
+				    if (__tianyiInterceptor && __tianyiInterceptor.enabled) {
+				      try { __tianyiInterceptor.log({ type: 'boot', version: __mockVersion, targets: Array.from(__mockTargets) }); } catch (_) {}
+				      __interceptors.push(__tianyiInterceptor);
+				    }
+
+					    const __ucMockPayloadFor = (meta) => {
+					      try {
+					        const pathLike = meta && meta.path ? String(meta.path) : '';
+					        const bodyLike = meta && meta.body ? String(meta.body) : '';
 			        const nowS = () => Math.floor(Date.now() / 1000);
 			        const isToken = pathLike.startsWith('/1/clouddrive/share/sharepage/token');
 			        const isDetail = pathLike.startsWith('/1/clouddrive/share/sharepage/detail');
@@ -1143,39 +1609,58 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 		      return null;
 		    };
 
-				    // Best-effort block for scripts using fetch (Node 18+ / undici).
-				    try {
-				      if (__mockEnabled && __interceptors.length && typeof globalThis.fetch === 'function') {
-		        const __origFetch = globalThis.fetch.bind(globalThis);
-		        globalThis.fetch = function patchedFetch(input, init) {
-		          try {
-		            const method = init && typeof init === 'object' && init.method ? String(init.method).toUpperCase() : 'GET';
+					    // Best-effort block for scripts using fetch (Node 18+ / undici).
+					    try {
+					      if (__mockEnabled && __interceptors.length && typeof globalThis.fetch === 'function') {
+			        const __origFetch = globalThis.fetch.bind(globalThis);
+			        globalThis.fetch = function patchedFetch(input, init) {
+			          try {
+			            const method = init && typeof init === 'object' && init.method ? String(init.method).toUpperCase() : 'GET';
 	            const url =
 	              typeof input === 'string'
 	                ? input
 	                : input && typeof input === 'object' && typeof input.url === 'string'
 	                  ? input.url
 	                  : '';
-			            const it0 = __pickInterceptor(url);
-			            if (it0) {
-			              try {
-			                const bodyRaw = init && typeof init === 'object' && init.body != null ? init.body : null;
-			                const bodyStr = typeof bodyRaw === 'string' ? bodyRaw : '';
-			                it0.log({ type: 'fetch', host: __normalizeHost(url), method, url, body: bodyStr.slice(0, 4096) });
-			              } catch (_) {}
-			              try {
-				                const u = new URL(url);
-				                const meta = { path: String(u.pathname || '') + String(u.search || ''), body: bodyStr };
-				                const mocked = it0.mock(meta);
+				            const it0 = __pickInterceptor(url);
+				            if (it0) {
+				              const __callStack = (() => {
 				                try {
-				                  it0.log({ type: 'mock', via: 'fetch', kind: mocked.kind, url, stoken: mocked.kind === 'token' ? (__tryParseJson(mocked.payload)?.data?.stoken || '') : '' });
-				                } catch (_) {}
-					                const body = mocked && mocked.payload != null ? String(mocked.payload) : '';
-					                const status = mocked && Number.isFinite(mocked.statusCode) ? mocked.statusCode : 200;
-					                const headersIn =
-					                  mocked && mocked.headers && typeof mocked.headers === 'object'
-					                    ? mocked.headers
-					                    : { 'content-type': 'application/json; charset=utf-8' };
+				                  if (!__wantMockStack) return '';
+				                  return new Error('catpaw-call-stack').stack || '';
+				                } catch (_) {
+				                  return '';
+				                }
+				              })();
+				              try {
+				                const bodyRaw = init && typeof init === 'object' && init.body != null ? init.body : null;
+				                const bodyStr = typeof bodyRaw === 'string' ? bodyRaw : '';
+				                it0.log({ type: 'fetch', host: __normalizeHost(url), method, url, body: bodyStr.slice(0, 4096), stack: __callStack });
+				              } catch (_) {}
+				              try {
+					                const u = new URL(url);
+					                const meta = { path: String(u.pathname || '') + String(u.search || ''), body: bodyStr };
+					                const mocked = it0.mock(meta);
+					                try {
+					                  it0.log({ type: 'mock', via: 'fetch', kind: mocked.kind, url, stoken: mocked.kind === 'token' ? (__tryParseJson(mocked.payload)?.data?.stoken || '') : '', stack: __callStack });
+					                } catch (_) {}
+						                const bodyBuf = (() => {
+						                  try {
+						                    const b64 = mocked && typeof mocked.payloadB64 === 'string' ? mocked.payloadB64 : '';
+						                    if (b64) return Buffer.from(b64, 'base64');
+						                  } catch (_) {}
+						                  try {
+						                    return Buffer.from(mocked && mocked.payload != null ? String(mocked.payload) : '', 'utf8');
+						                  } catch (_) {
+						                    return Buffer.alloc(0);
+						                  }
+						                })();
+						                const body = bodyBuf.toString('utf8');
+						                const status = mocked && Number.isFinite(mocked.statusCode) ? mocked.statusCode : 200;
+						                const headersIn =
+						                  mocked && mocked.headers && typeof mocked.headers === 'object'
+						                    ? mocked.headers
+						                    : { 'content-type': 'application/json; charset=utf-8' };
 					                const headers = (() => {
 					                  try {
 					                    const out = {};
@@ -1190,14 +1675,14 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 					                    return { 'content-type': 'application/json; charset=utf-8' };
 					                  }
 					                })();
-					                if (typeof globalThis.Response === 'function') {
-					                  return Promise.resolve(
-					                    new globalThis.Response(body, {
-					                      status,
-			                      headers,
-			                    })
-			                  );
-			                }
+						                if (typeof globalThis.Response === 'function') {
+						                  return Promise.resolve(
+						                    new globalThis.Response(bodyBuf, {
+						                      status,
+				                      headers,
+				                    })
+				                  );
+						                }
 			              } catch (_) {}
 			              return Promise.reject(new Error('blocked by CATPAW_MOCK'));
 			            }
@@ -1251,26 +1736,309 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			              }
 			            }
 			          } catch (_) {}
-			          return __origFetch(input, init);
-			        };
-		      }
-			    } catch (_) {}
-				    const patch = (mod) => {
-			      const orig = mod && typeof mod.request === 'function' ? mod.request : null;
-			      if (!orig) return;
-			      mod.request = function patchedRequest(options, cb) {
-			        try {
-	          const isUrl = options && typeof options === 'object' && options instanceof URL;
+				          return __origFetch(input, init);
+				        };
+			      }
+				    } catch (_) {}
+					    // Tape (record/replay) for scripts using fetch (undici).
+					    try {
+					      if (__tapeMode !== 'off' && __tapeTargets && __tapeTargets.size && typeof globalThis.fetch === 'function' && !globalThis.__catpaw_tape_fetch_patched) {
+					        globalThis.__catpaw_tape_fetch_patched = true;
+					        const __origFetchTape = globalThis.fetch.bind(globalThis);
+					        globalThis.fetch = async function tapedFetch(input, init) {
+					          const method = init && typeof init === 'object' && init.method ? String(init.method).toUpperCase() : 'GET';
+					          const url =
+					            typeof input === 'string'
+					              ? input
+					              : input && typeof input === 'object' && typeof input.url === 'string'
+					                ? input.url
+					                : '';
+					          const host = __normalizeHost(url);
+					          const provider = __providerForHost(host);
+					          if (!provider || !__tapeTargets.has(provider)) return __origFetchTape(input, init);
+					          const u = (() => { try { return new URL(url); } catch (_) { return null; } })();
+					          const pathLike = u ? String(u.pathname || '') + String(u.search || '') : '';
+					          const hdrs = init && typeof init === 'object' && init.headers && typeof init.headers === 'object' ? init.headers : {};
+					          const bodyRaw = init && typeof init === 'object' && init.body != null ? init.body : null;
+					          const bodyStr = typeof bodyRaw === 'string' ? bodyRaw : '';
+
+					          if (__tapeMode === 'replay') {
+					            const key1 = __tapeKey(provider, method, host, pathLike, bodyStr);
+					            const key2 = __tapeKey(provider, method, host, pathLike, '');
+					            const state = __tapeState && __tapeState.get(provider) ? __tapeState.get(provider) : null;
+					            const take = (k) => {
+					              try {
+					                if (!state || !state.map) return null;
+					                const arr = state.map.get(k);
+					                if (!arr || !arr.length) return null;
+					                return arr.shift();
+					              } catch (_) {
+					                return null;
+					              }
+					            };
+					            const hit = take(key1) || take(key2);
+					            if (!hit) {
+					              if (__tapeStrict) throw new Error('tape miss: ' + provider + ' fetch ' + url);
+					              return __origFetchTape(input, init);
+					            }
+					            const payload = hit && hit.resBodyB64 ? Buffer.from(String(hit.resBodyB64), 'base64') : Buffer.from(String(hit.resBody || ''), 'utf8');
+					            const status = Number(hit.statusCode || 200);
+					            const headers = hit.resHeaders && typeof hit.resHeaders === 'object' ? hit.resHeaders : { 'content-type': 'application/json; charset=utf-8' };
+					            if (typeof globalThis.Response === 'function') return new globalThis.Response(payload, { status, headers });
+					            return payload.toString('utf8');
+					          }
+
+					          if (__tapeMode === 'record') {
+					            const res = await __origFetchTape(input, init);
+					            try {
+					              const cloned = typeof res.clone === 'function' ? res.clone() : null;
+					              const buf = cloned && typeof cloned.arrayBuffer === 'function' ? Buffer.from(await cloned.arrayBuffer()) : Buffer.alloc(0);
+					              const key = __tapeKey(provider, method, host, pathLike, bodyStr);
+					              const resHeaders = (() => {
+					                try {
+					                  const o = {};
+					                  if (res && res.headers && typeof res.headers.forEach === 'function') res.headers.forEach((v, k) => { o[k] = v; });
+					                  return o;
+					                } catch (_) { return {}; }
+					              })();
+					              __appendTape(provider, {
+					                v: 1,
+					                provider,
+					                key,
+					                method,
+					                host,
+					                path: __stableQuery(pathLike),
+					                reqHeaders: hdrs,
+					                reqBody: bodyStr.slice(0, __tapeReqLimit),
+					                statusCode: res && typeof res.status === 'number' ? res.status : 0,
+					                resHeaders,
+					                resBodyB64: buf.length ? buf.subarray(0, __tapeResLimit).toString('base64') : '',
+					              });
+					            } catch (_) {}
+					            return res;
+					          }
+
+					          return __origFetchTape(input, init);
+					        };
+					      }
+					    } catch (_) {}
+					    const patch = (mod) => {
+				      const orig = mod && typeof mod.request === 'function' ? mod.request : null;
+				      if (!orig) return;
+				      mod.request = function patchedRequest(options, cb) {
+				        try {
+		          const isUrl = options && typeof options === 'object' && options instanceof URL;
 	          const hostname = isUrl
 	            ? String(options.hostname || '')
 	            : options && typeof options === 'string'
 	              ? (() => { try { return String(new URL(options).hostname || ''); } catch (_) { return ''; } })()
 	              : String((options && (options.hostname || options.host)) || '');
-	          const host = __normalizeHost(hostname);
-
-		          const it = __pickInterceptor(host);
-		          if (it) {
+		          const host = __normalizeHost(hostname);
+		          const __callStack = (() => {
 		            try {
+		              if (!__wantMockStack) return '';
+		              return new Error('catpaw-call-stack').stack || '';
+		            } catch (_) {
+		              return '';
+		            }
+		          })();
+
+		          // Tape replay/record (http/https.request).
+		          // IMPORTANT: If CATPAW_MOCK is enabled and a mock interceptor matches this host, do not fall through to real network.
+		          try {
+		            const provider = __providerForHost(host);
+		            const mockMatched = (() => {
+		              try {
+		                if (!__mockEnabled) return false;
+		                const it0 = __pickInterceptor(host);
+		                return !!it0;
+		              } catch (_) {
+		                return false;
+		              }
+		            })();
+		            const tapeOn = !mockMatched && __tapeMode !== 'off' && provider && __tapeTargets && __tapeTargets.has(provider);
+		            if (tapeOn) {
+		              const { EventEmitter } = require('events');
+		              const { Readable } = require('stream');
+		              const method = options && typeof options === 'object' && options.method ? String(options.method).toUpperCase() : 'GET';
+		              const pth = options && typeof options === 'object' && typeof options.path === 'string' ? String(options.path) : isUrl ? String(options.pathname || '') + String(options.search || '') : '';
+		              const hdrs = options && typeof options === 'object' && options.headers && typeof options.headers === 'object' ? options.headers : {};
+
+		              const mkRes = (payloadStr, statusCode, headersObj) => {
+		                const res = Readable.from([Buffer.from(String(payloadStr || ''), 'utf8')]);
+		                res.statusCode = Number.isFinite(statusCode) ? statusCode : 200;
+		                res.headers = headersObj && typeof headersObj === 'object' ? headersObj : { 'content-type': 'application/json; charset=utf-8' };
+		                if (!('set-cookie' in res.headers)) res.headers['set-cookie'] = [];
+		                return res;
+		              };
+
+		              if (__tapeMode === 'replay') {
+		                class __CatPawTapeReplayRequest extends EventEmitter {
+		                  constructor(meta) {
+		                    super();
+		                    this._meta = meta || {};
+		                    this._chunks = [];
+		                    this._replied = false;
+		                    this.aborted = false;
+		                    this.destroyed = false;
+		                    this.writable = true;
+		                    this.readable = false;
+		                    this.socket = null;
+		                    const cb2 = typeof cb === 'function' ? cb : null;
+		                    const tryAuto = () => {
+		                      try {
+		                        if (this._replied || this.destroyed) return;
+		                        const m = String(this._meta.method || 'GET').toUpperCase();
+		                        if (m === 'GET' || m === 'HEAD') this._respond(cb2);
+		                      } catch (_) {}
+		                    };
+		                    process.nextTick(tryAuto);
+		                  }
+		                  _respond(cb2) {
+		                    if (this._replied || this.destroyed) return;
+		                    this._replied = true;
+		                    try {
+		                      const buf = this._chunks && this._chunks.length ? Buffer.concat(this._chunks) : Buffer.alloc(0);
+		                      const bodyStr = buf.length ? buf.toString('utf8') : '';
+		                      const key1 = __tapeKey(provider, this._meta.method || 'GET', this._meta.host || '', this._meta.path || '', bodyStr);
+		                      const key2 = __tapeKey(provider, this._meta.method || 'GET', this._meta.host || '', this._meta.path || '', '');
+		                      const state = __tapeState && __tapeState.get(provider) ? __tapeState.get(provider) : null;
+		                      const take = (k) => {
+		                        try {
+		                          if (!state || !state.map) return null;
+		                          const arr = state.map.get(k);
+		                          if (!arr || !arr.length) return null;
+		                          return arr.shift();
+		                        } catch (_) {
+		                          return null;
+		                        }
+		                      };
+		                      const hit = take(key1) || take(key2);
+		                      if (!hit) {
+		                        const err = new Error('tape miss: ' + provider + ' ' + String(this._meta.method || '') + ' ' + String(this._meta.host || '') + ' ' + String(this._meta.path || ''));
+		                        if (__tapeStrict) throw err;
+		                        try { this.emit('error', err); } catch (_) {}
+		                        try { this.emit('close'); } catch (_) {}
+		                        return;
+		                      }
+		                      const payload = hit && hit.resBodyB64 ? Buffer.from(String(hit.resBodyB64), 'base64').toString('utf8') : String(hit.resBody || '');
+		                      const res = mkRes(payload, Number(hit.statusCode || 200), hit.resHeaders || { 'content-type': 'application/json; charset=utf-8' });
+		                      try { if (cb2) cb2(res); } catch (_) {}
+		                      this.emit('response', res);
+		                      this.emit('close');
+		                    } catch (e) {
+		                      try { this.emit('error', e); } catch (_) {}
+		                      try { this.emit('close'); } catch (_) {}
+		                    }
+		                  }
+		                  abort() { this.aborted = true; return this.destroy(new Error('aborted')); }
+		                  destroy(err) { this.destroyed = true; try { if (err) this.emit('error', err); } catch (_) {} return this; }
+		                  end(_data, _enc, _cb) {
+		                    try {
+		                      const data = typeof _data === 'string' ? Buffer.from(_data, typeof _enc === 'string' ? _enc : 'utf8') : Buffer.isBuffer(_data) ? _data : null;
+		                      if (data) this._chunks.push(Buffer.from(data));
+		                    } catch (_) {}
+		                    const cb3 = typeof _data === 'function' ? _data : typeof _enc === 'function' ? _enc : typeof _cb === 'function' ? _cb : null;
+		                    try { if (cb3) process.nextTick(cb3); } catch (_) {}
+		                    try { this._respond(typeof cb === 'function' ? cb : null); } catch (_) {}
+		                    return this;
+		                  }
+		                  write(_data, _enc, _cb) {
+		                    try {
+		                      const data = typeof _data === 'string' ? Buffer.from(_data, typeof _enc === 'string' ? _enc : 'utf8') : Buffer.isBuffer(_data) ? _data : null;
+		                      if (data) {
+		                        const cur = this._chunks.reduce((n, b) => n + b.length, 0);
+		                        if (cur < __tapeReqLimit) this._chunks.push(Buffer.from(data.subarray(0, Math.max(0, __tapeReqLimit - cur))));
+		                      }
+		                    } catch (_) {}
+		                    const cb3 = typeof _enc === 'function' ? _enc : typeof _cb === 'function' ? _cb : null;
+		                    try { if (cb3) process.nextTick(cb3); } catch (_) {}
+		                    return true;
+		                  }
+		                  setTimeout(_ms, _cb) { try { if (typeof _cb === 'function') process.nextTick(_cb); } catch (_) {} return this; }
+		                  setHeader() { return; }
+		                  getHeader() { return undefined; }
+		                  removeHeader() { return; }
+		                }
+		                const meta = { provider, host, method, path: pth, headers: hdrs };
+		                return new __CatPawTapeReplayRequest(meta);
+		              }
+
+		              if (__tapeMode === 'record') {
+		                const req = orig.call(mod, options, cb);
+		                try {
+		                  const reqChunks = [];
+		                  const pushReq = (d, enc) => {
+		                    try {
+		                      if (d == null) return;
+		                      const buf =
+		                        typeof d === 'string'
+		                          ? Buffer.from(d, typeof enc === 'string' ? enc : 'utf8')
+		                          : Buffer.isBuffer(d)
+		                            ? d
+		                            : d instanceof Uint8Array
+		                              ? Buffer.from(d)
+		                              : null;
+		                      if (!buf || !buf.length) return;
+		                      const cur = reqChunks.reduce((n, b) => n + b.length, 0);
+		                      if (cur >= __tapeReqLimit) return;
+		                      reqChunks.push(buf.subarray(0, Math.max(0, __tapeReqLimit - cur)));
+		                    } catch (_) {}
+		                  };
+		                  if (req && typeof req.write === 'function') {
+		                    const ow = req.write.bind(req);
+		                    req.write = function (d, enc, cb3) { pushReq(d, enc); return ow(d, enc, cb3); };
+		                  }
+		                  if (req && typeof req.end === 'function') {
+		                    const oe = req.end.bind(req);
+		                    req.end = function (d, enc, cb3) { pushReq(d, enc); return oe(d, enc, cb3); };
+		                  }
+		                  req.once('response', (res) => {
+		                    try {
+		                      const resChunks = [];
+		                      let resBytes = 0;
+		                      res.on('data', (c) => {
+		                        try {
+		                          const b = Buffer.isBuffer(c) ? c : Buffer.from(c);
+		                          if (resBytes >= __tapeResLimit) return;
+		                          const take = Math.min(b.length, __tapeResLimit - resBytes);
+		                          if (take > 0) {
+		                            resChunks.push(b.subarray(0, take));
+		                            resBytes += take;
+		                          }
+		                        } catch (_) {}
+		                      });
+		                      res.on('end', () => {
+		                        try {
+		                          const reqBody = reqChunks.length ? Buffer.concat(reqChunks).toString('utf8') : '';
+		                          const resBodyBuf = resChunks.length ? Buffer.concat(resChunks) : Buffer.alloc(0);
+		                          const key = __tapeKey(provider, method, host, pth, reqBody);
+		                          __appendTape(provider, {
+		                            v: 1,
+		                            provider,
+		                            key,
+		                            method,
+		                            host,
+		                            path: __stableQuery(pth),
+		                            reqHeaders: hdrs,
+		                            reqBody,
+		                            statusCode: res && res.statusCode ? Number(res.statusCode || 0) : 0,
+		                            resHeaders: res && res.headers ? res.headers : {},
+		                            resBodyB64: resBodyBuf.length ? resBodyBuf.toString('base64') : '',
+		                          });
+		                        } catch (_) {}
+		                      });
+		                    } catch (_) {}
+		                  });
+		                } catch (_) {}
+		                return req;
+		              }
+		            }
+		          } catch (_) {}
+
+			          const it = __pickInterceptor(host);
+			          if (it) {
+			            try {
 		              const { EventEmitter } = require('events');
 		              const { Readable } = require('stream');
 		              const interceptor = it;
@@ -1293,31 +2061,44 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			                        const buf = this._chunks && this._chunks.length ? Buffer.concat(this._chunks) : Buffer.alloc(0);
 			                        const body = buf.length ? buf.toString('utf8').slice(0, 4096) : '';
 			                        try { this._meta.body = body; } catch (_) {}
-			                        try {
-			                          interceptor.log({
-			                          type: 'http',
-			                          host: this._meta.host || '',
-			                          method: this._meta.method || '',
-		                          path: this._meta.path || '',
-		                          headers: this._meta.headers || {},
-			                          body,
-			                          });
-			                        } catch (_) {}
-			                      } catch (_) {}
-			                      const mocked = interceptor.mock(this._meta);
-			                      try {
-			                        interceptor.log({
-			                          type: 'mock',
-			                          via: 'http',
-			                          kind: mocked.kind,
-			                          host: this._meta.host || '',
-			                          method: this._meta.method || '',
+				                        try {
+				                          interceptor.log({
+				                          type: 'http',
+				                          host: this._meta.host || '',
+				                          method: this._meta.method || '',
 			                          path: this._meta.path || '',
-			                          stoken: mocked.kind === 'token' ? (__tryParseJson(mocked.payload)?.data?.stoken || '') : '',
-			                        });
-			                      } catch (_) {}
-				                      const payload = mocked && mocked.payload != null ? String(mocked.payload) : '';
-				                      const res = Readable.from([Buffer.from(payload, 'utf8')]);
+			                          headers: this._meta.headers || {},
+				                          body,
+				                          stack: this._meta.stack || '',
+				                          });
+				                        } catch (_) {}
+				                      } catch (_) {}
+				                      const mocked = interceptor.mock(this._meta);
+				                      try {
+				                        interceptor.log({
+				                          type: 'mock',
+				                          via: 'http',
+				                          kind: mocked.kind,
+				                          host: this._meta.host || '',
+				                          method: this._meta.method || '',
+				                          path: this._meta.path || '',
+				                          stoken: mocked.kind === 'token' ? (__tryParseJson(mocked.payload)?.data?.stoken || '') : '',
+				                          stack: this._meta.stack || '',
+				                        });
+				                      } catch (_) {}
+					                      const payloadBuf = (() => {
+					                        try {
+					                          const b64 = mocked && typeof mocked.payloadB64 === 'string' ? mocked.payloadB64 : '';
+					                          if (b64) return Buffer.from(b64, 'base64');
+					                        } catch (_) {}
+					                        try {
+					                          return Buffer.from(mocked && mocked.payload != null ? String(mocked.payload) : '', 'utf8');
+					                        } catch (_) {
+					                          return Buffer.alloc(0);
+					                        }
+					                      })();
+					                      const payload = payloadBuf.toString('utf8');
+					                      const res = Readable.from([payloadBuf]);
 				                      const statusCode = mocked && Number.isFinite(mocked.statusCode) ? mocked.statusCode : 200;
 				                      const headersRaw = mocked && mocked.headers && typeof mocked.headers === 'object' ? mocked.headers : null;
 				                      const headers = headersRaw || { 'content-type': 'application/json; charset=utf-8', 'set-cookie': [] };
@@ -1381,19 +2162,19 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 	                getHeader() { return undefined; }
 	                removeHeader() { return; }
 	              }
-		              const meta = (() => {
-		                try {
-		                  const method = options && typeof options === 'object' && options.method ? String(options.method).toUpperCase() : 'GET';
-		                  const pth = options && typeof options === 'object' && typeof options.path === 'string' ? options.path : '';
-		                  const hdrs = options && typeof options === 'object' && options.headers && typeof options.headers === 'object' ? options.headers : {};
-		                  return { host, method, path: pth, headers: hdrs };
-		                } catch (_) {
-		                  return { host };
-		                }
-		              })();
-		              return new __CatPawBlockedRequest(new Error('blocked by CATPAW_MOCK'), meta);
-		            } catch (_) {
-		              throw new Error('blocked by CATPAW_MOCK');
+			              const meta = (() => {
+			                try {
+			                  const method = options && typeof options === 'object' && options.method ? String(options.method).toUpperCase() : 'GET';
+			                  const pth = options && typeof options === 'object' && typeof options.path === 'string' ? options.path : '';
+			                  const hdrs = options && typeof options === 'object' && options.headers && typeof options.headers === 'object' ? options.headers : {};
+			                  return { host, method, path: pth, headers: hdrs, stack: __callStack };
+			                } catch (_) {
+			                  return { host, stack: __callStack };
+			                }
+			              })();
+			              return new __CatPawBlockedRequest(new Error('blocked by CATPAW_MOCK'), meta);
+			            } catch (_) {
+			              throw new Error('blocked by CATPAW_MOCK');
 		            }
 		          }
 
@@ -1784,11 +2565,28 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 	    const onlineLogPath = wantDebug ? path.resolve(rootDir, `online-runtime.${key}.log`) : '';
 	    let chosenPort = p;
 		    for (let attempt = 0; attempt < 6; attempt += 1) {
+		        const mockProviders = 'quark,uc,139,baidu,tianyi';
+		        const mockEnv = panMock
+		            ? {
+		                CATPAW_MOCK: '1',
+		                CATPAW_MOCK_PROVIDER: '',
+		                CATPAW_MOCK_PROVIDERS: mockProviders,
+		                CATPAW_BLOCK_QUARK: '',
+		            }
+		            : {
+		                // Force disable even if parent process env has it set.
+		                CATPAW_MOCK: '',
+		                CATPAW_MOCK_PROVIDER: '',
+		                CATPAW_MOCK_PROVIDERS: '',
+		                CATPAW_BLOCK_QUARK: '',
+		            };
 		        const child = spawn(process.execPath, [bootstrapPath], {
 		            stdio,
 		            cwd: rootDir,
 		            env: {
 		                ...process.env,
+		                // Where to write intercept logs / tapes by default (so users can find them easily).
+		                CATPAW_LOG_ROOT: process.cwd(),
 		                DEV_HTTP_PORT: String(chosenPort),
 		                PORT: String(chosenPort),
 		                HTTP_PORT: String(chosenPort),
@@ -1797,6 +2595,7 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 		                ONLINE_CWD: rootDir,
 		                CATPAW_DEBUG_LOG: onlineLogPath,
 		                NODE_PATH: rootDir,
+		                ...mockEnv,
 		            },
 		        });
 		        children.set(key, { child, entry, port: chosenPort });
