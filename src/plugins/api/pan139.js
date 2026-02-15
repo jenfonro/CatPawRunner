@@ -292,6 +292,36 @@ function parsePlayId(idStr) {
     return { linkID, contentId, coID };
 }
 
+async function getOutLinkInfoV6Signed({ linkID, pCaID, authorization }) {
+    const auth = stripBasicPrefix(authorization);
+    if (!auth) throw new Error('missing authorization');
+    const account = decodeAccountFromAuthorization(auth);
+    if (!account) throw new Error('authorization invalid (missing account)');
+
+    const payload = {
+        getOutLinkInfoReq: { account, linkID: toStr(linkID), pCaID: toStr(pCaID || '') },
+        commonAccountInfo: { account, accountType: 1 },
+    };
+    const plain = JSON.stringify(payload);
+    const enc = aesCbcEncryptBase64(KEY_OUTLINK, plain);
+    const body = JSON.stringify(enc);
+    const headers = buildMcloudHeaders({ authorization: auth, bodyForSign: plain });
+    const url = `${OUTLINK_API_BASE}getOutLinkInfoV6`;
+
+    const resp = await fetchText(url, { method: 'POST', headers, body });
+    const decoded = decryptOutlinkResponse(resp.text);
+    return { resp, parsed: decoded.parsed, rawText: decoded.rawText, decrypted: decoded.decrypted };
+}
+
+function pickOutlinkCoList(parsed) {
+    const p = parsed && typeof parsed === 'object' ? parsed : null;
+    const data = p && typeof p.data === 'object' && p.data ? p.data : null;
+    const list = (data && (data.coLst || data.co_list || data.list)) || (p && (p.coLst || p.list)) || [];
+    if (Array.isArray(list)) return list;
+    if (list && typeof list === 'object' && Array.isArray(list.item)) return list.item;
+    return [];
+}
+
 async function outlinkDlFromOutLinkV3Signed({ linkID, contentId, coID, authorization }) {
     const auth = stripBasicPrefix(authorization);
     if (!auth) throw new Error('missing authorization');
@@ -338,6 +368,44 @@ export const apiPlugins = [
     {
         prefix: '/api/139',
         plugin: async function pan139Api(instance) {
+            // List OutLink root files and return 0119-style `vod_play_url`.
+            // Input: { flag: "逸动-<linkID>" }  Output: { ok, vod_play_url }
+            instance.post('/list', async (req, reply) => {
+                const body = normalizeRequestBody(req && req.body);
+                const flag = toStr(body.flag || '').trim();
+                const linkID = toStr(body.linkID || body.linkId || parseLinkIDFromFlag(flag)).trim();
+                if (!linkID) {
+                    reply.code(400);
+                    return { ok: false, message: 'missing/invalid flag (expected: 逸动-<linkID>)' };
+                }
+                try {
+                    const authorization = await get139Authorization(instance);
+                    const out = await getOutLinkInfoV6Signed({ linkID, pCaID: '', authorization });
+                    const parsed = out.parsed;
+                    const code = parsed && (parsed.code ?? parsed.resultCode);
+                    if (String(code) !== '0') {
+                        const desc = parsed && (parsed.desc || parsed.message);
+                        reply.code(502);
+                        return { ok: false, message: desc ? `${toStr(code || 'error')}: ${toStr(desc)}` : toStr(code || 'failed') };
+                    }
+
+                    const coLst = pickOutlinkCoList(parsed);
+                    const parts = [];
+                    for (const it of coLst) {
+                        if (!it || typeof it !== 'object') continue;
+                        const name = toStr(it.coName || it.name || it.fileName || '').trim();
+                        const coID = toStr(it.coID || it.coId || it.id || '').trim();
+                        if (!name || !coID) continue;
+                        const id = `${linkID}||${coID}|${name}`;
+                        parts.push(`${name}$${id}`);
+                    }
+                    return { ok: true, vod_play_url: parts.join('#') };
+                } catch (e) {
+                    reply.code(502);
+                    return { ok: false, message: (e && e.message) || String(e) };
+                }
+            });
+
             instance.post('/play', async (req, reply) => {
                 const body = normalizeRequestBody(req && req.body);
                 const flag = toStr(body.flag || '').trim();
@@ -356,9 +424,9 @@ export const apiPlugins = [
                     reply.code(400);
                     return { ok: false, message: 'missing linkID (from id/flag)' };
                 }
-                if (!contentId) {
+                if (!contentId && !coID) {
                     reply.code(400);
-                    return { ok: false, message: 'missing contentId (from id)' };
+                    return { ok: false, message: 'missing contentId/coID (from id)' };
                 }
 
                 try {

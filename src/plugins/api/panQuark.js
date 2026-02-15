@@ -87,6 +87,55 @@ function sha256Hex(input) {
   return crypto.createHash('sha256').update(String(input == null ? '' : input)).digest('hex');
 }
 
+function parseQuarkShareIdFromFlag(flag) {
+  const raw = String(flag || '').trim();
+  if (!raw) return '';
+  try {
+    if (raw.includes('pan.quark.cn')) {
+      const p = parseQuarkShareUrl(raw);
+      if (p && p.shareId) return String(p.shareId || '').trim();
+    }
+  } catch {}
+  // Examples: "夸父-2b61bf950027" / "quark-xxxx"
+  const m = raw.match(/(?:夸父|quark)[-_ ]*([a-z0-9]+)/i);
+  return m && m[1] ? String(m[1]).trim() : '';
+}
+
+function pickQuarkShareFileList(detail) {
+  const d = detail && typeof detail === 'object' ? detail : null;
+  const list =
+    (d && d.data && typeof d.data === 'object' && (d.data.list || d.data.items || d.data.files)) ||
+    (d && d.list) ||
+    [];
+  return Array.isArray(list) ? list : [];
+}
+
+function isQuarkDirItem(it) {
+  if (!it || typeof it !== 'object') return false;
+  if (it.dir === true || it.file === false) return true;
+  const ft = Number(it.file_type);
+  // In Quark share/detail, file_type=0 is folder, 1 is file.
+  if (Number.isFinite(ft) && ft === 0) return true;
+  const kind = String(it.type || it.kind || '').trim().toLowerCase();
+  if (kind === 'folder' || kind === 'dir' || kind === 'directory') return true;
+  return false;
+}
+
+function getQuarkItemFid(it) {
+  if (!it || typeof it !== 'object') return '';
+  return String(it.fid || it.file_id || it.fileId || it.id || '').trim();
+}
+
+function getQuarkItemFidToken(it) {
+  if (!it || typeof it !== 'object') return '';
+  return String(it.share_fid_token || it.fid_token || it.fidToken || it.token || '').trim();
+}
+
+function getQuarkItemName(it) {
+  if (!it || typeof it !== 'object') return '';
+  return String(it.file_name || it.fileName || it.name || '').trim();
+}
+
 function quarkTvGenerateReqSign(method, pathname, deviceId) {
   const m = String(method || 'GET').toUpperCase();
   const p = String(pathname || '').trim() || '/';
@@ -381,9 +430,57 @@ function atomicWriteFile(filePath, content) {
   fs.renameSync(tmp, filePath);
 }
 
+function readTextFileSafe(filePath) {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return '';
+    return fs.readFileSync(filePath, 'utf8');
+  } catch {
+    return '';
+  }
+}
+
 function writeJsonFileAtomic(filePath, obj) {
   const root = obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : {};
   atomicWriteFile(filePath, `${JSON.stringify(root, null, 2)}\n`);
+}
+
+function getErrorLogPath() {
+  try {
+    return path.resolve(resolveRuntimeRootDir(), 'error.log');
+  } catch {
+    return path.resolve(process.cwd(), 'error.log');
+  }
+}
+
+function upsertErrorLogByShareId(record) {
+  const r = record && typeof record === 'object' && !Array.isArray(record) ? record : null;
+  const shareId = String((r && r.shareId) || '').trim();
+  if (!shareId) return;
+
+  const logPath = getErrorLogPath();
+  const raw = readTextFileSafe(logPath);
+  const map = new Map();
+  for (const line of raw.split(/\r?\n/)) {
+    const s = String(line || '').trim();
+    if (!s) continue;
+    try {
+      const obj = JSON.parse(s);
+      const sid = String((obj && obj.shareId) || '').trim();
+      if (sid) map.set(sid, obj);
+    } catch {}
+  }
+  map.set(shareId, { t: Date.now(), provider: 'quark', ...r });
+  const out = Array.from(map.entries())
+    .sort((a, b) => a[0].localeCompare(b[0], 'en'))
+    .map(([, v]) => JSON.stringify(v))
+    .join('\n');
+  atomicWriteFile(logPath, `${out}\n`);
+}
+
+function isQuarkNeedPasscodeError(err) {
+  const msg = String((err && err.message) || '').toLowerCase();
+  if (!msg) return false;
+  return msg.includes('passcode') || msg.includes('访问码') || msg.includes('提取码') || msg.includes('密码');
 }
 
 function getQuarkCookieFromDbRoot(root) {
@@ -1164,6 +1261,64 @@ const apiPlugins = [
           return { ok: true, ...out };
         } catch (e) {
           const msg = (e && e.message) || String(e);
+          reply.code(502);
+          return { ok: false, message: msg.slice(0, 400) };
+        }
+      });
+
+      // List share root files and return 0119-style `vod_play_url`.
+      // Input: { flag: "夸父-<shareId>" | "quark-<shareId>", passcode? }  Output: { ok, vod_play_url }
+      instance.post('/list', async (req, reply) => {
+        const body = req && typeof req.body === 'object' ? req.body : {};
+        const flag = String(body.flag || body.shareCode || body.shareId || body.share_id || '').trim();
+        const shareId = parseQuarkShareIdFromFlag(flag);
+        if (!shareId) {
+          reply.code(400);
+          return { ok: false, message: 'missing/invalid flag (expected: 夸父-<shareId>)' };
+        }
+        const root = await readDbRoot(req.server);
+        const cookie = getQuarkCookieFromDbRoot(root);
+        if (!cookie) {
+          reply.code(400);
+          return { ok: false, message: 'missing quark cookie' };
+        }
+        const passcodeIn = String(body.passcode || body.pwd || '').trim();
+        try {
+          const out = await getShareDetail({
+            shareId,
+            stoken: '',
+            passcode: passcodeIn,
+            pdirFid: '0',
+            cookie,
+          });
+          const stoken = String(out && out.stoken ? out.stoken : '').trim();
+          const detail = out && out.detail ? out.detail : null;
+          const list = pickQuarkShareFileList(detail);
+
+          const parts = [];
+          for (const it of list) {
+            if (isQuarkDirItem(it)) continue;
+            const fid = getQuarkItemFid(it);
+            const fidToken = getQuarkItemFidToken(it);
+            const name = getQuarkItemName(it);
+            if (!fid || !fidToken || !name) continue;
+            const id = `${shareId}*${stoken}*${fid}*${fidToken}***${name}`;
+            parts.push(`${name}$${id}`);
+          }
+          return { ok: true, vod_play_url: parts.join('#') };
+        } catch (e) {
+          const msg = (e && e.message) || String(e);
+          try {
+            if (isQuarkNeedPasscodeError(e)) {
+              upsertErrorLogByShareId({
+                api: '/api/quark/list',
+                shareId,
+                needPasscode: true,
+                passcodeProvided: !!passcodeIn,
+                message: msg.slice(0, 400),
+              });
+            }
+          } catch {}
           reply.code(502);
           return { ok: false, message: msg.slice(0, 400) };
         }
