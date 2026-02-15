@@ -142,6 +142,12 @@ function is139Flag(flag) {
     return s.includes('逸动') || s.includes('139') || s.includes('和彩云') || s.includes('移动');
 }
 
+function is189Flag(flag) {
+    const s = String(flag || '');
+    const lower = s.toLowerCase();
+    return s.includes('天意') || s.includes('天翼') || s.includes('189') || lower.includes('cloud.189.cn') || lower.includes('tianyi');
+}
+
 function pickStringField(obj, keys) {
     const o = obj && typeof obj === 'object' ? obj : {};
     for (const k of Array.isArray(keys) ? keys : []) {
@@ -244,7 +250,7 @@ export default async function router(fastify) {
     }
 
     // Unified play entrypoint:
-    // - if builtin pan resolver enabled: dispatch to /api/{baidu,quark,uc,139}/play based on flag
+    // - if builtin pan resolver enabled: dispatch to /api/{baidu,quark,uc,139,189}/play based on flag
     // - otherwise (or no match): forward to the target runtime play via siteApi + siteId
     fastify.post('/play', async function (request, reply) {
         const body = request && request.body && typeof request.body === 'object' ? request.body : {};
@@ -270,7 +276,17 @@ export default async function router(fastify) {
 
         // 1) builtin pan resolver path
         if (panEnabled) {
-            let route = isBaiduFlag(flag) ? '/api/baidu/play' : isQuarkFlag(flag) ? '/api/quark/play' : isUcFlag(flag) ? '/api/uc/play' : is139Flag(flag) ? '/api/139/play' : '';
+            let route = isBaiduFlag(flag)
+                ? '/api/baidu/play'
+                : isQuarkFlag(flag)
+                    ? '/api/quark/play'
+                    : isUcFlag(flag)
+                        ? '/api/uc/play'
+                        : is139Flag(flag)
+                            ? '/api/139/play'
+                            : is189Flag(flag)
+                                ? '/api/189/play'
+                                : '';
             const shareUrl =
                 pickStringField(body, ['url', 'shareUrl', 'shareURL', 'share_url']) ||
                 extractFirstUrl(flag) ||
