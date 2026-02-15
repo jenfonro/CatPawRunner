@@ -1,5 +1,6 @@
 // Tianyi (天翼云盘 / cloud.189.cn) share API plugin.
 // Keep only minimal endpoints:
+// - POST /api/189/list (root list from share flag/code)
 // - POST /api/189/share/info
 // - POST /api/189/share/list
 // - POST /api/189/file/download
@@ -24,6 +25,15 @@ function atomicWriteFile(filePath, content) {
   const tmp = path.resolve(dir, `.${path.basename(filePath)}.tmp.${process.pid}.${Date.now()}`);
   fs.writeFileSync(tmp, content, 'utf8');
   fs.renameSync(tmp, filePath);
+}
+
+function readTextFileSafe(filePath) {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return '';
+    return fs.readFileSync(filePath, 'utf8');
+  } catch (_) {
+    return '';
+  }
 }
 
 function writeJsonFileAtomic(filePath, obj) {
@@ -494,6 +504,16 @@ function normalizeBody(body) {
   return body && typeof body === 'object' && !Array.isArray(body) ? body : {};
 }
 
+function parse189ShareCodeLike(str) {
+  const s = toStr(str).trim();
+  if (!s) return { shareCode: '', accessCode: '' };
+
+  // Strict spider flag format (only): "天意-<shareCode>"
+  const m = s.match(/^天意-([A-Za-z0-9]{6,64})$/);
+  const shareCode = m && m[1] ? toStr(m[1]).trim() : '';
+  return { shareCode, accessCode: '' };
+}
+
 function buildUrl(pathname, query) {
   const u = new URL(String(pathname || ''), TIANYI_API_BASE);
   const q = query && typeof query === 'object' ? query : {};
@@ -540,6 +560,18 @@ function pickTianyiResCode(resp) {
   return { code, msg };
 }
 
+function pickTianyiErrorCodeFromError(err) {
+  try {
+    if (!err) return { code: null, msg: '' };
+    if (Object.prototype.hasOwnProperty.call(err, 'res_code') || Object.prototype.hasOwnProperty.call(err, 'res_message')) {
+      return { code: err.res_code ?? null, msg: toStr(err.res_message ?? err.message ?? '').trim() };
+    }
+    const body = err.body && typeof err.body === 'object' && !Array.isArray(err.body) ? err.body : null;
+    if (body) return pickTianyiResCode(body);
+  } catch (_) {}
+  return { code: null, msg: toStr(err && err.message).trim() };
+}
+
 function assertTianyiOk(resp, ctx) {
   const { code, msg } = pickTianyiResCode(resp);
   if (code === null) return;
@@ -548,6 +580,8 @@ function assertTianyiOk(resp, ctx) {
   err.body = resp;
   err.res_code = code;
   err.res_message = msg;
+  const ml = toStr(msg).toLowerCase();
+  if (ml.includes('accesscode') || ml.includes('访问码') || ml.includes('提取码') || ml.includes('密码')) err.needAccessCode = true;
   throw err;
 }
 
@@ -555,6 +589,92 @@ function isTianyiSessionExpiredError(err) {
   const m = toStr(err && err.message).toLowerCase();
   if (!m) return false;
   return m.includes('invalidsessionkey') || m.includes('usersessionbo is null') || m.includes('session expired');
+}
+
+function getErrorLogPath() {
+  try {
+    return path.resolve(resolveRuntimeRootDir(), 'error.log');
+  } catch (_) {
+    return path.resolve(process.cwd(), 'error.log');
+  }
+}
+
+function upsertErrorLogByShareCode(record) {
+  const r = record && typeof record === 'object' && !Array.isArray(record) ? record : null;
+  const shareCode = toStr(r && r.shareCode).trim();
+  if (!shareCode) return;
+
+  const logPath = getErrorLogPath();
+  const raw = readTextFileSafe(logPath);
+  const map = new Map();
+  for (const line of raw.split(/\r?\n/)) {
+    const s = toStr(line).trim();
+    if (!s) continue;
+    try {
+      const obj = JSON.parse(s);
+      const sc = toStr(obj && obj.shareCode).trim();
+      if (sc) map.set(sc, obj);
+    } catch (_) {}
+  }
+  map.set(shareCode, { t: Date.now(), ...r });
+
+  const out = Array.from(map.entries())
+    .sort((a, b) => a[0].localeCompare(b[0], 'en'))
+    .map(([, v]) => JSON.stringify(v))
+    .join('\n');
+  atomicWriteFile(logPath, `${out}\n`);
+}
+
+function shareInfoRequiresAccessCode(info) {
+  const i = info && typeof info === 'object' && !Array.isArray(info) ? info : {};
+  if (i.needAccessCode === 1 || i.needAccessCode === '1' || i.needAccessCode === true) return true;
+  if (i.needAccessCode === 0 || i.needAccessCode === '0' || i.needAccessCode === false) return false;
+  const msg = toStr(i.res_message || i.resMessage || i.message || '').toLowerCase();
+  return msg.includes('accesscode') || msg.includes('访问码') || msg.includes('提取码') || msg.includes('密码');
+}
+
+function isNeedAccessCodeError(err) {
+  if (!err) return false;
+  if (err.needAccessCode) return true;
+  const msg = toStr(err.message).toLowerCase();
+  if (msg.includes('accesscode') || msg.includes('访问码') || msg.includes('提取码') || msg.includes('密码')) return true;
+  const body = err.body && typeof err.body === 'object' ? err.body : null;
+  if (body) {
+    const { msg: m2 } = pickTianyiResCode(body);
+    const ml = toStr(m2).toLowerCase();
+    if (ml.includes('accesscode') || ml.includes('访问码') || ml.includes('提取码') || ml.includes('密码')) return true;
+  }
+  const raw = toStr(err.rawText).toLowerCase();
+  return raw.includes('accesscode') || raw.includes('访问码') || raw.includes('提取码') || raw.includes('密码');
+}
+
+function normalize189FileListFromShareListResp(respData) {
+  const root = respData && typeof respData === 'object' && !Array.isArray(respData) ? respData : {};
+  const fileList =
+    root.fileListAO && typeof root.fileListAO === 'object' && Array.isArray(root.fileListAO.fileList)
+      ? root.fileListAO.fileList
+      : root.data && typeof root.data === 'object' && root.data.fileListAO && typeof root.data.fileListAO === 'object' && Array.isArray(root.data.fileListAO.fileList)
+        ? root.data.fileListAO.fileList
+        : [];
+
+  return fileList
+    .map((it) => {
+      const o = it && typeof it === 'object' && !Array.isArray(it) ? it : {};
+      const fileId = toStr(o.id || o.fileId || o.file_id).trim();
+      const name = toStr(o.name || o.fileName || o.file_name).trim();
+      const sizeRaw = o.size != null ? o.size : o.fileSize != null ? o.fileSize : o.file_size != null ? o.file_size : 0;
+      const size = Number.isFinite(Number(sizeRaw)) ? Math.max(0, Math.trunc(Number(sizeRaw))) : 0;
+      const lastOpTime = toStr(o.lastOpTime || o.lastOpDate || o.fileLastOpTime || o.last_op_time).trim();
+      const fileCata = Number.isFinite(Number(o.fileCata)) ? Math.trunc(Number(o.fileCata)) : null;
+      const isFolder =
+        typeof o.isFolder === 'boolean'
+          ? o.isFolder
+          : typeof o.isfolder === 'boolean'
+            ? o.isfolder
+            : fileCata === 0;
+      return { fileId, name, size, lastOpTime, isFolder };
+    })
+    .filter((x) => x && x.fileId && x.name);
 }
 
 async function tianyiListShareDir({ shareId, fileId, shareMode, pageNum, pageSize, orderBy, descending, accessCode, cookie }) {
@@ -616,6 +736,121 @@ export const apiPlugins = [
   {
     prefix: '/api/189',
     plugin: async function pan189Api(instance) {
+      instance.post('/list', async (req, reply) => {
+        const body = normalizeBody(req && req.body);
+        const flag = toStr(body.flag || body.from || body.play_from).trim();
+        const parsed = parse189ShareCodeLike(flag);
+        const shareCode = parsed.shareCode;
+        const accessCode = toStr(body.accessCode || body.passcode || body.pwd || body.password).trim();
+        const pageSizeRaw = body.pageSize != null ? body.pageSize : body.size != null ? body.size : 200;
+        const pageSize = Number.isFinite(Number(pageSizeRaw)) ? Math.max(1, Math.min(1000, Math.trunc(Number(pageSizeRaw)))) : 200;
+        if (!shareCode) return reply.code(400).send({ ok: false, message: 'missing/invalid flag (expected: 天意-<shareCode>)' });
+
+        let shareIdForLog = '';
+        try {
+          let ensured = await ensure189Cookie();
+          let cookie = toStr(ensured.cookie).trim();
+          if (!cookie && ensured && ensured.missingCred) {
+            return reply.code(400).send({ ok: false, message: 'missing 189 cookie; set account["189"].cookie or account["189"].username/password in config.json' });
+          }
+
+          let infoOut;
+          try {
+            infoOut = await tianyiGetShareInfoByCode({ shareCode, accessCode, cookie });
+            assertTianyiOk(infoOut.data, 'tianyi share info');
+          } catch (e) {
+            if (isTianyiSessionExpiredError(e)) {
+              ensured = await ensure189Cookie({ forceRefresh: true });
+              cookie = toStr(ensured.cookie).trim();
+              infoOut = await tianyiGetShareInfoByCode({ shareCode, accessCode, cookie });
+              assertTianyiOk(infoOut.data, 'tianyi share info');
+            } else {
+              throw e;
+            }
+          }
+
+          const info = infoOut && infoOut.data && typeof infoOut.data === 'object' ? infoOut.data : {};
+          const shareId = toStr(info.shareId || info.share_id).trim();
+          shareIdForLog = shareId;
+          const rootFileId = toStr(info.fileId || info.file_id || '0').trim() || '0';
+          const isFolder = typeof info.isFolder === 'boolean' ? info.isFolder : String(info.isFolder || '').toLowerCase() === 'true';
+          if (!shareId) return reply.code(502).send({ ok: false, message: 'tianyi share info: missing shareId', info });
+          if (shareInfoRequiresAccessCode(info) && !accessCode) {
+            return reply.code(401).send({ ok: false, needAccessCode: true, message: 'tianyi share requires accessCode', shareCode, shareId, fileId: rootFileId });
+          }
+
+          if (!isFolder) {
+            const name = toStr(info.fileName || info.name).trim() || 'file';
+            const fileId = toStr(info.fileId || info.file_id).trim();
+            const id = fileId && shareId ? `${fileId}*${shareId}*${name}` : '';
+            return {
+              ok: true,
+              shareCode,
+              shareId,
+              fileId: rootFileId,
+              vod_play_url: id ? `${name}$${id}` : '',
+            };
+          }
+
+          let listOut;
+          try {
+            listOut = await tianyiListShareDir({
+              shareId,
+              fileId: rootFileId,
+              shareMode: body.shareMode || info.shareMode,
+              pageNum: 1,
+              pageSize,
+              orderBy: body.orderBy || 'lastOpTime',
+              descending: body.descending != null ? body.descending : true,
+              accessCode,
+              cookie,
+            });
+            assertTianyiOk(listOut.data, 'tianyi share list');
+          } catch (e) {
+            if (isTianyiSessionExpiredError(e)) {
+              ensured = await ensure189Cookie({ forceRefresh: true });
+              cookie = toStr(ensured.cookie).trim();
+              listOut = await tianyiListShareDir({
+                shareId,
+                fileId: rootFileId,
+                shareMode: body.shareMode || info.shareMode,
+                pageNum: 1,
+                pageSize,
+                orderBy: body.orderBy || 'lastOpTime',
+                descending: body.descending != null ? body.descending : true,
+                accessCode,
+                cookie,
+              });
+              assertTianyiOk(listOut.data, 'tianyi share list');
+            } else {
+              throw e;
+            }
+          }
+
+          const files = normalize189FileListFromShareListResp(listOut.data);
+          const vod_play_url = files
+            .filter((f) => f && !f.isFolder && f.fileId && f.name)
+            .map((f) => `${f.name}$${f.fileId}*${shareId}*${f.name}`)
+            .join('#');
+          return { ok: true, shareCode, shareId, fileId: rootFileId, vod_play_url };
+        } catch (e) {
+          try {
+            if (!isNeedAccessCodeError(e)) {
+              const { code, msg } = pickTianyiErrorCodeFromError(e);
+              upsertErrorLogByShareCode({
+                provider: '189',
+                api: '/api/189/list',
+                shareCode,
+                shareId: shareIdForLog,
+                code,
+                message: msg || toStr(e && e.message).trim(),
+              });
+            }
+          } catch (_) {}
+          return reply.code(502).send({ ok: false, message: (e && e.message) || String(e) });
+        }
+      });
+
       instance.post('/share/info', async (req, reply) => {
         const body = normalizeBody(req && req.body);
         const shareCode = toStr(body.shareCode || body.code || body.share_code).trim();
@@ -627,8 +862,10 @@ export const apiPlugins = [
           const cookie = toStr(ensured.cookie).trim();
           const out = await tianyiGetShareInfoByCode({ shareCode, accessCode, cookie });
           assertTianyiOk(out.data, 'tianyi share info');
-          return { ok: true, shareCode, info: out.data, rawText: out.text };
+          const needAccessCode = shareInfoRequiresAccessCode(out.data) && !accessCode;
+          return { ok: true, shareCode, needAccessCode, info: out.data, rawText: out.text };
         } catch (e) {
+          if (isNeedAccessCodeError(e)) return reply.code(401).send({ ok: false, needAccessCode: true, message: 'tianyi share requires accessCode' });
           return reply.code(502).send({ ok: false, message: (e && e.message) || String(e) });
         }
       });
@@ -657,6 +894,7 @@ export const apiPlugins = [
           assertTianyiOk(out.data, 'tianyi share list');
           return { ok: true, shareId, fileId, detail: out.data, rawText: out.text };
         } catch (e) {
+          if (isNeedAccessCodeError(e)) return reply.code(401).send({ ok: false, needAccessCode: true, message: 'tianyi share requires accessCode' });
           return reply.code(502).send({ ok: false, message: (e && e.message) || String(e) });
         }
       });
@@ -694,6 +932,7 @@ export const apiPlugins = [
           const url = url0 ? await resolveFinalUrl(url0) : '';
           return { ok: true, shareId, fileId, url, data: out.data, rawText: out.text };
         } catch (e) {
+          if (isNeedAccessCodeError(e)) return reply.code(401).send({ ok: false, needAccessCode: true, message: 'tianyi share requires accessCode' });
           return reply.code(502).send({ ok: false, message: (e && e.message) || String(e) });
         }
       });
@@ -741,6 +980,7 @@ export const apiPlugins = [
             fileName: parsed.fileName,
           };
         } catch (e) {
+          if (isNeedAccessCodeError(e)) return reply.code(401).send({ ok: false, needAccessCode: true, message: 'tianyi share requires accessCode' });
           return reply.code(502).send({ ok: false, message: (e && e.message) || String(e) });
         }
       });
