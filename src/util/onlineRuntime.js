@@ -395,7 +395,7 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 	    };
 		    // Unified mock/debug switches:
 		    // - CATPAW_MOCK=1 enables interceptors (default target: quark)
-		    // - CATPAW_MOCK_PROVIDER=uc | quark (single) or CATPAW_MOCK_PROVIDERS=uc,quark
+			    // - CATPAW_MOCK_PROVIDER=uc | quark | 139 | baidu (single) or CATPAW_MOCK_PROVIDERS=uc,quark,139,baidu
 		    // - CATPAW_MOCK_DEBUG (optional): when set, '1' enables log; any other value disables
 		    const __mockEnabled =
 		      String(process.env.CATPAW_MOCK || '').trim() === '1' ||
@@ -482,6 +482,13 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			      // - yun.139.com
 			      // - share-kd-njs.yun.139.com
 			      return !!(h && (h === 'yun.139.com' || h.endsWith('.yun.139.com')));
+			    };
+			    const __isBaiduPanHost = (host) => {
+			      const h = __normalizeHost(host);
+			      // Baidu Netdisk share endpoints (script side):
+			      // - pan.baidu.com
+			      // Some flows may also touch other subdomains, but start with the share domain.
+			      return !!(h && (h === 'pan.baidu.com' || h.endsWith('.pan.baidu.com')));
 			    };
 			    const __mkInterceptLogPath = (name) => {
 			      try {
@@ -828,6 +835,130 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			    if (__pan139Interceptor && __pan139Interceptor.enabled) {
 			      try { __pan139Interceptor.log({ type: 'boot', version: __mockVersion, targets: Array.from(__mockTargets) }); } catch (_) {}
 			      __interceptors.push(__pan139Interceptor);
+			    }
+
+			    const __baiduMockPayloadFor = (meta) => {
+			      try {
+			        const pathLike = meta && meta.path ? String(meta.path) : '';
+			        const bodyLike = meta && meta.body ? String(meta.body) : '';
+			        const nowS = () => Math.floor(Date.now() / 1000);
+
+			        const urlObj = (() => {
+			          try { return new URL('https://pan.baidu.com' + pathLike); } catch (_) { return null; }
+			        })();
+			        const qp = (k) => {
+			          try { return urlObj ? String(urlObj.searchParams.get(k) || '') : ''; } catch (_) { return ''; }
+			        };
+			        const surl = qp('surl') || qp('shorturl') || '';
+
+			        const md5hex = (s) => {
+			          try {
+			            return nodeCrypto.createHash('md5').update(String(s || ''), 'utf8').digest('hex');
+			          } catch (_) {
+			            return '0'.repeat(32);
+			          }
+			        };
+			        const shareid = 47340394925;
+			        const uk = 1099891027153;
+			        const fs_id = 439187793826381;
+			        const fileName = 'placeholder.mp4';
+			        const filePath = '/placeholder.mp4';
+			        const fileItem = {
+			          category: 1,
+			          extent_int8: 0,
+			          fs_id,
+			          isdir: 0,
+			          local_ctime: nowS(),
+			          local_mtime: nowS(),
+			          md5: md5hex('baidu:' + (surl || '') + ':' + fileName),
+			          path: filePath,
+			          server_ctime: nowS(),
+			          server_filename: fileName,
+			          server_mtime: nowS(),
+			          size: 874 * 1024 * 1024,
+			          thumbs: {
+			            url1: '',
+			            url2: '',
+			            url3: '',
+			            icon: '',
+			          },
+			        };
+
+				        if (pathLike.startsWith('/share/verify')) {
+				          // Baidu share passcode verify. Set BDCLND to mimic real behavior.
+				          const randsk = 'mock_randsk';
+				          const payload = JSON.stringify({ errno: 0, err_msg: 'ok', request_id: Date.now(), surl, t: nowS(), randsk });
+				          return {
+				            kind: 'share_verify',
+				            payload,
+				            statusCode: 200,
+				            headers: {
+				              'content-type': 'application/json; charset=utf-8',
+				              'set-cookie': ['BDCLND=' + randsk + '; Path=/; Domain=pan.baidu.com'],
+				            },
+				          };
+				        }
+
+				        if (pathLike.startsWith('/share/list')) {
+				          const payloadObj = {
+				            errno: 0,
+				            err_msg: 'ok',
+				            randsk: 'mock_randsk',
+				            uk,
+				            shareid,
+				            surl: surl || '',
+				            list: [fileItem],
+				            data: { uk, shareid, list: [fileItem] },
+				          };
+				          return { kind: 'share_list', payload: JSON.stringify(payloadObj) };
+				        }
+
+			        if (pathLike.startsWith('/api/loginStatus')) {
+			          const payloadObj = { errno: 0, err_msg: 'ok', bdstoken: 'mock_bdstoken', login_status: 1, uk };
+			          return { kind: 'login_status', payload: JSON.stringify(payloadObj) };
+			        }
+
+			        // Default: block, but keep path for debugging.
+			        return {
+			          kind: 'blocked',
+			          payload: JSON.stringify({
+			            status: 200,
+			            code: 1,
+			            message: 'blocked by CATPAW_MOCK',
+			            provider: 'baidu',
+			            path: pathLike,
+			            timestamp: nowS(),
+			            data: {},
+			          }),
+			        };
+			      } catch (_) {}
+			      return {
+			        kind: 'blocked',
+			        payload: JSON.stringify({
+			          status: 200,
+			          code: 1,
+			          message: 'blocked by CATPAW_MOCK',
+			          provider: 'baidu',
+			          timestamp: Math.floor(Date.now() / 1000),
+			          data: {},
+			        }),
+			      };
+			    };
+			    const __baiduInterceptor = (() => {
+			      const enabled = __mockEnabled && __mockTargets.has('baidu');
+			      const logPath = __mkInterceptLogPath('baidu');
+			      const log = (obj) => __appendInterceptLog(__mockDebug && enabled, logPath, obj);
+			      return {
+			        name: 'baidu',
+			        enabled,
+			        matchHost: (hostLike) => __isBaiduPanHost(hostLike),
+			        log,
+			        mock: (meta) => __baiduMockPayloadFor(meta),
+			      };
+			    })();
+			    if (__baiduInterceptor && __baiduInterceptor.enabled) {
+			      try { __baiduInterceptor.log({ type: 'boot', version: __mockVersion, targets: Array.from(__mockTargets) }); } catch (_) {}
+			      __interceptors.push(__baiduInterceptor);
 			    }
 
 				    const __ucMockPayloadFor = (meta) => {
@@ -1270,7 +1401,7 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 		          if (__isQuarkHost(host)) provider = 'quark';
 		          else if (__isUcHost(host) || host.includes('open-api-drive.uc.cn')) provider = 'uc';
 		          else if (__is139Host(host)) provider = '139';
-		          else if (host.endsWith('baidu.com')) provider = 'baidu';
+		          else if (__isBaiduPanHost(host) || host.endsWith('baidu.com')) provider = 'baidu';
 
 		          if (provider) {
 		            const cookie = pickCookie(provider);
