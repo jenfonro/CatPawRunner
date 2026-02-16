@@ -1,6 +1,7 @@
 dist
 generated
 node_modules
+build/
 config.json
 db.json
 runtime.log
