@@ -4,7 +4,7 @@ import http from 'node:http';
 import https from 'node:https';
 import { findAvailablePortInRange } from '../../util/tool.js';
 import { applyOnlineConfigs } from '../../util/onlineConfigStore.js';
-import { startOnlineRuntime, stopOnlineRuntime, stopAllOnlineRuntimes } from '../../util/onlineRuntime.js';
+import { startOnlineRuntime, stopOnlineRuntime, stopAllOnlineRuntimes, broadcastOnlineRuntimeMockConfig } from '../../util/onlineRuntime.js';
 
 function resolveRuntimeRootDir() {
     try {
@@ -612,6 +612,10 @@ export const apiPlugins = [
                     const msg = e && e.message ? String(e.message) : 'config write failed';
                     return reply.code(500).send({ success: false, message: msg });
                 }
+                try {
+                    // Allow toggling pan mock without restarting online runtimes.
+                    broadcastOnlineRuntimeMockConfig({ rootDir });
+                } catch (_) {}
 
                 let onlineResults = null;
                 if (onlineInput.provided) {
