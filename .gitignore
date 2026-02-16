@@ -1,8 +1,11 @@
 dist
 generated
 node_modules
+config.json
 db.json
 runtime.log
+error.log
+debug_log/
 .catpaw_online_runtime_bootstrap.cjs
 custom_spider/*.js
 custom_spider/*.cjs
