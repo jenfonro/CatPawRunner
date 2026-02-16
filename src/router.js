@@ -89,6 +89,17 @@ function readConfigJsonSafe(configPath) {
     }
 }
 
+function isPanMockEnabled() {
+    try {
+        const runtimeRoot = resolveRuntimeRootDir();
+        const cfgPath = path.resolve(runtimeRoot, 'config.json');
+        const cfgRoot = readConfigJsonSafe(cfgPath);
+        return !!(cfgRoot && cfgRoot.pan_mock);
+    } catch (_) {
+        return false;
+    }
+}
+
 function readPanBuiltinResolverEnabledFromConfigRoot(root) {
     const cfgRoot = root && typeof root === 'object' && !Array.isArray(root) ? root : {};
     if (Object.prototype.hasOwnProperty.call(cfgRoot, 'panResolver') && typeof cfgRoot.panResolver === 'boolean') return cfgRoot.panResolver;
@@ -659,6 +670,7 @@ export default async function router(fastify) {
     // This allows downloaded scripts in `custom_spider/` to expose their own routes while still being accessed from this port.
     const proxyToPort = async function (request, reply, targetPort, urlPath) {
         const pathToUse = typeof urlPath === 'string' && urlPath ? urlPath : '/';
+        const wantInjectPanMock = /\/spider\/[^/]+\/\d+\/detail(?:\?|$)/i.test(pathToUse);
 
         const hopByHop = new Set([
             'connection',
@@ -678,6 +690,8 @@ export default async function router(fastify) {
             if (!key || hopByHop.has(key)) return;
             headers[key] = inHeaders[k];
         });
+        // If we plan to parse and rewrite JSON, disable compression from upstream.
+        if (wantInjectPanMock) headers['accept-encoding'] = 'identity';
         headers.host = `127.0.0.1:${targetPort}`;
         // Fastify may have already consumed the incoming stream to populate `request.body`.
         // Never forward a stale Content-Length (will hang the upstream waiting for bytes).
@@ -717,11 +731,81 @@ export default async function router(fastify) {
                             });
                         }
                     } catch (_) {}
-                    try {
-                        reply.raw.writeHead(proxyRes.statusCode || 502, outHeaders);
-                    } catch (_) {}
-                    proxyRes.pipe(reply.raw);
-                    proxyRes.on('end', () => resolve());
+                    const shouldTryInject =
+                        wantInjectPanMock &&
+                        (String(outHeaders['content-type'] || '').includes('application/json') ||
+                            String(outHeaders['content-type'] || '').includes('text/plain') ||
+                            String(outHeaders['content-type'] || '').includes('text/json') ||
+                            !outHeaders['content-type']);
+
+                    if (!shouldTryInject) {
+                        try {
+                            reply.raw.writeHead(proxyRes.statusCode || 502, outHeaders);
+                        } catch (_) {}
+                        proxyRes.pipe(reply.raw);
+                        proxyRes.on('end', () => resolve());
+                        return;
+                    }
+
+                    const chunks = [];
+                    let total = 0;
+                    const limit = 8 * 1024 * 1024; // 8MB max for rewrite
+                    let streaming = false;
+                    proxyRes.on('data', (c) => {
+                        const b = Buffer.isBuffer(c) ? c : Buffer.from(c);
+                        if (streaming) {
+                            try {
+                                reply.raw.write(b);
+                            } catch (_) {}
+                            return;
+                        }
+                        if (total+b.length > limit) {
+                            // Too large to safely buffer/parse; stream through unchanged.
+                            streaming = true;
+                            try {
+                                reply.raw.writeHead(proxyRes.statusCode || 502, outHeaders);
+                                if (chunks.length) reply.raw.write(Buffer.concat(chunks));
+                                reply.raw.write(b);
+                            } catch (_) {}
+                            return;
+                        }
+                        total += b.length;
+                        chunks.push(b);
+                    });
+                    proxyRes.on('end', () => {
+                        const status = proxyRes.statusCode || 502;
+                        if (streaming) {
+                            try {
+                                reply.raw.end();
+                            } catch (_) {}
+                            resolve();
+                            return;
+                        }
+                        try {
+                            const raw = Buffer.concat(chunks).toString('utf8');
+                            const parsed = raw && raw.trim() ? JSON.parse(raw) : null;
+                            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                                parsed.pan_mock = isPanMockEnabled();
+                                const out = Buffer.from(JSON.stringify(parsed), 'utf8');
+                                delete outHeaders['content-length'];
+                                outHeaders['content-length'] = String(out.length);
+                                if (!outHeaders['content-type']) outHeaders['content-type'] = 'application/json; charset=utf-8';
+                                reply.raw.writeHead(status, outHeaders);
+                                reply.raw.end(out);
+                                resolve();
+                                return;
+                            }
+                        } catch (_) {}
+
+                        // Fallback: stream original response if rewrite fails.
+                        try {
+                            reply.raw.writeHead(status, outHeaders);
+                        } catch (_) {}
+                        try {
+                            reply.raw.end(Buffer.concat(chunks));
+                        } catch (_) {}
+                        resolve();
+                    });
                 }
             );
             proxyReq.on('error', (err) => {
