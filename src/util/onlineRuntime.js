@@ -402,31 +402,10 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 	      }
 	      return '';
 	    };
-		    // Intercept capture (record request meta) for pan providers.
-		    // Enable via env: CATPAW_INTERCEPT=1
-		    // Optional: CATPAW_INTERCEPT_PROVIDERS=quark,uc,139,baidu,tianyi
-		    const __interceptEnabled = String(process.env.CATPAW_INTERCEPT || '').trim() === '1';
-		    const __interceptBodyLimit = (() => {
-		      const v = String(process.env.CATPAW_INTERCEPT_BODY_LIMIT || '').trim();
-		      if (!v) return 262144;
-		      const n = Math.trunc(Number(v));
-		      if (!Number.isFinite(n) || n < 0) return 262144;
-		      return n;
-		    })();
-		    const __interceptTargets = (() => {
-		      try {
-		        const raw = String(process.env.CATPAW_INTERCEPT_PROVIDERS || 'quark,uc,139,baidu,tianyi');
-		        const parts = raw.split(',').map((s) => String(s || '').trim()).filter(Boolean);
-		        return new Set(parts);
-		      } catch (_) {
-		        return new Set(['quark', 'uc', '139', 'baidu', 'tianyi']);
-		      }
-		    })();
-
-		    // Mock is separate; keep disabled by default.
-		    const __mockEnabled = String(process.env.CATPAW_MOCK || '').trim() === '1';
-		    const __mockDebug = String(process.env.CATPAW_MOCK_DEBUG || '').trim() === '1';
-		    const __mockTargets = (() => {
+			    // Mock interceptors (disabled by default).
+			    const __mockEnabled = String(process.env.CATPAW_MOCK || '').trim() === '1';
+			    const __mockDebug = String(process.env.CATPAW_MOCK_DEBUG || '').trim() === '1';
+			    const __mockTargets = (() => {
 		      try {
 		        const raw = String(process.env.CATPAW_MOCK_PROVIDERS || process.env.CATPAW_MOCK_PROVIDER || '').trim();
 		        if (!raw) return new Set();
@@ -533,7 +512,7 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 				        const id = String(process.env.ONLINE_ID || '').trim() || 'online';
 				        const n = String(name || '').trim() || 'pan';
 				        const file = String(n) + '-intercept.' + String(id) + '.log';
-				        const dirRaw = String(process.env.CATPAW_INTERCEPT_DIR || '').trim();
+				        const dirRaw = String(process.env.CATPAW_MOCK_DIR || '').trim();
 				        const dir = dirRaw
 				          ? (path.isAbsolute(dirRaw) ? dirRaw : path.resolve(__logRoot, dirRaw))
 				          : path.resolve(__logRoot, 'debug_log');
@@ -755,15 +734,15 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			      return (pw || 'nopass') + '.mp4';
 			    };
 
-			    // Tape (record/replay) for pan-provider HTTP flows.
-			    // - CATPAW_TAPE=record|replay|off
-			    // - CATPAW_TAPE_PROVIDER=tianyi|quark|uc|139|baidu (single) or CATPAW_TAPE_PROVIDERS=a,b,c
-			    // - CATPAW_TAPE_DIR=/path/to/dir (optional)
-			    // - CATPAW_TAPE_PATH=/path/to/file.jsonl (optional, single file for all providers)
-			    // - CATPAW_TAPE_<PROVIDER>_PATH=/path/to/file.jsonl (optional, per provider)
-			    // - CATPAW_TAPE_STRICT=1 (replay: throw if missing; default passthrough)
-			    // - CATPAW_TAPE_REQ_LIMIT_BYTES (default 262144; 0 => unlimited)
-			    // - CATPAW_TAPE_RES_LIMIT_BYTES (default 2097152; 0 => unlimited)
+				    /* Tape (record/replay) support removed (keep only CATPAW_MOCK* intercept logging).
+				    // - CATPAW_TAPE=record|replay|off
+				    // - CATPAW_TAPE_PROVIDER=tianyi|quark|uc|139|baidu (single) or CATPAW_TAPE_PROVIDERS=a,b,c
+				    // - CATPAW_TAPE_DIR=/path/to/dir (optional)
+				    // - CATPAW_TAPE_PATH=/path/to/file.jsonl (optional, single file for all providers)
+				    // - CATPAW_TAPE_<PROVIDER>_PATH=/path/to/file.jsonl (optional, per provider)
+				    // - CATPAW_TAPE_STRICT=1 (replay: throw if missing; default passthrough)
+				    // - CATPAW_TAPE_REQ_LIMIT_BYTES (default 262144; 0 => unlimited)
+				    // - CATPAW_TAPE_RES_LIMIT_BYTES (default 2097152; 0 => unlimited)
 			    const __tapeMode = 'off';
 			    const __tapeStrict = false;
 			    const __tapeReqLimit = 262144;
@@ -863,18 +842,19 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			        return null;
 			      }
 			    })();
-			    const __appendTape = (provider, entry) => {
-			      try {
-			        const tapePath = __mkTapePath(provider);
-			        if (!tapePath) return;
-			        const line = JSON.stringify(entry);
-			        fs.appendFileSync(tapePath, line + String.fromCharCode(10));
-			      } catch (_) {}
-			    };
-			    const __tryParseJson = (text) => {
-			      try {
-			        const t = typeof text === 'string' ? text.trim() : '';
-			        if (!t) return null;
+				    const __appendTape = (provider, entry) => {
+				      try {
+				        const tapePath = __mkTapePath(provider);
+				        if (!tapePath) return;
+				        const line = JSON.stringify(entry);
+				        fs.appendFileSync(tapePath, line + String.fromCharCode(10));
+				      } catch (_) {}
+				    };
+				    */
+				    const __tryParseJson = (text) => {
+				      try {
+				        const t = typeof text === 'string' ? text.trim() : '';
+				        if (!t) return null;
 		        return JSON.parse(t);
 		      } catch (_) {
 		        return null;
@@ -1050,9 +1030,9 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 		    // Interceptors (extensible for other pan providers).
 		    const __interceptors = [];
 			    const __quarkInterceptor = (() => {
-			      const enabled = (__interceptEnabled && __interceptTargets.has('quark')) || (__mockEnabled && __mockTargets.has('quark'));
+			      const enabled = (__mockEnabled && __mockTargets.has('quark'));
 			      const logPath = __mkInterceptLogPath('quark');
-			      const log = (obj) => __appendInterceptLog((__interceptEnabled && __interceptTargets.has('quark')) || (__mockDebug && __mockEnabled && __mockTargets.has('quark')), logPath, obj);
+			      const log = (obj) => __appendInterceptLog((__mockDebug && enabled), logPath, obj);
 			      return {
 			        name: 'quark',
 			        enabled,
@@ -1063,8 +1043,7 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			    })();
 			    if (__quarkInterceptor && __quarkInterceptor.enabled) {
 			      try {
-			        if (__interceptEnabled && __interceptTargets.has('quark')) __quarkInterceptor.log({ type: 'boot', mode: 'intercept', version: __mockVersion, targets: Array.from(__interceptTargets) });
-			        if (__mockEnabled && __mockTargets.has('quark')) __quarkInterceptor.log({ type: 'boot', mode: 'mock', version: __mockVersion, targets: Array.from(__mockTargets) });
+			        __quarkInterceptor.log({ type: 'boot', mode: 'mock', version: __mockVersion, targets: Array.from(__mockTargets) });
 			      } catch (_) {}
 			      __interceptors.push(__quarkInterceptor);
 			    }
@@ -1186,9 +1165,9 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			      };
 			    };
 			    const __pan139Interceptor = (() => {
-			      const enabled = (__interceptEnabled && __interceptTargets.has('139')) || (__mockEnabled && __mockTargets.has('139'));
+			      const enabled = (__mockEnabled && __mockTargets.has('139'));
 			      const logPath = __mkInterceptLogPath('139');
-			      const log = (obj) => __appendInterceptLog((__interceptEnabled && __interceptTargets.has('139')) || (__mockDebug && __mockEnabled && __mockTargets.has('139')), logPath, obj);
+			      const log = (obj) => __appendInterceptLog((__mockDebug && enabled), logPath, obj);
 			      return {
 			        name: '139',
 			        enabled,
@@ -1199,8 +1178,7 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			    })();
 			    if (__pan139Interceptor && __pan139Interceptor.enabled) {
 			      try {
-			        if (__interceptEnabled && __interceptTargets.has('139')) __pan139Interceptor.log({ type: 'boot', mode: 'intercept', version: __mockVersion, targets: Array.from(__interceptTargets) });
-			        if (__mockEnabled && __mockTargets.has('139')) __pan139Interceptor.log({ type: 'boot', mode: 'mock', version: __mockVersion, targets: Array.from(__mockTargets) });
+			        __pan139Interceptor.log({ type: 'boot', mode: 'mock', version: __mockVersion, targets: Array.from(__mockTargets) });
 			      } catch (_) {}
 			      __interceptors.push(__pan139Interceptor);
 			    }
@@ -1331,9 +1309,9 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			      };
 			    };
 				    const __baiduInterceptor = (() => {
-				      const enabled = (__interceptEnabled && __interceptTargets.has('baidu')) || (__mockEnabled && __mockTargets.has('baidu'));
+				      const enabled = (__mockEnabled && __mockTargets.has('baidu'));
 				      const logPath = __mkInterceptLogPath('baidu');
-				      const log = (obj) => __appendInterceptLog((__interceptEnabled && __interceptTargets.has('baidu')) || (__mockDebug && __mockEnabled && __mockTargets.has('baidu')), logPath, obj);
+				      const log = (obj) => __appendInterceptLog((__mockDebug && enabled), logPath, obj);
 				      return {
 				        name: 'baidu',
 				        enabled,
@@ -1344,8 +1322,7 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 				    })();
 				    if (__baiduInterceptor && __baiduInterceptor.enabled) {
 				      try {
-				        if (__interceptEnabled && __interceptTargets.has('baidu')) __baiduInterceptor.log({ type: 'boot', mode: 'intercept', version: __mockVersion, targets: Array.from(__interceptTargets) });
-				        if (__mockEnabled && __mockTargets.has('baidu')) __baiduInterceptor.log({ type: 'boot', mode: 'mock', version: __mockVersion, targets: Array.from(__mockTargets) });
+				        __baiduInterceptor.log({ type: 'boot', mode: 'mock', version: __mockVersion, targets: Array.from(__mockTargets) });
 				      } catch (_) {}
 				      __interceptors.push(__baiduInterceptor);
 				    }
@@ -1579,9 +1556,9 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 				      };
 				    };
 				    const __tianyiInterceptor = (() => {
-				      const enabled = (__interceptEnabled && __interceptTargets.has('tianyi')) || (__mockEnabled && __mockTargets.has('tianyi'));
+				      const enabled = (__mockEnabled && __mockTargets.has('tianyi'));
 				      const logPath = __mkInterceptLogPath('tianyi');
-				      const log = (obj) => __appendInterceptLog((__interceptEnabled && __interceptTargets.has('tianyi')) || (__mockDebug && __mockEnabled && __mockTargets.has('tianyi')), logPath, obj);
+				      const log = (obj) => __appendInterceptLog((__mockDebug && enabled), logPath, obj);
 				      return {
 				        name: 'tianyi',
 				        enabled,
@@ -1592,8 +1569,7 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 				    })();
 				    if (__tianyiInterceptor && __tianyiInterceptor.enabled) {
 				      try {
-				        if (__interceptEnabled && __interceptTargets.has('tianyi')) __tianyiInterceptor.log({ type: 'boot', mode: 'intercept', version: __mockVersion, targets: Array.from(__interceptTargets) });
-				        if (__mockEnabled && __mockTargets.has('tianyi')) __tianyiInterceptor.log({ type: 'boot', mode: 'mock', version: __mockVersion, targets: Array.from(__mockTargets) });
+				        __tianyiInterceptor.log({ type: 'boot', mode: 'mock', version: __mockVersion, targets: Array.from(__mockTargets) });
 				      } catch (_) {}
 				      __interceptors.push(__tianyiInterceptor);
 				    }
@@ -1763,9 +1739,9 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 		      };
 		    };
 			    const __ucInterceptor = (() => {
-			      const enabled = (__interceptEnabled && __interceptTargets.has('uc')) || (__mockEnabled && __mockTargets.has('uc'));
+			      const enabled = (__mockEnabled && __mockTargets.has('uc'));
 			      const logPath = __mkInterceptLogPath('uc');
-			      const log = (obj) => __appendInterceptLog((__interceptEnabled && __interceptTargets.has('uc')) || (__mockDebug && __mockEnabled && __mockTargets.has('uc')), logPath, obj);
+			      const log = (obj) => __appendInterceptLog((__mockDebug && enabled), logPath, obj);
 			      return {
 			        name: 'uc',
 			        enabled,
@@ -1776,8 +1752,7 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			    })();
 			    if (__ucInterceptor && __ucInterceptor.enabled) {
 			      try {
-			        if (__interceptEnabled && __interceptTargets.has('uc')) __ucInterceptor.log({ type: 'boot', mode: 'intercept', version: __mockVersion, targets: Array.from(__interceptTargets) });
-			        if (__mockEnabled && __mockTargets.has('uc')) __ucInterceptor.log({ type: 'boot', mode: 'mock', version: __mockVersion, targets: Array.from(__mockTargets) });
+			        __ucInterceptor.log({ type: 'boot', mode: 'mock', version: __mockVersion, targets: Array.from(__mockTargets) });
 			      } catch (_) {}
 			      __interceptors.push(__ucInterceptor);
 			    }
@@ -1789,53 +1764,6 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 		      } catch (_) {}
 		      return null;
 		    };
-
-					    // Intercept capture for scripts using fetch (Node 18+ / undici) - pass-through.
-					    try {
-					      if (__interceptEnabled && __interceptTargets && __interceptTargets.size && typeof globalThis.fetch === 'function' && !globalThis.__catpaw_intercept_fetch_patched) {
-					        globalThis.__catpaw_intercept_fetch_patched = true;
-					        const __origFetchIntercept = globalThis.fetch.bind(globalThis);
-					        globalThis.fetch = function interceptedFetch(input, init) {
-					          try {
-					            const method = init && typeof init === 'object' && init.method ? String(init.method).toUpperCase() : 'GET';
-					            const url =
-					              typeof input === 'string'
-					                ? input
-					                : input && typeof input === 'object' && typeof input.url === 'string'
-					                  ? input.url
-					                  : '';
-					            const host = __normalizeHost(url);
-					            const provider = __providerForHost(host);
-					            if (provider && __interceptTargets.has(provider)) {
-					              const hdrs = init && typeof init === 'object' && init.headers && typeof init.headers === 'object' ? init.headers : {};
-					              const bodyRaw = init && typeof init === 'object' && init.body != null ? init.body : null;
-					              const bodyStr = typeof bodyRaw === 'string' ? bodyRaw : '';
-					              const pth = (() => {
-					                try {
-					                  const u = new URL(url);
-					                  return String(u.pathname || '') + String(u.search || '');
-					                } catch (_) {
-					                  return '';
-					                }
-					              })();
-					              const creds = __extractInterceptCreds(provider, host, pth, hdrs, bodyStr);
-					              const lp = __mkInterceptLogPath(provider);
-					              __appendInterceptLog(true, lp, {
-					                type: 'fetch',
-					                provider,
-					                host,
-					                method,
-					                url,
-					                headers: hdrs,
-					                body: __safeSlice(bodyStr, 4096),
-					                creds,
-					              });
-					            }
-					          } catch (_) {}
-					          return __origFetchIntercept(input, init);
-					        };
-					      }
-					    } catch (_) {}
 
 					    // Best-effort block for scripts using fetch (Node 18+ / undici).
 					    try {
@@ -1971,12 +1899,12 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 				        };
 			      }
 				    } catch (_) {}
-					    // Tape (record/replay) for scripts using fetch (undici).
-					    try {
-					      if (__tapeMode !== 'off' && __tapeTargets && __tapeTargets.size && typeof globalThis.fetch === 'function' && !globalThis.__catpaw_tape_fetch_patched) {
-					        globalThis.__catpaw_tape_fetch_patched = true;
-					        const __origFetchTape = globalThis.fetch.bind(globalThis);
-					        globalThis.fetch = async function tapedFetch(input, init) {
+						    /* Tape (record/replay) for scripts using fetch (undici).
+						    try {
+						      if (__tapeMode !== 'off' && __tapeTargets && __tapeTargets.size && typeof globalThis.fetch === 'function' && !globalThis.__catpaw_tape_fetch_patched) {
+						        globalThis.__catpaw_tape_fetch_patched = true;
+						        const __origFetchTape = globalThis.fetch.bind(globalThis);
+						        globalThis.fetch = async function tapedFetch(input, init) {
 					          const method = init && typeof init === 'object' && init.method ? String(init.method).toUpperCase() : 'GET';
 					          const url =
 					            typeof input === 'string'
@@ -2049,14 +1977,15 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 					            return res;
 					          }
 
-					          return __origFetchTape(input, init);
-					        };
-					      }
-					    } catch (_) {}
-					    const patch = (mod) => {
-				      const orig = mod && typeof mod.request === 'function' ? mod.request : null;
-				      if (!orig) return;
-				      mod.request = function patchedRequest(options, cb) {
+						          return __origFetchTape(input, init);
+						        };
+						      }
+						    } catch (_) {}
+						    */
+						    const patch = (mod) => {
+					      const orig = mod && typeof mod.request === 'function' ? mod.request : null;
+					      if (!orig) return;
+					      mod.request = function patchedRequest(options, cb) {
 				        try {
 		          const isUrl = options && typeof options === 'object' && options instanceof URL;
 	          const hostname = isUrl
@@ -2074,13 +2003,13 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 		            }
 		          })();
 
-		          // Tape replay/record (http/https.request).
-		          // IMPORTANT: If CATPAW_MOCK is enabled and a mock interceptor matches this host, do not fall through to real network.
-		          try {
-		            const provider = __providerForHost(host);
-		            const mockMatched = (() => {
-		              try {
-		                if (!__mockEnabled) return false;
+			          /* Tape replay/record (http/https.request) removed.
+			          // IMPORTANT: If CATPAW_MOCK is enabled and a mock interceptor matches this host, do not fall through to real network.
+			          try {
+			            const provider = __providerForHost(host);
+			            const mockMatched = (() => {
+			              try {
+			                if (!__mockEnabled) return false;
 		                const it0 = __pickInterceptor(host);
 		                return !!it0;
 		              } catch (_) {
@@ -2263,14 +2192,15 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 		                  });
 		                } catch (_) {}
 		                return req;
-		              }
-		            }
-		          } catch (_) {}
+			              }
+			            }
+			          } catch (_) {}
+			          */
 
-			          const it = __pickInterceptor(host);
-			          if (it) {
-			            try {
-		              const { EventEmitter } = require('events');
+				          const it = __pickInterceptor(host);
+				          if (it) {
+				            try {
+			              const { EventEmitter } = require('events');
 		              const { Readable } = require('stream');
 		              const interceptor = it;
 		              class __CatPawBlockedRequest extends EventEmitter {
@@ -2436,70 +2366,7 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 		          }
 	        } catch (_) {}
 
-	        // Intercept capture (pass-through): record request meta + extracted share code / pwd.
-	        const __cb0 = typeof cb === 'function' ? cb : null;
-	        const __meta0 = (() => {
-	          try {
-	            if (!__interceptEnabled) return null;
-	            const prov = __providerForHost(host);
-	            if (!prov || !__interceptTargets.has(prov)) return null;
-	            const method = options && typeof options === 'object' && options.method ? String(options.method).toUpperCase() : 'GET';
-	            const pth = options && typeof options === 'object' && typeof options.path === 'string' ? String(options.path) : isUrl ? String(options.pathname || '') + String(options.search || '') : '';
-	            const hdrs = options && typeof options === 'object' && options.headers && typeof options.headers === 'object' ? options.headers : {};
-	            return { provider: prov, host, method, path: pth, headers: hdrs };
-	          } catch (_) {
-	            return null;
-	          }
-	        })();
-	        const __logPath0 = __meta0 ? __mkInterceptLogPath(__meta0.provider) : '';
-	        let __chunks0 = __meta0 ? [] : null;
-	        let __chunkBytes0 = 0;
-
-	        const req = orig.call(mod, options, function patchedCb(res) {
-	          try { if (__cb0) __cb0(res); } catch (_) {}
-	        });
-	        try {
-	          if (__meta0 && req && typeof req.write === 'function' && typeof req.end === 'function') {
-	            const __origWrite = req.write.bind(req);
-	            const __origEnd = req.end.bind(req);
-	            req.write = function patchedWrite(chunk, enc, cb2) {
-	              try {
-	                if (__chunks0 && __interceptBodyLimit >= 0) {
-	                  const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk || ''), typeof enc === 'string' ? enc : 'utf8');
-	                  const room = __interceptBodyLimit === 0 ? b.length : Math.max(0, __interceptBodyLimit - __chunkBytes0);
-	                  if (__interceptBodyLimit === 0 || room > 0) {
-	                    const take = __interceptBodyLimit === 0 ? b.length : Math.min(b.length, room);
-	                    if (take > 0) {
-	                      __chunks0.push(b.subarray(0, take));
-	                      __chunkBytes0 += take;
-	                    }
-	                  }
-	                }
-	              } catch (_) {}
-	              return __origWrite(chunk, enc, cb2);
-	            };
-	            req.end = function patchedEnd(chunk, enc, cb2) {
-	              try {
-	                if (chunk != null) req.write(chunk, enc);
-	              } catch (_) {}
-	              try {
-	                const body = __chunks0 && __chunks0.length ? Buffer.concat(__chunks0).toString('utf8') : '';
-	                const creds = __extractInterceptCreds(__meta0.provider, __meta0.host, __meta0.path, __meta0.headers, body);
-	                __appendInterceptLog(true, __logPath0, {
-	                  type: 'http',
-	                  provider: __meta0.provider,
-	                  host: __meta0.host,
-	                  method: __meta0.method,
-	                  path: __meta0.path,
-	                  headers: __meta0.headers || {},
-	                  body: __safeSlice(body, 4096),
-	                  creds,
-	                });
-	              } catch (_) {}
-	              return __origEnd(chunk, enc, cb2);
-	            };
-	          }
-	        } catch (_) {}
+	        const req = orig.call(mod, options, cb);
 	        return req;
 	      };
 	    };
@@ -2865,27 +2732,8 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 		    const onlineLogPath = wantDebug ? path.resolve(rootDir, `online-runtime.${key}.log`) : '';
 		    let chosenPort = p;
 
-		    const interceptFromConfig = (() => {
-		        try {
-		            const cfgPath = path.resolve(rootDir, 'config.json');
-		            if (!fs.existsSync(cfgPath)) return false;
-		            const raw = fs.readFileSync(cfgPath, 'utf8');
-		            const parsed = raw && raw.trim() ? JSON.parse(raw) : {};
-		            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
-		            return !!parsed.pan_mock;
-		        } catch (_) {
-		            return false;
-		        }
-		    })();
-
 			    for (let attempt = 0; attempt < 6; attempt += 1) {
 			        const baseEnv = { ...process.env };
-			        if (interceptFromConfig && !String(baseEnv.CATPAW_INTERCEPT || '').trim()) {
-			            baseEnv.CATPAW_INTERCEPT = '1';
-			        }
-			        if (interceptFromConfig && !String(baseEnv.CATPAW_INTERCEPT_PROVIDERS || '').trim()) {
-			            baseEnv.CATPAW_INTERCEPT_PROVIDERS = 'quark,uc,139,baidu,tianyi';
-			        }
 			        const child = spawn(process.execPath, [bootstrapPath], {
 			            stdio,
 			            cwd: rootDir,

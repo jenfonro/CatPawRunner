@@ -246,6 +246,39 @@ export async function start(config) {
         const p = typeof process.env.NODE_PATH === 'string' && process.env.NODE_PATH.trim() ? process.env.NODE_PATH.trim() : '';
         return p ? path.resolve(p) : process.cwd();
     })();
+
+    const ensureConfigJsonDefaults = () => {
+        const cfgPath = path.resolve(runtimeRoot, 'config.json');
+        const readJsonSafe = () => {
+            try {
+                if (!fs.existsSync(cfgPath)) return {};
+                const raw = fs.readFileSync(cfgPath, 'utf8');
+                const parsed = raw && raw.trim() ? JSON.parse(raw) : {};
+                return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+            } catch (_) {
+                return {};
+            }
+        };
+        const atomicWrite = (obj) => {
+            try {
+                const dir = path.dirname(cfgPath);
+                if (dir && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+            } catch (_) {}
+            const tmp = path.resolve(path.dirname(cfgPath), `.${path.basename(cfgPath)}.tmp.${process.pid}.${Date.now()}`);
+            fs.writeFileSync(tmp, `${JSON.stringify(obj, null, 2)}\n`, 'utf8');
+            fs.renameSync(tmp, cfgPath);
+        };
+        try {
+            const cur = readJsonSafe();
+            if (!Object.prototype.hasOwnProperty.call(cur, 'pan_mock')) {
+                atomicWrite({ ...cur, pan_mock: false });
+            }
+        } catch (_) {}
+    };
+
+    // Ensure `pan_mock` exists even if user deleted it (defaults to false).
+    ensureConfigJsonDefaults();
+
     server.db = new JsonDB(new Config(path.resolve(runtimeRoot, 'db.json'), true, true, '/', true));
     server.onlineRuntimePorts = onlineRuntimePorts;
     server.register(router);
@@ -331,6 +364,7 @@ export async function start(config) {
             const m = Number(st.mtimeMs || 0);
             if (!m || m === configWatchLastMtime) return;
             configWatchLastMtime = m;
+            ensureConfigJsonDefaults();
             await syncAndMaybeRestartOnline('config changed');
         } catch (_) {}
     }, pollMs);
