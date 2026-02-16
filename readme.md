@@ -36,7 +36,7 @@ npm run dev
 常用字段：
 
 - `proxy`: 全局代理（字符串，空串表示不启用）
-- `pan_mock`: 是否开启“网盘 mock/拦截”（布尔；启动时若缺失会自动写回 `false`）
+- `pan_mock`: 是否开启“网盘 mock/拦截”（布尔；启动时若缺失会自动写回 `false`；支持运行中切换）
 - `panBuiltinResolverEnabled`: 是否启用内置网盘解析 API
 - `onlineConfigs`: 在线脚本配置（会下载到 `custom_spider/` 并启动子进程 runtime）
 
@@ -45,7 +45,7 @@ npm run dev
 - `GET /admin/settings`
 - `PUT /admin/settings`
 
-> `pan_mock`：目前只会被 `/admin/settings` 读写保存（并在启动时补全默认值），不会自动影响 online runtime 的 mock 行为；online runtime 的 mock 仍由环境变量控制（见下文）。
+> `pan_mock`：可通过 `PUT /admin/settings` 在不重启 online runtime 子进程的情况下切换 mock 拦截开关（通过 IPC 下发配置，通常秒级生效）。
 
 ### `db.json`
 
@@ -103,7 +103,15 @@ npm run dev
 
 用途：当你需要“保留线路/flag 展示”，但不希望脚本真的去请求网盘 API 时，开启 mock 拦截，让请求直接返回占位数据，并记录日志用于分析“脚本到底请求了什么”。
 
-### 开启方式（环境变量）
+### 开启方式（推荐：config.json）
+
+通过 `PUT /admin/settings` 设置：
+
+- `pan_mock: true|false`
+
+该开关会通过 IPC 下发到 online runtime 子进程（不需要重启子进程）。
+
+### 开启方式（环境变量，备用）
 
 在启动 `npm run dev` 前设置：
 

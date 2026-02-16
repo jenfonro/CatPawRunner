@@ -45,6 +45,48 @@ function findOnlineEntry(onlineDir) {
     }
 }
 
+function readJsonFileSafe(filePath) {
+    try {
+        if (!filePath || !fs.existsSync(filePath)) return {};
+        const raw = fs.readFileSync(filePath, 'utf8');
+        const parsed = raw && raw.trim() ? JSON.parse(raw) : {};
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    } catch (_) {
+        return {};
+    }
+}
+
+const DEFAULT_MOCK_PROVIDERS = ['quark', 'uc', '139', 'baidu', 'tianyi'];
+
+function readPanMockConfigFromRuntimeRoot(rootDir) {
+    try {
+        const cfgPath = path.resolve(rootDir, 'config.json');
+        const cfg = readJsonFileSafe(cfgPath);
+        const enabled = !!cfg.pan_mock;
+        return { enabled, debug: enabled, providers: DEFAULT_MOCK_PROVIDERS };
+    } catch (_) {
+        return { enabled: false, debug: false, providers: DEFAULT_MOCK_PROVIDERS };
+    }
+}
+
+function sendMockConfigToChild(childProc, mockCfg) {
+    try {
+        if (!childProc || typeof childProc.send !== 'function') return;
+        if (childProc.killed) return;
+        childProc.send({ type: 'mock_config', ...mockCfg });
+    } catch (_) {}
+}
+
+export function broadcastOnlineRuntimeMockConfig({ rootDir } = {}) {
+    try {
+        const dir = rootDir ? path.resolve(String(rootDir)) : getRootDir();
+        const cfg = readPanMockConfigFromRuntimeRoot(dir);
+        for (const { child } of children.values()) {
+            sendMockConfigToChild(child, cfg);
+        }
+    } catch (_) {}
+}
+
 export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[online]', entry: entryOverride = '' } = {}) {
     const rootDir = getRootDir();
     const onlineDir = path.resolve(rootDir, 'custom_spider');
@@ -403,19 +445,59 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 	      return '';
 	    };
 			    // Mock interceptors (disabled by default).
-			    const __mockEnabled = String(process.env.CATPAW_MOCK || '').trim() === '1';
-			    const __mockDebug = String(process.env.CATPAW_MOCK_DEBUG || '').trim() === '1';
-			    const __mockTargets = (() => {
-		      try {
-		        const raw = String(process.env.CATPAW_MOCK_PROVIDERS || process.env.CATPAW_MOCK_PROVIDER || '').trim();
-		        if (!raw) return new Set();
-		        const parts = raw.split(',').map((s) => String(s || '').trim()).filter(Boolean);
-		        return new Set(parts);
-		      } catch (_) {
-		        return new Set();
-		      }
-		    })();
-		    const __mockVersion = 'catpaw-runtime';
+			    // Runtime-toggle support: parent process can update this state via IPC (process.send).
+			    const __mockState = (() => {
+			      const enabled = String(process.env.CATPAW_MOCK || '').trim() === '1';
+			      const debug = String(process.env.CATPAW_MOCK_DEBUG || '').trim() === '1';
+			      const targets = (() => {
+			        try {
+			          const raw = String(process.env.CATPAW_MOCK_PROVIDERS || process.env.CATPAW_MOCK_PROVIDER || '').trim();
+			          if (!raw) return new Set();
+			          const parts = raw.split(',').map((s) => String(s || '').trim()).filter(Boolean);
+			          return new Set(parts);
+			        } catch (_) {
+			          return new Set();
+			        }
+			      })();
+			      return { enabled, debug, targets };
+			    })();
+			    const __mockEnabled = () => {
+			      try {
+			        return !!(__mockState && __mockState.enabled);
+			      } catch (_) {
+			        return false;
+			      }
+			    };
+			    const __mockDebug = () => {
+			      try {
+			        return !!(__mockState && __mockState.debug);
+			      } catch (_) {
+			        return false;
+			      }
+			    };
+			    const __mockHasTarget = (name) => {
+			      try {
+			        const n = String(name || '').trim();
+			        if (!n) return false;
+			        return !!(__mockState && __mockState.targets && typeof __mockState.targets.has === 'function' && __mockState.targets.has(n));
+			      } catch (_) {
+			        return false;
+			      }
+			    };
+			    const __applyMockConfig = (cfg) => {
+			      try {
+			        if (!cfg || typeof cfg !== 'object') return;
+			        if (Object.prototype.hasOwnProperty.call(cfg, 'enabled')) __mockState.enabled = !!cfg.enabled;
+			        if (Object.prototype.hasOwnProperty.call(cfg, 'debug')) __mockState.debug = !!cfg.debug;
+			        if (Object.prototype.hasOwnProperty.call(cfg, 'providers')) {
+			          const raw = cfg.providers;
+			          const list = Array.isArray(raw) ? raw : typeof raw === 'string' ? raw.split(',') : [];
+			          const next = new Set(list.map((s) => String(s || '').trim()).filter(Boolean));
+			          __mockState.targets = next;
+			        }
+			      } catch (_) {}
+			    };
+			    const __mockVersion = 'catpaw-runtime';
 			    const __normalizeHost = (raw) => {
 			      try {
 			        let h = String(raw == null ? '' : raw).trim().toLowerCase();
@@ -1027,26 +1109,20 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 				      };
 				    };
 
-		    // Interceptors (extensible for other pan providers).
-		    const __interceptors = [];
-			    const __quarkInterceptor = (() => {
-			      const enabled = (__mockEnabled && __mockTargets.has('quark'));
-			      const logPath = __mkInterceptLogPath('quark');
-			      const log = (obj) => __appendInterceptLog((__mockDebug && enabled), logPath, obj);
-			      return {
-			        name: 'quark',
-			        enabled,
-			        matchHost: (hostLike) => __isQuarkHost(hostLike),
-			        log,
-			        mock: (meta) => __quarkMockPayloadFor(meta),
-			      };
-			    })();
-			    if (__quarkInterceptor && __quarkInterceptor.enabled) {
-			      try {
-			        __quarkInterceptor.log({ type: 'boot', mode: 'mock', version: __mockVersion, targets: Array.from(__mockTargets) });
-			      } catch (_) {}
-			      __interceptors.push(__quarkInterceptor);
-			    }
+			    // Interceptors (extensible for other pan providers).
+			    const __interceptors = [];
+				    const __quarkInterceptor = (() => {
+				      const logPath = __mkInterceptLogPath('quark');
+				      const log = (obj) =>
+				        __appendInterceptLog((__mockDebug() && __mockEnabled() && __mockHasTarget('quark')), logPath, obj);
+				      return {
+				        name: 'quark',
+				        matchHost: (hostLike) => __isQuarkHost(hostLike),
+				        log,
+				        mock: (meta) => __quarkMockPayloadFor(meta),
+				      };
+				    })();
+				    if (__quarkInterceptor) __interceptors.push(__quarkInterceptor);
 
 				    const __pan139MockPayloadFor = (meta) => {
 				      try {
@@ -1164,24 +1240,17 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			        }),
 			      };
 			    };
-			    const __pan139Interceptor = (() => {
-			      const enabled = (__mockEnabled && __mockTargets.has('139'));
-			      const logPath = __mkInterceptLogPath('139');
-			      const log = (obj) => __appendInterceptLog((__mockDebug && enabled), logPath, obj);
-			      return {
-			        name: '139',
-			        enabled,
-			        matchHost: (hostLike) => __is139Host(hostLike),
-			        log,
-			        mock: (meta) => __pan139MockPayloadFor(meta),
-			      };
-			    })();
-			    if (__pan139Interceptor && __pan139Interceptor.enabled) {
-			      try {
-			        __pan139Interceptor.log({ type: 'boot', mode: 'mock', version: __mockVersion, targets: Array.from(__mockTargets) });
-			      } catch (_) {}
-			      __interceptors.push(__pan139Interceptor);
-			    }
+				    const __pan139Interceptor = (() => {
+				      const logPath = __mkInterceptLogPath('139');
+				      const log = (obj) => __appendInterceptLog((__mockDebug() && __mockEnabled() && __mockHasTarget('139')), logPath, obj);
+				      return {
+				        name: '139',
+				        matchHost: (hostLike) => __is139Host(hostLike),
+				        log,
+				        mock: (meta) => __pan139MockPayloadFor(meta),
+				      };
+				    })();
+				    if (__pan139Interceptor) __interceptors.push(__pan139Interceptor);
 
 			    const __baiduMockPayloadFor = (meta) => {
 			      try {
@@ -1309,23 +1378,17 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			      };
 			    };
 				    const __baiduInterceptor = (() => {
-				      const enabled = (__mockEnabled && __mockTargets.has('baidu'));
 				      const logPath = __mkInterceptLogPath('baidu');
-				      const log = (obj) => __appendInterceptLog((__mockDebug && enabled), logPath, obj);
+				      const log = (obj) =>
+				        __appendInterceptLog((__mockDebug() && __mockEnabled() && __mockHasTarget('baidu')), logPath, obj);
 				      return {
 				        name: 'baidu',
-				        enabled,
 				        matchHost: (hostLike) => __isBaiduPanHost(hostLike),
-			        log,
-			        mock: (meta) => __baiduMockPayloadFor(meta),
-			      };
+				        log,
+				        mock: (meta) => __baiduMockPayloadFor(meta),
+				      };
 				    })();
-				    if (__baiduInterceptor && __baiduInterceptor.enabled) {
-				      try {
-				        __baiduInterceptor.log({ type: 'boot', mode: 'mock', version: __mockVersion, targets: Array.from(__mockTargets) });
-				      } catch (_) {}
-				      __interceptors.push(__baiduInterceptor);
-				    }
+				    if (__baiduInterceptor) __interceptors.push(__baiduInterceptor);
 
 				    const __tianyiMockPayloadFor = (meta) => {
 				      try {
@@ -1556,23 +1619,17 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 				      };
 				    };
 				    const __tianyiInterceptor = (() => {
-				      const enabled = (__mockEnabled && __mockTargets.has('tianyi'));
 				      const logPath = __mkInterceptLogPath('tianyi');
-				      const log = (obj) => __appendInterceptLog((__mockDebug && enabled), logPath, obj);
+				      const log = (obj) =>
+				        __appendInterceptLog((__mockDebug() && __mockEnabled() && __mockHasTarget('tianyi')), logPath, obj);
 				      return {
 				        name: 'tianyi',
-				        enabled,
 				        matchHost: (hostLike) => __isTianyiHost(hostLike),
 				        log,
 				        mock: (meta) => __tianyiMockPayloadFor(meta),
 				      };
 				    })();
-				    if (__tianyiInterceptor && __tianyiInterceptor.enabled) {
-				      try {
-				        __tianyiInterceptor.log({ type: 'boot', mode: 'mock', version: __mockVersion, targets: Array.from(__mockTargets) });
-				      } catch (_) {}
-				      __interceptors.push(__tianyiInterceptor);
-				    }
+				    if (__tianyiInterceptor) __interceptors.push(__tianyiInterceptor);
 
 					    const __ucMockPayloadFor = (meta) => {
 					      try {
@@ -1739,63 +1796,81 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 		      };
 		    };
 			    const __ucInterceptor = (() => {
-			      const enabled = (__mockEnabled && __mockTargets.has('uc'));
 			      const logPath = __mkInterceptLogPath('uc');
-			      const log = (obj) => __appendInterceptLog((__mockDebug && enabled), logPath, obj);
+			      const log = (obj) => __appendInterceptLog((__mockDebug() && __mockEnabled() && __mockHasTarget('uc')), logPath, obj);
 			      return {
 			        name: 'uc',
-			        enabled,
 			        matchHost: (hostLike) => __isUcHost(hostLike),
-		        log,
-		        mock: (meta) => __ucMockPayloadFor(meta),
-		      };
+			        log,
+			        mock: (meta) => __ucMockPayloadFor(meta),
+			      };
 			    })();
-			    if (__ucInterceptor && __ucInterceptor.enabled) {
+			    if (__ucInterceptor) __interceptors.push(__ucInterceptor);
+			    const __pickInterceptor = (hostLike) => {
 			      try {
-			        __ucInterceptor.log({ type: 'boot', mode: 'mock', version: __mockVersion, targets: Array.from(__mockTargets) });
+			        if (!__mockEnabled()) return null;
+			        for (const it of __interceptors) {
+			          if (!it || typeof it.matchHost !== 'function') continue;
+			          if (!__mockHasTarget(it.name)) continue;
+			          if (it.matchHost(hostLike)) return it;
+			        }
 			      } catch (_) {}
-			      __interceptors.push(__ucInterceptor);
-			    }
-		    const __pickInterceptor = (hostLike) => {
-		      try {
-		        for (const it of __interceptors) {
-		          if (it && typeof it.matchHost === 'function' && it.matchHost(hostLike)) return it;
-		        }
-		      } catch (_) {}
-		      return null;
-		    };
+			      return null;
+			    };
 
-					    // Best-effort block for scripts using fetch (Node 18+ / undici).
-					    try {
-					      if (__mockEnabled && __interceptors.length && typeof globalThis.fetch === 'function') {
-			        const __origFetch = globalThis.fetch.bind(globalThis);
-			        globalThis.fetch = function patchedFetch(input, init) {
-			          try {
-			            const method = init && typeof init === 'object' && init.method ? String(init.method).toUpperCase() : 'GET';
-	            const url =
-	              typeof input === 'string'
+			    // Runtime-toggle support: update mock state via parent IPC without restarting the child process.
+			    try {
+			      process.on('message', (msg) => {
+			        try {
+			          if (!msg || typeof msg !== 'object') return;
+			          if (msg.type !== 'mock_config') return;
+			          const was = __mockEnabled();
+			          __applyMockConfig(msg);
+			          const now = __mockEnabled();
+			          if (!was && now && __mockDebug()) {
+			            for (const it of __interceptors) {
+			              try {
+			                if (!it || !__mockHasTarget(it.name)) continue;
+			                if (typeof it.log === 'function') it.log({ type: 'boot', mode: 'mock', version: __mockVersion, targets: Array.from(__mockState.targets || []) });
+			              } catch (_) {}
+			            }
+			          }
+			        } catch (_) {}
+			      });
+			    } catch (_) {}
+
+						    // Best-effort mock for scripts using fetch (Node 18+ / undici).
+						    try {
+						      if (__interceptors.length && typeof globalThis.fetch === 'function' && !globalThis.__catpaw_mock_fetch_patched) {
+						        globalThis.__catpaw_mock_fetch_patched = true;
+				        const __origFetch = globalThis.fetch.bind(globalThis);
+				        globalThis.fetch = function patchedFetch(input, init) {
+				          try {
+				            const method = init && typeof init === 'object' && init.method ? String(init.method).toUpperCase() : 'GET';
+		            const url =
+		              typeof input === 'string'
 	                ? input
 	                : input && typeof input === 'object' && typeof input.url === 'string'
 	                  ? input.url
 	                  : '';
-				            const it0 = __pickInterceptor(url);
-				            if (it0) {
-				              const __callStack = (() => {
-				                try {
-				                  if (!__wantMockStack) return '';
-				                  return new Error('catpaw-call-stack').stack || '';
+					            const it0 = __pickInterceptor(url);
+					            if (it0) {
+					              const bodyRaw = init && typeof init === 'object' && init.body != null ? init.body : null;
+					              const bodyStr = typeof bodyRaw === 'string' ? bodyRaw : '';
+					              const __callStack = (() => {
+					                try {
+					                  if (!__wantMockStack) return '';
+					                  return new Error('catpaw-call-stack').stack || '';
 				                } catch (_) {
 				                  return '';
 				                }
 				              })();
-				              try {
-				                const bodyRaw = init && typeof init === 'object' && init.body != null ? init.body : null;
-				                const bodyStr = typeof bodyRaw === 'string' ? bodyRaw : '';
-				                const u2 = (() => { try { return new URL(url); } catch (_) { return null; } })();
-				                const pth2 = u2 ? String(u2.pathname || '') + String(u2.search || '') : '';
-				                const creds = __extractInterceptCreds(it0 && it0.name ? it0.name : '', __normalizeHost(url), pth2, init && typeof init === 'object' ? (init.headers || {}) : {}, bodyStr);
-				                it0.log({ type: 'fetch', provider: it0 && it0.name ? it0.name : '', host: __normalizeHost(url), method, url, body: bodyStr.slice(0, 4096), creds, stack: __callStack });
-				              } catch (_) {}
+					              try {
+					                const u2 = (() => { try { return new URL(url); } catch (_) { return null; } })();
+					                const pth2 = u2 ? String(u2.pathname || '') + String(u2.search || '') : '';
+					                const creds = __extractInterceptCreds(it0 && it0.name ? it0.name : '', __normalizeHost(url), pth2, init && typeof init === 'object' ? (init.headers || {}) : {}, bodyStr);
+					                it0.log({ type: 'fetch', provider: it0 && it0.name ? it0.name : '', host: __normalizeHost(url), method, url, body: bodyStr.slice(0, 4096), creds, stack: __callStack });
+					              } catch (_) {}
 				              try {
 					                const u = new URL(url);
 					                const meta = { path: String(u.pathname || '') + String(u.search || ''), body: bodyStr };
@@ -1845,15 +1920,15 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			              } catch (_) {}
 			              return Promise.reject(new Error('blocked by CATPAW_MOCK'));
 			            }
-		            if (input && typeof input === 'object') {
-			              const h = input.hostname || input.host || (input.headers && (input.headers.host || input.headers.Host));
-			              const it1 = __pickInterceptor(h);
-			              if (it1) {
-			                try {
-			                  const bodyRaw = init && typeof init === 'object' && init.body != null ? init.body : null;
-			                  const bodyStr = typeof bodyRaw === 'string' ? bodyRaw : '';
-			                  it1.log({ type: 'fetch', host: __normalizeHost(h), method, url, body: bodyStr.slice(0, 4096) });
-			                } catch (_) {}
+			            if (input && typeof input === 'object') {
+				              const h = input.hostname || input.host || (input.headers && (input.headers.host || input.headers.Host));
+				              const it1 = __pickInterceptor(h);
+				              if (it1) {
+				                const bodyRaw = init && typeof init === 'object' && init.body != null ? init.body : null;
+				                const bodyStr = typeof bodyRaw === 'string' ? bodyRaw : '';
+				                try {
+				                  it1.log({ type: 'fetch', host: __normalizeHost(h), method, url, body: bodyStr.slice(0, 4096) });
+				                } catch (_) {}
 			                try {
 				                  const url2 = typeof input.url === 'string' ? input.url : '';
 				                  const u = url2 ? new URL(url2) : null;
@@ -2009,7 +2084,7 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			            const provider = __providerForHost(host);
 			            const mockMatched = (() => {
 			              try {
-			                if (!__mockEnabled) return false;
+				                if (!__mockEnabled()) return false;
 		                const it0 = __pickInterceptor(host);
 		                return !!it0;
 		              } catch (_) {
@@ -2270,7 +2345,7 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 				                      res.statusCode = statusCode;
 			                      res.headers = headers;
 			                      try {
-			                        if (__mockDebug && mocked && mocked.kind && typeof mocked.kind === 'string' && mocked.kind.includes('detail')) {
+				                        if (__mockDebug() && mocked && mocked.kind && typeof mocked.kind === 'string' && mocked.kind.includes('detail')) {
 			                          const parsed = __tryParseJson(payload);
 			                          const list = parsed && parsed.data && Array.isArray(parsed.data.list) ? parsed.data.list : [];
 			                          const meta = parsed && parsed.data && parsed.data.metadata ? parsed.data.metadata : null;
@@ -2732,12 +2807,13 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 		    const onlineLogPath = wantDebug ? path.resolve(rootDir, `online-runtime.${key}.log`) : '';
 		    let chosenPort = p;
 
-			    for (let attempt = 0; attempt < 6; attempt += 1) {
-			        const baseEnv = { ...process.env };
-			        const child = spawn(process.execPath, [bootstrapPath], {
-			            stdio,
-			            cwd: rootDir,
-			            env: {
+				    for (let attempt = 0; attempt < 6; attempt += 1) {
+				        const baseEnv = { ...process.env };
+				        const panMockCfg = readPanMockConfigFromRuntimeRoot(rootDir);
+				        const child = spawn(process.execPath, [bootstrapPath], {
+				            stdio,
+				            cwd: rootDir,
+				            env: {
 			                ...baseEnv,
 			                DEV_HTTP_PORT: String(chosenPort),
 			                PORT: String(chosenPort),
@@ -2745,11 +2821,13 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			                ONLINE_ID: String(key),
 			                ONLINE_ENTRY: entry,
 			                ONLINE_CWD: rootDir,
-			                CATPAW_DEBUG_LOG: onlineLogPath,
-			                NODE_PATH: rootDir,
-			            },
-			        });
-			        children.set(key, { child, entry, port: chosenPort });
+				                CATPAW_DEBUG_LOG: onlineLogPath,
+				                NODE_PATH: rootDir,
+				            },
+				        });
+				        children.set(key, { child, entry, port: chosenPort });
+				        // Push initial mock config (can be toggled later without restarting via IPC).
+				        sendMockConfigToChild(child, panMockCfg);
 
 	    // When debugging online runtimes, capture child output:
 	    // - dev: if CATPAW_LOG_FILE is set, forward to parent stdout/stderr (which are already redirected to file in dev.js)
