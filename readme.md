@@ -81,7 +81,8 @@ npm run dev
 ### 139（移动云盘/和彩云 OutLink）
 
 - `POST /api/139/list`：`{ "flag": "逸动-<linkID>" }` → `{ ok, vod_play_url }`
-- `POST /api/139/play`：`{ "id": "<linkID>||<coID>|<name>" }` → `{ ok, url, headers }`
+- `POST /api/139/play`：`{ "id": "...", "want"?: "download_url"|"play_url" }` → `{ ok, url, headers }`（默认 `download_url`）
+  - `vod_play_url` 展示名为 `目录路径/文件名`（根目录显示为 `/文件名`；若根目录仅 1 个文件夹会自动下沉为根目录）。
 
 ### Baidu（百度网盘）
 
@@ -90,8 +91,9 @@ npm run dev
 
 ### Tianyi 189（天翼云盘 / cloud.189.cn）
 
-- `POST /api/189/list`：`{ "flag": "天意-<shareCode>", "accessCode"?: "" }` → `{ ok, vod_play_url }`
-- `POST /api/189/play`：`{ "id": "<fileId>*<shareId>*<fileName>" }` → `{ ok, url }`
+- `POST /api/189/list`：`{ "flag": "天翼-<shareCode>", "shareCode"?: "<shareCode>", "accessCode"?: "" }` → `{ ok, vod_play_url, shareId }`
+  - `vod_play_url` 的 `id` 为 `<fileId>*<shareId>*<fileName?>`
+- `POST /api/189/play`：`{ "id": "<fileId>*<shareId>*<fileName?>", "accessCode"?: "" }` → `{ ok, url }`
 
 辅助接口（调试/适配用）：
 
