@@ -1,5 +1,3 @@
-// Baidu Netdisk API plugin.
-
 import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
@@ -17,7 +15,6 @@ const fetchFn =
 
 function panLog(...args) {
   if (!PAN_DEBUG) return;
-  // eslint-disable-next-line no-console
   console.log('[pan]', ...args);
 }
 
@@ -202,7 +199,6 @@ async function httpRequestFollow(urlStr, init) {
       if (status === 303) {
         method = 'GET';
         body = undefined;
-        // Drop content headers when switching to GET.
         const nextHeaders = {};
         for (const [k, v] of Object.entries(headers || {})) {
           const lower = String(k || '').toLowerCase();
@@ -413,7 +409,6 @@ async function fetchText(url, init) {
     const setCookie = getFetchSetCookies(resp && resp.headers);
     const ab = await resp.arrayBuffer();
     const raw = Buffer.from(ab);
-    // Node's fetch (undici) transparently decompresses for us.
     const text = raw.toString('utf8');
     return { res: { status, headers: {} }, text, setCookie };
   }
@@ -481,7 +476,6 @@ async function getBdstokenScript({ cookie, cookieRef }) {
 function toCreateApiPath(dirPath) {
   const p = String(dirPath || '').trim();
   if (!p) return '';
-  // Match the script behavior: sending `path=//Name` for root dirs.
   if (p.startsWith('/')) return `/${p}`;
   return `//${p}`;
 }
@@ -596,10 +590,6 @@ function parseShareUrl(urlStr) {
   }
   const host = u.hostname.toLowerCase();
   if (!(host === 'pan.baidu.com' || host.endsWith('.pan.baidu.com'))) return null;
-  // Common formats:
-  // - https://pan.baidu.com/s/1xxxx
-  // - https://pan.baidu.com/s/xxxxxxxx (no leading 1)
-  // - https://pan.baidu.com/share/init?surl=xxxx
   const m1 = u.pathname.match(/^\/s\/([^/?#]+)/);
   if (m1) {
     const shareKey = m1[1];
@@ -637,11 +627,18 @@ function pickCookieValueFromSetCookie(setCookieArr, key) {
 function parseSurlFromFlag(flag) {
   const raw = String(flag || '').trim();
   if (!raw) return '';
+  const normalizeCandidate = (candRaw) => {
+    const cand = String(candRaw || '').trim();
+    if (!cand) return '';
+    if (/^1[0-9a-zA-Z_-]+$/.test(cand)) return cand.slice(1);
+    return cand;
+  };
+
   const m = raw.match(/百度[^-]*-([^#]+)/);
-  if (m && m[1]) return String(m[1]).trim();
+  if (m && m[1]) return normalizeCandidate(m[1]);
   const parts = raw.split('-');
-  if (parts.length >= 2) return String(parts[1] || '').split('#')[0].trim();
-  return '';
+  if (parts.length >= 2) return normalizeCandidate(String(parts[1] || '').split('#')[0]);
+  return normalizeCandidate(raw);
 }
 
 function decodePlayIdToJson(id) {
@@ -655,8 +652,15 @@ function decodePlayIdToJson(id) {
   try {
     raw = decodeURIComponent(raw);
   } catch {}
+  const maybeToBase64 = (s) => {
+    const t = String(s || '').trim();
+    if (!t) return '';
+    const b64 = t.replace(/-/g, '+').replace(/_/g, '/');
+    const pad = b64.length % 4 ? '='.repeat(4 - (b64.length % 4)) : '';
+    return b64 + pad;
+  };
   try {
-    const text = Buffer.from(raw, 'base64').toString('utf8');
+    const text = Buffer.from(maybeToBase64(raw), 'base64').toString('utf8');
     const obj = JSON.parse(text);
     return obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : null;
   } catch {
@@ -668,7 +672,6 @@ function encodePlayIdFromJson(decodedObj, fileName) {
   const obj = decodedObj && typeof decodedObj === 'object' && !Array.isArray(decodedObj) ? decodedObj : {};
   const name = String(fileName || '').trim();
   const b64 = Buffer.from(JSON.stringify(obj), 'utf8').toString('base64');
-  // Match existing decode logic: `decodePlayIdToJson` strips `|||...` suffix and extracts name via `extractNameFromTvServerId`.
   return name ? `${b64}|||${name}` : b64;
 }
 
@@ -701,7 +704,6 @@ async function resolveBaiduFinalUrlFromDlink(dlink) {
     }
   };
 
-  // Prefer extracting a single 302 Location and returning it to the client.
   if (fetchFn) {
     try {
       const resp = await fetchFn(url, { method: 'GET', redirect: 'manual', headers });
@@ -733,7 +735,6 @@ async function resolveBaiduFinalUrlFromDlink(dlink) {
     if (status >= 200 && status < 300) return url;
   } catch (_e) {}
 
-  // Fallback: follow redirects until we can compute the final URL.
   const resp = await httpRequestFollow(url, { method: 'GET', headers, maxRedirects: 5, timeoutMs: 30000, maxBytes: 1024 * 1024 });
   const status = Number(resp && resp.status) || 0;
   if (!(status >= 200 && status < 400)) throw new Error(`baidu dlink resolve http ${status || 0}`);
@@ -837,6 +838,147 @@ function getShareListArray(data) {
   if (Array.isArray(data.list)) return data.list;
   if (data.data && typeof data.data === 'object' && Array.isArray(data.data.list)) return data.data.list;
   return [];
+}
+
+function normalizeShareItemName(it) {
+  return String((it && (it.server_filename || it.filename || it.name)) || '').trim();
+}
+
+function normalizeShareItemPath(it) {
+  const p = String((it && (it.path || it.server_path || it.serverPath)) || '').trim();
+  return p && p.startsWith('/') ? p : '';
+}
+
+function joinShareDirPath(parentDir, childName) {
+  const base = String(parentDir || '').trim();
+  const name = String(childName || '').trim().replace(/^\/+|\/+$/g, '');
+  if (!name) return base && base.startsWith('/') ? base : '';
+  if (!base || base === '/') return `/${name}`;
+  return `${base.replace(/\/+$/g, '')}/${name}`;
+}
+
+function sanitizeVodPlayDisplayName(name) {
+  return String(name || '')
+    .replace(/[#$]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function sanitizeVodPlayIdSuffixName(name) {
+  return String(name || '')
+    .replace(/[#$]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function stripLeadingSlash(p) {
+  const s = String(p || '').trim();
+  return s.startsWith('/') ? s.slice(1) : s;
+}
+
+function normalizeDirDisplay(dirRel) {
+  const rel = String(dirRel || '').trim();
+  if (!rel || rel === '/') return '/';
+  const noLead = stripLeadingSlash(rel);
+  return sanitizeVodPlayDisplayName(noLead);
+}
+
+function stripDirPrefix(dirPath, prefix) {
+  const d = String(dirPath || '').trim();
+  const pre = String(prefix || '').trim();
+  if (!pre || pre === '/' || !d.startsWith('/')) return d || '/';
+  if (d === pre) return '/';
+  const pre2 = pre.endsWith('/') ? pre : `${pre}/`;
+  if (d.startsWith(pre2)) return `/${d.slice(pre2.length)}`;
+  return d || '/';
+}
+
+async function shareListAllFilesRecursive({
+  baseCookie,
+  surl,
+  pwd,
+}) {
+  const maxDirs = 2000;
+  const maxFiles = 50000;
+  const maxDepth = 50;
+
+  const root = await shareListRootScript({ baseCookie, surl, pwd });
+  const { shareid, uk } = root.ctx || {};
+  if (!shareid || !uk) throw new Error('share context missing (uk/shareid)');
+
+  const outFiles = [];
+  const visitedDirs = new Set();
+  const q = [];
+  let effectiveRootPrefix = '';
+
+  const enqueueDir = (dirPath, depth) => {
+    const d = String(dirPath || '').trim();
+    if (!d || !d.startsWith('/')) return;
+    if (visitedDirs.has(d)) return;
+    if (depth > maxDepth) return;
+    visitedDirs.add(d);
+    if (visitedDirs.size > maxDirs) throw new Error(`too many dirs (> ${maxDirs})`);
+    q.push({ dir: d, depth });
+  };
+
+  const pushFile = (it, dirPath) => {
+    const realName = normalizeShareItemName(it);
+    const fsid = String((it && (it.fs_id || it.fsid || it.fsId)) || '').trim();
+    if (!realName || !fsid) return;
+    const dir = String(dirPath || '').trim() || '/';
+    const relDir = stripDirPrefix(dir, effectiveRootPrefix) || '/';
+    outFiles.push({ fsid, realName, dir: relDir });
+    if (outFiles.length > maxFiles) throw new Error(`too many files (> ${maxFiles})`);
+  };
+
+  const walkList = (list, currentDir, depth) => {
+    const arr = Array.isArray(list) ? list : [];
+    for (const it of arr) {
+      if (!it || typeof it !== 'object') continue;
+      const isDir = Number(it.isdir) === 1;
+      if (isDir) {
+        const itemName = normalizeShareItemName(it);
+        const itemPath = normalizeShareItemPath(it) || joinShareDirPath(currentDir || '/', itemName);
+        enqueueDir(itemPath, depth + 1);
+      } else {
+        pushFile(it, currentDir || '/');
+      }
+    }
+  };
+
+  const rootArr = getShareListArray(root.data);
+  const rootDirs = [];
+  const rootFiles = [];
+  for (const it of Array.isArray(rootArr) ? rootArr : []) {
+    if (!it || typeof it !== 'object') continue;
+    if (Number(it.isdir) === 1) rootDirs.push(it);
+    else rootFiles.push(it);
+  }
+
+  if (rootFiles.length === 0 && rootDirs.length === 1) {
+    const onlyDirName = normalizeShareItemName(rootDirs[0]);
+    const onlyDirPath = normalizeShareItemPath(rootDirs[0]) || joinShareDirPath('/', onlyDirName);
+    if (onlyDirPath && onlyDirPath.startsWith('/')) {
+      effectiveRootPrefix = onlyDirPath;
+      enqueueDir(onlyDirPath, 0);
+    } else {
+      walkList(rootArr, '/', 0);
+    }
+  } else {
+    walkList(rootArr, '/', 0);
+  }
+
+  while (q.length) {
+    const cur = q.shift();
+    const data = await shareListDirScript({ cookie: root.cookie, shareid, uk, dir: cur.dir });
+    walkList(getShareListArray(data), cur.dir, cur.depth);
+  }
+
+  return {
+    cookie: root.cookie,
+    ctx: { surl: String(surl || '').trim(), shareid, uk },
+    files: outFiles,
+  };
 }
 
 function findShareItemByName(list, name, isDir) {
@@ -966,8 +1108,6 @@ const apiPlugins = [
         return { ok: true, hasCookie: !!cookie, features: { transferSupportsFlagId: true } };
       });
 
-      // List share root files and return 0119-style `vod_play_url`.
-      // Input: { flag: "百度xxx-<surl>#..." , pwd? }  Output: { ok, vod_play_url }
       instance.post('/list', async (req, reply) => {
         const body = req && typeof req.body === 'object' ? req.body : {};
         const flag = String(body.flag || '').trim();
@@ -984,19 +1124,18 @@ const apiPlugins = [
         }
         try {
           const pwd = String(body.pwd || body.pass || body.password || '').trim();
-          const rootList = await shareListRootScript({ baseCookie, surl, pwd });
+          const rootList = await shareListAllFilesRecursive({ baseCookie, surl, pwd });
           const { shareid, uk } = rootList.ctx || {};
-          const list = getShareListArray(rootList.data);
           const parts = [];
-          for (const it of list) {
-            if (!it || typeof it !== 'object') continue;
-            if (Number(it.isdir) === 1) continue;
-            const name = String(it.server_filename || it.filename || it.name || '').trim();
-            const fsid = String(it.fs_id || it.fsid || it.fsId || '').trim();
-            if (!name || !fsid) continue;
-            const playJson = { shareid, uk, fs_id: fsid, surl, pwd, realName: name };
-            const id = encodePlayIdFromJson(playJson, name);
-            parts.push(`${name}$${id}`);
+          for (const f of Array.isArray(rootList.files) ? rootList.files : []) {
+            if (!f || typeof f !== 'object') continue;
+            const realName = String(f.realName || '').trim();
+            const fsid = String(f.fsid || '').trim();
+            const dirDisplay = normalizeDirDisplay(String(f.dir || '').trim() || '/');
+            if (!dirDisplay || !realName || !fsid) continue;
+            const playJson = { shareid, uk, fs_id: fsid, surl, pwd, realName };
+            const id = encodePlayIdFromJson(playJson, sanitizeVodPlayIdSuffixName(realName));
+            parts.push(`${dirDisplay}$${id}`);
           }
           return { ok: true, vod_play_url: parts.join('#') };
         } catch (e) {
@@ -1071,9 +1210,9 @@ const apiPlugins = [
           return { ok: false, message: 'missing flag/id' };
         }
 
-	        const dirPath = destPathRaw
-	          ? destPathRaw.startsWith('/') ? destPathRaw : `/${destPathRaw}`
-	          : destName ? `/${destName}` : '/MeowFilm';
+        const dirPath = destPathRaw
+          ? destPathRaw.startsWith('/') ? destPathRaw : `/${destPathRaw}`
+          : destName ? `/${destName}` : '/MeowFilm';
         if (!dirPath || !dirPath.startsWith('/')) {
           reply.code(400);
           return { ok: false, message: 'missing destPath/destName' };
@@ -1155,7 +1294,7 @@ const apiPlugins = [
           });
           panLog(`baidu play transfer done id=${reqId}`, { ms: Date.now() - tTransferStart });
 
-          const safeName = fileName.replace(/^\/+/, '');
+          const safeName = path.posix.basename(String(fileName || '').replace(/\\/g, '/')).replace(/^\/+/, '');
           const fullPath = `${ensuredPath.replace(/\/+$/g, '')}/${safeName}`.replace(/\/{2,}/g, '/');
           stage = 'mediainfo';
           const tMediaStart = Date.now();
@@ -1195,7 +1334,7 @@ const apiPlugins = [
             })(),
           });
           panLog(`baidu play done id=${reqId}`, { ms: Date.now() - tStart });
-          return { ok: true, parse: 0, url: finalUrl, playUrl: finalUrl, downloadUrl: finalUrl, header: { 'User-Agent': BAIDU_PLAY_UA } };
+          return { ok: true, url: finalUrl, header: { 'User-Agent': BAIDU_PLAY_UA } };
         } catch (e) {
           const message = (e && e.message) || String(e);
           panLog(`baidu play failed id=${reqId}`, { stage, ms: Date.now() - tStart, message: message.slice(0, 400) });

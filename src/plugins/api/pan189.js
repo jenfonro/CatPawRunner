@@ -4,7 +4,7 @@
 // - POST /api/189/share/info
 // - POST /api/189/share/list
 // - POST /api/189/file/download
-// - POST /api/189/play  (id: fileId*shareId*fileName)
+// - POST /api/189/play  (id: fileId*shareId*fileName?)
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -13,7 +13,7 @@ import crypto from 'node:crypto';
 const TIANYI_API_BASE = 'https://cloud.189.cn';
 const TIANYI_AUTH_BASE = 'https://open.e.189.cn';
 const TIANYI_UA =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36';
 
 function toStr(v) {
   return typeof v === 'string' ? v : v == null ? '' : String(v);
@@ -92,7 +92,7 @@ async function fetchTianyiJson(urlStr, init = {}) {
   const text = await res.text();
   let data = null;
   try {
-    data = text && text.trim() ? JSON.parse(text) : null;
+    data = text && text.trim() ? safeParseTianyiJSON(text) : null;
   } catch (_) {
     data = null;
   }
@@ -105,6 +105,18 @@ async function fetchTianyiJson(urlStr, init = {}) {
     throw err;
   }
   return { status: res.status, headers: res.headers, text, data };
+}
+
+function safeParseTianyiJSON(text) {
+  // Tianyi APIs frequently return 17-19 digit numeric IDs (shareId/fileId/id/parentId),
+  // which will lose precision if parsed as JS Number (IEEE-754).
+  // Fix by quoting those numeric tokens before JSON.parse.
+  const raw = toStr(text);
+  const patched = raw.replace(
+    /(\"(?:shareId|share_id|fileId|file_id|id|parentId|parent_id)\"\s*:\s*)(\d{16,})/g,
+    '$1\"$2\"'
+  );
+  return patched && patched.trim() ? JSON.parse(patched) : null;
 }
 
 async function resolveFinalUrl(urlStr, { maxRedirects = 8 } = {}) {
@@ -491,7 +503,9 @@ async function ensure189Cookie({ forceRefresh = false } = {}) {
 
 function parsePlayId(id) {
   const raw = toStr(id).trim();
-  // Tianyi ids used by the spider: `<fileId>*<shareId>*<fileName?>`
+  // Supported formats:
+  // - `<fileId>*<shareId>*<fileName?>` (legacy)
+  // - `<fileId>*<shareId>` (supported but list will include fileName for compatibility)
   if (!raw) return { shareId: '', fileId: '', fileName: '' };
   const parts = raw.split('*');
   const fileId = toStr(parts[0]).trim();
@@ -507,11 +521,27 @@ function normalizeBody(body) {
 function parse189ShareCodeLike(str) {
   const s = toStr(str).trim();
   if (!s) return { shareCode: '', accessCode: '' };
+  const mFlag = s.match(/^(?:天翼|天意)-([A-Za-z0-9]{6,64})$/);
+  if (mFlag && mFlag[1]) return { shareCode: toStr(mFlag[1]).trim(), accessCode: '' };
 
-  // Strict spider flag format (only): "天意-<shareCode>"
-  const m = s.match(/^天意-([A-Za-z0-9]{6,64})$/);
-  const shareCode = m && m[1] ? toStr(m[1]).trim() : '';
-  return { shareCode, accessCode: '' };
+  // cloud.189.cn short share url
+  const mT = s.match(/^https?:\/\/cloud\.189\.cn\/t\/([A-Za-z0-9]{6,64})(?:\b|\/|$)/i);
+  if (mT && mT[1]) return { shareCode: toStr(mT[1]).trim(), accessCode: '' };
+
+  // content.21cn.com share link (shareCode in query)
+  try {
+    if (/^https?:\/\//i.test(s)) {
+      const u = new URL(s.replace('#', ''));
+      const sc = toStr(u.searchParams.get('shareCode') || '').trim();
+      if (sc) return { shareCode: sc, accessCode: '' };
+    }
+  } catch (_) {}
+
+  // Fallback: if user passes raw shareCode
+  const mCode = s.match(/^([A-Za-z0-9]{6,64})$/);
+  if (mCode && mCode[1]) return { shareCode: toStr(mCode[1]).trim(), accessCode: '' };
+
+  return { shareCode: '', accessCode: '' };
 }
 
 function buildUrl(pathname, query) {
@@ -534,6 +564,26 @@ async function tianyiGetShareInfoByCode({ shareCode, accessCode, cookie }) {
     method: 'GET',
     headers: buildTianyiHeaders({ cookie, referer: `https://cloud.189.cn/t/${toStr(shareCode).trim()}` }),
   });
+}
+
+async function tianyiCheckAccessCode({ shareCode, accessCode, cookie }) {
+  const url = buildUrl('/api/open/share/checkAccessCode.action', {
+    key: 'noCache',
+    noCache: String(Math.random()),
+    shareCode,
+    accessCode,
+  });
+  return await fetchTianyiJson(url, {
+    method: 'GET',
+    headers: buildTianyiHeaders({ cookie, referer: `https://cloud.189.cn/web/share?code=${toStr(shareCode).trim()}` }),
+  });
+}
+
+function isTianyiFileTooLargeError(err) {
+  const { code, msg } = pickTianyiErrorCodeFromError(err);
+  const c = toStr(code).toLowerCase();
+  const m = toStr(msg).toLowerCase();
+  return c.includes('filetoolarge') || m.includes('file too large') || m.includes('filetoolarge');
 }
 
 function pickTianyiResCode(resp) {
@@ -648,44 +698,118 @@ function isNeedAccessCodeError(err) {
   return raw.includes('accesscode') || raw.includes('访问码') || raw.includes('提取码') || raw.includes('密码');
 }
 
+function parseIsFolderValue(v) {
+  if (v === true) return true;
+  if (v === false) return false;
+  const s = toStr(v).trim().toLowerCase();
+  if (s === '1' || s === 'true' || s === 'yes') return true;
+  if (s === '0' || s === 'false' || s === 'no') return false;
+  // Some APIs may return numeric-ish values.
+  const n = Number(s);
+  if (Number.isFinite(n)) {
+    if (Math.trunc(n) === 1) return true;
+    if (Math.trunc(n) === 0) return false;
+  }
+  return null;
+}
+
+function pickTianyiShareListCount(respData) {
+  const root = respData && typeof respData === 'object' && !Array.isArray(respData) ? respData : {};
+  const fileListAO =
+    root.fileListAO && typeof root.fileListAO === 'object'
+      ? root.fileListAO
+      : root.data && typeof root.data === 'object' && root.data.fileListAO && typeof root.data.fileListAO === 'object'
+        ? root.data.fileListAO
+        : {};
+  const c = fileListAO.count ?? fileListAO.Count ?? fileListAO.total ?? fileListAO.Total ?? null;
+  const n = Number(c);
+  return Number.isFinite(n) ? Math.max(0, Math.trunc(n)) : 0;
+}
+
+function ensureLeadingSlash(p) {
+  const s = toStr(p).trim().replace(/\/{2,}/g, '/');
+  if (!s) return '/';
+  return s.startsWith('/') ? s : `/${s}`;
+}
+
+function joinPath(a, b) {
+  const aa = ensureLeadingSlash(a);
+  const bb = toStr(b).trim();
+  if (!bb) return aa;
+  if (aa === '/') return `/${bb}`.replace(/\/{2,}/g, '/');
+  return `${aa.replace(/\/+$/g, '')}/${bb}`.replace(/\/{2,}/g, '/');
+}
+
+function buildDisplayName(dirPath, fileName) {
+  // Display name should be directory path only:
+  // - root directory: "/"
+  // - nested directories: "/a/b"
+  // NOTE: fileName is intentionally ignored (kept for backward-compatible signature).
+  return ensureLeadingSlash(dirPath);
+}
+
 function normalize189FileListFromShareListResp(respData) {
   const root = respData && typeof respData === 'object' && !Array.isArray(respData) ? respData : {};
-  const fileList =
-    root.fileListAO && typeof root.fileListAO === 'object' && Array.isArray(root.fileListAO.fileList)
-      ? root.fileListAO.fileList
-      : root.data && typeof root.data === 'object' && root.data.fileListAO && typeof root.data.fileListAO === 'object' && Array.isArray(root.data.fileListAO.fileList)
-        ? root.data.fileListAO.fileList
-        : [];
+  const fileListAO =
+    root.fileListAO && typeof root.fileListAO === 'object'
+      ? root.fileListAO
+      : root.data && typeof root.data === 'object' && root.data.fileListAO && typeof root.data.fileListAO === 'object'
+        ? root.data.fileListAO
+        : {};
 
-  return fileList
-    .map((it) => {
+  // Some responses return files/folders split into different arrays; merge them.
+  const fileListRaw = Array.isArray(fileListAO.fileList)
+    ? fileListAO.fileList
+    : Array.isArray(fileListAO.files)
+      ? fileListAO.files
+      : [];
+  const folderListRaw = Array.isArray(fileListAO.folderList)
+    ? fileListAO.folderList
+    : Array.isArray(fileListAO.dirList)
+      ? fileListAO.dirList
+      : Array.isArray(fileListAO.folders)
+        ? fileListAO.folders
+        : [];
+  const merged = [
+    ...fileListRaw.map((it) => ({ __kind: 'file', it })),
+    // `folderList` is authoritative: always treat these as folders even if `isFolder` is missing/misleading.
+    ...folderListRaw.map((it) => ({ __kind: 'folder', it: it && typeof it === 'object' && !Array.isArray(it) ? { ...it, isFolder: true } : it })),
+  ];
+
+  return merged
+    .map((wrap) => {
+      const kind = wrap && typeof wrap === 'object' ? toStr(wrap.__kind) : '';
+      const it = wrap && typeof wrap === 'object' ? wrap.it : null;
       const o = it && typeof it === 'object' && !Array.isArray(it) ? it : {};
       const fileId = toStr(o.id || o.fileId || o.file_id).trim();
       const name = toStr(o.name || o.fileName || o.file_name).trim();
       const sizeRaw = o.size != null ? o.size : o.fileSize != null ? o.fileSize : o.file_size != null ? o.file_size : 0;
       const size = Number.isFinite(Number(sizeRaw)) ? Math.max(0, Math.trunc(Number(sizeRaw))) : 0;
       const lastOpTime = toStr(o.lastOpTime || o.lastOpDate || o.fileLastOpTime || o.last_op_time).trim();
-      const fileCata = Number.isFinite(Number(o.fileCata)) ? Math.trunc(Number(o.fileCata)) : null;
-      const isFolder =
-        typeof o.isFolder === 'boolean'
-          ? o.isFolder
-          : typeof o.isfolder === 'boolean'
-            ? o.isfolder
-            : fileCata === 0;
+      // Tianyi share list responses may:
+      // - return a single `fileList` containing both files and folders, distinguished by `isFolder` (0/1/"true"/"false")
+      // - or return split arrays (fileList/folderList)
+      // Prefer explicit `isFolder` value if present; otherwise fall back to response structure.
+      let isFolder = false;
+      const parsedIsFolder = parseIsFolderValue(o.isFolder ?? o.isfolder ?? o.is_folder);
+      if (parsedIsFolder !== null) isFolder = parsedIsFolder;
+      else if (kind === 'folder') isFolder = true;
+      else if (kind === 'file') isFolder = false;
       return { fileId, name, size, lastOpTime, isFolder };
     })
     .filter((x) => x && x.fileId && x.name);
 }
 
-async function tianyiListShareDir({ shareId, fileId, shareMode, pageNum, pageSize, orderBy, descending, accessCode, cookie }) {
+async function tianyiListShareDir({ shareId, fileId, shareDirFileId, shareMode, pageNum, pageSize, orderBy, descending, accessCode, cookie }) {
   const fid = toStr(fileId || '0').trim() || '0';
+  const dirFid = toStr(shareDirFileId || fid).trim() || fid;
   const desc = typeof descending === 'boolean' ? (descending ? 'true' : 'false') : toStr(descending || 'true');
   const url = buildUrl('/api/open/share/listShareDir.action', {
     key: 'noCache',
     noCache: String(Math.random()),
     shareId,
     fileId: fid,
-    shareDirFileId: fid,
+    shareDirFileId: dirFid,
     isFolder: 'true',
     iconOption: '5',
     shareMode: toStr(shareMode || '3').trim() || '3',
@@ -701,7 +825,147 @@ async function tianyiListShareDir({ shareId, fileId, shareMode, pageNum, pageSiz
   });
 }
 
+async function tianyiListShareDirAllPages({
+  shareId,
+  fileId,
+  shareDirFileId,
+  shareMode,
+  pageSize,
+  orderBy,
+  descending,
+  accessCode,
+  cookie,
+  maxPages = 2000,
+}) {
+  const meta = await tianyiListShareDirAllPagesWithMeta({
+    shareId,
+    fileId,
+    shareDirFileId,
+    shareMode,
+    pageSize,
+    orderBy,
+    descending,
+    accessCode,
+    cookie,
+    maxPages,
+  });
+  return meta.items;
+}
+
+async function tianyiListShareDirAllPagesWithMeta({
+  shareId,
+  fileId,
+  shareDirFileId,
+  shareMode,
+  pageSize,
+  orderBy,
+  descending,
+  accessCode,
+  cookie,
+  maxPages = 2000,
+}) {
+  const out = [];
+  const ps = Number.isFinite(Number(pageSize)) ? Math.max(1, Math.min(1000, Math.trunc(Number(pageSize)))) : 200;
+  const limit = Number.isFinite(Number(maxPages)) ? Math.max(1, Math.trunc(Number(maxPages))) : 2000;
+  let pagesFetched = 0;
+  let truncated = false;
+  let countMax = 0;
+
+  for (let pageNum = 1; pageNum <= limit; pageNum += 1) {
+    pagesFetched = pageNum;
+    const resp = await tianyiListShareDir({
+      shareId,
+      fileId,
+      shareDirFileId,
+      shareMode,
+      pageNum,
+      pageSize: ps,
+      orderBy,
+      descending,
+      accessCode,
+      cookie,
+    });
+    assertTianyiOk(resp.data, 'tianyi share list');
+    const items = normalize189FileListFromShareListResp(resp.data);
+    const count = pickTianyiShareListCount(resp.data);
+    if (count > countMax) countMax = count;
+    if (items.length === 0) break;
+
+    out.push(...items);
+
+    // Stop paging when the page is not full, or when count is reached.
+    if (items.length < ps) break;
+    if (count > 0 && pageNum * ps >= count) break;
+    if (pageNum === limit) truncated = true;
+  }
+  return { items: out, count: countMax, pagesFetched, truncated };
+}
+
+async function tianyiListShareDirRecursive({
+  shareId,
+  rootFileId,
+  shareMode,
+  pageSize,
+  orderBy,
+  descending,
+  accessCode,
+  cookie,
+  maxDirs = 20000,
+  prefetchedItemsByDirId,
+}) {
+  const dirs = [];
+  const files = [];
+  const rootFid = toStr(rootFileId || '0').trim() || '0';
+  const q = [{ dirId: rootFid, dirPath: '/' }];
+  const seen = new Set([rootFid]);
+  const limit = Number.isFinite(Number(maxDirs)) ? Math.max(1, Math.trunc(Number(maxDirs))) : 20000;
+  const prefetched =
+    prefetchedItemsByDirId && typeof prefetchedItemsByDirId === 'object' && !Array.isArray(prefetchedItemsByDirId)
+      ? prefetchedItemsByDirId
+      : null;
+
+  while (q.length > 0) {
+    const cur = q.shift();
+    const dirId = toStr(cur && cur.dirId).trim();
+    const dirPath = ensureLeadingSlash(cur && cur.dirPath);
+    const items =
+      prefetched && Object.prototype.hasOwnProperty.call(prefetched, dirId) && Array.isArray(prefetched[dirId])
+        ? prefetched[dirId]
+        : (
+            await tianyiListShareDirAllPagesWithMeta({
+              shareId,
+              fileId: dirId,
+              shareDirFileId: dirId,
+              shareMode,
+              pageSize,
+              orderBy,
+              descending,
+              accessCode,
+              cookie,
+            })
+          ).items;
+    if (prefetched && Object.prototype.hasOwnProperty.call(prefetched, dirId)) delete prefetched[dirId];
+    for (const it of items) {
+      if (!it || !it.fileId) continue;
+      if (it.isFolder) {
+        dirs.push({ ...it, dirPath });
+        if (!seen.has(it.fileId)) {
+          seen.add(it.fileId);
+          q.push({ dirId: it.fileId, dirPath: joinPath(dirPath, it.name) });
+          if (seen.size >= limit) throw new Error('tianyi share too large (exceeded max dirs)');
+        }
+      } else {
+        files.push({ ...it, dirPath });
+      }
+    }
+  }
+
+  return { files, dirs };
+}
+
 async function tianyiGetFileDownloadUrl({ shareId, fileId, dt, accessCode, cookie }) {
+  // NOTE: This legacy API may fail for large files (FileTooLarge) depending on dt/provider.
+  // Keep the implementation for reference / other endpoints, but `/api/189/play` prefers the VLC portal API.
   const url = buildUrl('/api/open/file/getFileDownloadUrl.action', {
     shareId,
     fileId,
@@ -712,6 +976,25 @@ async function tianyiGetFileDownloadUrl({ shareId, fileId, dt, accessCode, cooki
     method: 'GET',
     headers: buildTianyiHeaders({ cookie, referer: 'https://cloud.189.cn/' }),
   });
+}
+
+async function tianyiGetNewVlcVideoPlayUrl({ shareId, fileId, dt, cookie }) {
+  const url = buildUrl('/api/portal/getNewVlcVideoPlayUrl.action', {
+    shareId,
+    fileId,
+    dt: toStr(dt || '1').trim() || '1',
+    type: '4',
+  });
+  return await fetchTianyiJson(url, {
+    method: 'GET',
+    headers: buildTianyiHeaders({ cookie, referer: 'https://cloud.189.cn/' }),
+  });
+}
+
+function extractFirstUrlFromTianyiVlcResp(respData) {
+  const d = respData && typeof respData === 'object' ? respData : null;
+  if (!d) return '';
+  return toStr(d.fileDownloadUrl).trim();
 }
 
 function extractFirstUrlFromTianyiDownloadResp(respData) {
@@ -738,13 +1021,19 @@ export const apiPlugins = [
     plugin: async function pan189Api(instance) {
       instance.post('/list', async (req, reply) => {
         const body = normalizeBody(req && req.body);
-        const flag = toStr(body.flag || body.from || body.play_from).trim();
+        const flag = toStr(body.flag).trim();
         const parsed = parse189ShareCodeLike(flag);
         const shareCode = parsed.shareCode;
-        const accessCode = toStr(body.accessCode || body.passcode || body.pwd || body.password).trim();
-        const pageSizeRaw = body.pageSize != null ? body.pageSize : body.size != null ? body.size : 200;
-        const pageSize = Number.isFinite(Number(pageSizeRaw)) ? Math.max(1, Math.min(1000, Math.trunc(Number(pageSizeRaw)))) : 200;
-        if (!shareCode) return reply.code(400).send({ ok: false, message: 'missing/invalid flag (expected: 天意-<shareCode>)' });
+        const accessCode = toStr(body.accessCode).trim();
+        const pageSize = 200;
+        const shareCodeDirect = toStr(body.shareCode).trim();
+        const shareCodeFinal = shareCodeDirect || shareCode;
+        if (!shareCodeFinal) {
+          return reply.code(400).send({
+            ok: false,
+            message: 'missing/invalid shareCode (flag supports: 天翼-<shareCode> / https://cloud.189.cn/t/<shareCode>)',
+          });
+        }
 
         let shareIdForLog = '';
         try {
@@ -756,117 +1045,212 @@ export const apiPlugins = [
 
           let infoOut;
           try {
-            infoOut = await tianyiGetShareInfoByCode({ shareCode, accessCode, cookie });
-            assertTianyiOk(infoOut.data, 'tianyi share info');
-          } catch (e) {
-            if (isTianyiSessionExpiredError(e)) {
-              ensured = await ensure189Cookie({ forceRefresh: true });
-              cookie = toStr(ensured.cookie).trim();
-              infoOut = await tianyiGetShareInfoByCode({ shareCode, accessCode, cookie });
+              infoOut = await tianyiGetShareInfoByCode({ shareCode: shareCodeFinal, accessCode, cookie });
               assertTianyiOk(infoOut.data, 'tianyi share info');
-            } else {
-              throw e;
+            } catch (e) {
+              if (isTianyiSessionExpiredError(e)) {
+                ensured = await ensure189Cookie({ forceRefresh: true });
+                cookie = toStr(ensured.cookie).trim();
+                infoOut = await tianyiGetShareInfoByCode({ shareCode: shareCodeFinal, accessCode, cookie });
+                assertTianyiOk(infoOut.data, 'tianyi share info');
+              } else {
+                throw e;
+              }
             }
-          }
 
-          const info = infoOut && infoOut.data && typeof infoOut.data === 'object' ? infoOut.data : {};
-          const shareId = toStr(info.shareId || info.share_id).trim();
-          shareIdForLog = shareId;
-          const rootFileId = toStr(info.fileId || info.file_id || '0').trim() || '0';
-          const isFolder = typeof info.isFolder === 'boolean' ? info.isFolder : String(info.isFolder || '').toLowerCase() === 'true';
-          if (!shareId) return reply.code(502).send({ ok: false, message: 'tianyi share info: missing shareId', info });
-          if (shareInfoRequiresAccessCode(info) && !accessCode) {
-            try {
+	          const info = infoOut && infoOut.data && typeof infoOut.data === 'object' ? infoOut.data : {};
+	          let shareId = '';
+	          if (accessCode) {
+	            let checkOut;
+	            try {
+	              checkOut = await tianyiCheckAccessCode({ shareCode: shareCodeFinal, accessCode, cookie });
+	              assertTianyiOk(checkOut.data, 'tianyi checkAccessCode');
+	            } catch (e) {
+	              if (isTianyiSessionExpiredError(e)) {
+	                ensured = await ensure189Cookie({ forceRefresh: true });
+	                cookie = toStr(ensured.cookie).trim();
+	                checkOut = await tianyiCheckAccessCode({ shareCode: shareCodeFinal, accessCode, cookie });
+	                assertTianyiOk(checkOut.data, 'tianyi checkAccessCode');
+	              } else {
+	                throw e;
+	              }
+	            }
+	            shareId = toStr(checkOut && checkOut.data && (checkOut.data.shareId || checkOut.data.share_id)).trim();
+	          }
+	          if (!shareId) shareId = toStr(info.shareId || info.share_id).trim();
+	          shareIdForLog = shareId;
+	          const rootFileId = toStr(info.fileId || info.file_id || '0').trim() || '0';
+	          let isFolder = false;
+	          const parsedIsFolder = parseIsFolderValue(info.isFolder ?? info.isfolder ?? info.is_folder);
+	          if (parsedIsFolder !== null) isFolder = parsedIsFolder;
+	          else isFolder = String(info.isFolder || '').toLowerCase() === 'true';
+	          if (!shareId) {
+	            if (!accessCode) return reply.code(401).send({ ok: false, needAccessCode: true, message: 'tianyi share requires accessCode' });
+	            return reply.code(502).send({ ok: false, message: 'tianyi share info: missing shareId', info });
+	          }
+
+	            if (!isFolder) {
+	              const name = toStr(info.fileName || info.name).trim() || 'file';
+	              const fileId = toStr(info.fileId || info.file_id).trim();
+	              // CatPawOpen legacy format: "<fileId>*<shareId>*<fileName?>"
+	              const id = fileId && shareId ? `${fileId}*${shareId}*${name}` : '';
+	              return {
+	                ok: true,
+	                vod_play_url: id ? `/$${id}` : '',
+	              };
+	            }
+
+	          const shareMode = info.shareMode;
+
+	          // Determine if the share root is actually a folder by listing it once (all pages),
+	          // instead of trusting `share info isFolder` which can be inconsistent across shares.
+	          let rootMeta;
+	          try {
+	            rootMeta = await tianyiListShareDirAllPagesWithMeta({
+	              shareId,
+	              fileId: rootFileId,
+	              shareDirFileId: rootFileId,
+	              shareMode,
+	              pageSize,
+	              orderBy: 'lastOpTime',
+	              descending: true,
+	              accessCode,
+	              cookie,
+	              maxPages: 2000,
+	            });
+	          } catch (e) {
+	            if (isTianyiSessionExpiredError(e)) {
+	              ensured = await ensure189Cookie({ forceRefresh: true });
+	              cookie = toStr(ensured.cookie).trim();
+	              rootMeta = await tianyiListShareDirAllPagesWithMeta({
+	                shareId,
+	                fileId: rootFileId,
+	                shareDirFileId: rootFileId,
+	                shareMode,
+	                pageSize,
+	                orderBy: 'lastOpTime',
+	                descending: true,
+	                accessCode,
+	                cookie,
+	                maxPages: 2000,
+	              });
+	            } else {
+	              throw e;
+	            }
+	          }
+
+	          const rootItems = rootMeta && Array.isArray(rootMeta.items) ? rootMeta.items : [];
+	          const rootCount = rootMeta && typeof rootMeta.count === 'number' ? rootMeta.count : 0;
+
+	          // If root listing is empty, treat as single-file share.
+	          if (rootItems.length === 0) {
+	            const name = toStr(info.fileName || info.name).trim() || 'file';
+	            const fileId = toStr(info.fileId || info.file_id).trim();
+	            const id = fileId && shareId ? `${fileId}*${shareId}*${name}` : '';
+	            return {
+	              ok: true,
+	              shareCode: shareCodeFinal,
+	              shareId,
+	              fileId: rootFileId,
+	              vod_play_url: id ? `/$${id}` : '',
+	            };
+	          }
+
+	          // Root unwrap: if share root contains only ONE folder and NO files, treat that folder as the effective root.
+	          let effectiveRootFileId = rootFileId;
+	          if (rootCount > 0 && rootCount <= rootItems.length) {
+	            const folders = rootItems.filter((x) => x && x.isFolder);
+	            const plainFiles = rootItems.filter((x) => x && !x.isFolder);
+	            if (plainFiles.length === 0 && folders.length === 1 && folders[0].fileId) {
+	              effectiveRootFileId = folders[0].fileId;
+	            }
+	          }
+
+	          // Always recursively list all directories to match the expected "get all files" behavior.
+	          let r;
+	          try {
+	            r = await tianyiListShareDirRecursive({
+	              shareId,
+	              rootFileId: effectiveRootFileId,
+	              shareMode,
+	              pageSize,
+	              orderBy: 'lastOpTime',
+	              descending: true,
+	              accessCode,
+	              cookie,
+	              ...(effectiveRootFileId === rootFileId ? { prefetchedItemsByDirId: { [rootFileId]: rootItems } } : {}),
+	            });
+	          } catch (e) {
+		            if (isTianyiSessionExpiredError(e)) {
+		              ensured = await ensure189Cookie({ forceRefresh: true });
+		              cookie = toStr(ensured.cookie).trim();
+	              // Refresh root listing as well.
+	              rootMeta = await tianyiListShareDirAllPagesWithMeta({
+	                shareId,
+	                fileId: rootFileId,
+	                shareDirFileId: rootFileId,
+	                shareMode,
+	                pageSize,
+	                orderBy: 'lastOpTime',
+	                descending: true,
+	                accessCode,
+	                cookie,
+	                maxPages: 2000,
+	              });
+	              const rootItems2 = rootMeta && Array.isArray(rootMeta.items) ? rootMeta.items : [];
+	              const rootCount2 = rootMeta && typeof rootMeta.count === 'number' ? rootMeta.count : 0;
+	              effectiveRootFileId = rootFileId;
+	              if (rootCount2 > 0 && rootCount2 <= rootItems2.length) {
+	                const folders = rootItems2.filter((x) => x && x.isFolder);
+	                const plainFiles = rootItems2.filter((x) => x && !x.isFolder);
+	                if (plainFiles.length === 0 && folders.length === 1 && folders[0].fileId) {
+	                  effectiveRootFileId = folders[0].fileId;
+	                }
+	              }
+		              r = await tianyiListShareDirRecursive({
+		                shareId,
+		                rootFileId: effectiveRootFileId,
+		                shareMode,
+		                pageSize,
+		                orderBy: 'lastOpTime',
+		                descending: true,
+		                accessCode,
+		                cookie,
+		                ...(effectiveRootFileId === rootFileId ? { prefetchedItemsByDirId: { [rootFileId]: rootItems2 } } : {}),
+		              });
+		            } else {
+		              throw e;
+		            }
+	          }
+	          const files = r.files;
+
+		          const vod_play_url = files
+		            .filter((f) => f && !f.isFolder && f.fileId && f.name)
+		            .map((f) => `${buildDisplayName(f.dirPath, f.name)}$${f.fileId}*${shareId}*${f.name}`)
+		            .join('#');
+		          return { ok: true, vod_play_url };
+	        } catch (e) {
+	          try {
+	            if (!isNeedAccessCodeError(e)) {
+	              const { code, msg } = pickTianyiErrorCodeFromError(e);
               upsertErrorLogByShareCode({
                 provider: '189',
                 api: '/api/189/list',
-                shareCode,
-                shareId,
-                needAccessCode: true,
-                accessCodeProvided: false,
-                code: info && Object.prototype.hasOwnProperty.call(info, 'res_code') ? info.res_code : null,
-                message: 'tianyi share requires accessCode',
-              });
-            } catch {}
-            return reply.code(401).send({ ok: false, needAccessCode: true, message: 'tianyi share requires accessCode', shareCode, shareId, fileId: rootFileId });
-          }
-
-          if (!isFolder) {
-            const name = toStr(info.fileName || info.name).trim() || 'file';
-            const fileId = toStr(info.fileId || info.file_id).trim();
-            const id = fileId && shareId ? `${fileId}*${shareId}*${name}` : '';
-            return {
-              ok: true,
-              shareCode,
-              shareId,
-              fileId: rootFileId,
-              vod_play_url: id ? `${name}$${id}` : '',
-            };
-          }
-
-          let listOut;
-          try {
-            listOut = await tianyiListShareDir({
-              shareId,
-              fileId: rootFileId,
-              shareMode: body.shareMode || info.shareMode,
-              pageNum: 1,
-              pageSize,
-              orderBy: body.orderBy || 'lastOpTime',
-              descending: body.descending != null ? body.descending : true,
-              accessCode,
-              cookie,
-            });
-            assertTianyiOk(listOut.data, 'tianyi share list');
-          } catch (e) {
-            if (isTianyiSessionExpiredError(e)) {
-              ensured = await ensure189Cookie({ forceRefresh: true });
-              cookie = toStr(ensured.cookie).trim();
-              listOut = await tianyiListShareDir({
-                shareId,
-                fileId: rootFileId,
-                shareMode: body.shareMode || info.shareMode,
-                pageNum: 1,
-                pageSize,
-                orderBy: body.orderBy || 'lastOpTime',
-                descending: body.descending != null ? body.descending : true,
-                accessCode,
-                cookie,
-              });
-              assertTianyiOk(listOut.data, 'tianyi share list');
-            } else {
-              throw e;
-            }
-          }
-
-          const files = normalize189FileListFromShareListResp(listOut.data);
-          const vod_play_url = files
-            .filter((f) => f && !f.isFolder && f.fileId && f.name)
-            .map((f) => `${f.name}$${f.fileId}*${shareId}*${f.name}`)
-            .join('#');
-          return { ok: true, shareCode, shareId, fileId: rootFileId, vod_play_url };
-        } catch (e) {
-          try {
-            if (!isNeedAccessCodeError(e)) {
-              const { code, msg } = pickTianyiErrorCodeFromError(e);
-              upsertErrorLogByShareCode({
-                provider: '189',
-                api: '/api/189/list',
-                shareCode,
+                shareCode: shareCodeFinal,
                 shareId: shareIdForLog,
                 code,
                 message: msg || toStr(e && e.message).trim(),
               });
             }
           } catch (_) {}
-          return reply.code(502).send({ ok: false, message: (e && e.message) || String(e) });
-        }
-      });
+	          return reply.code(502).send({ ok: false, message: (e && e.message) || String(e) });
+	        }
+	      });
 
       instance.post('/share/info', async (req, reply) => {
         const body = normalizeBody(req && req.body);
-        const shareCode = toStr(body.shareCode || body.code || body.share_code).trim();
-        const accessCode = toStr(body.accessCode || body.passcode || body.pwd || body.password).trim();
+        const shareCode = toStr(body.shareCode).trim();
+        const accessCode = toStr(body.accessCode).trim();
         if (!shareCode) return reply.code(400).send({ ok: false, message: 'missing shareCode' });
 
         try {
@@ -884,9 +1268,10 @@ export const apiPlugins = [
 
       instance.post('/share/list', async (req, reply) => {
         const body = normalizeBody(req && req.body);
-        const shareId = toStr(body.shareId || body.share_id).trim();
-        const fileId = toStr(body.fileId || body.file_id || body.pdir_fid || '0').trim() || '0';
-        const accessCode = toStr(body.accessCode || body.passcode || body.pwd || body.password).trim();
+        const shareId = toStr(body.shareId).trim();
+        const fileId = toStr(body.fileId || '0').trim() || '0';
+        const shareDirFileId = toStr(body.shareDirFileId || '').trim();
+        const accessCode = toStr(body.accessCode).trim();
         if (!shareId) return reply.code(400).send({ ok: false, message: 'missing shareId' });
 
         try {
@@ -895,6 +1280,7 @@ export const apiPlugins = [
           const out = await tianyiListShareDir({
             shareId,
             fileId,
+            ...(shareDirFileId ? { shareDirFileId } : {}),
             shareMode: body.shareMode,
             pageNum: body.pageNum,
             pageSize: body.pageSize,
@@ -913,9 +1299,9 @@ export const apiPlugins = [
 
       instance.post('/file/download', async (req, reply) => {
         const body = normalizeBody(req && req.body);
-        const shareId = toStr(body.shareId || body.share_id).trim();
-        const fileId = toStr(body.fileId || body.file_id).trim();
-        const accessCode = toStr(body.accessCode || body.passcode || body.pwd || body.password).trim();
+        const shareId = toStr(body.shareId).trim();
+        const fileId = toStr(body.fileId).trim();
+        const accessCode = toStr(body.accessCode).trim();
         if (!shareId) return reply.code(400).send({ ok: false, message: 'missing shareId' });
         if (!fileId) return reply.code(400).send({ ok: false, message: 'missing fileId' });
 
@@ -949,15 +1335,16 @@ export const apiPlugins = [
         }
       });
 
-      instance.post('/play', async (req, reply) => {
-        const body = normalizeBody(req && req.body);
-        const id = toStr(body.id || '').trim();
-        const parsed = parsePlayId(id);
-        const shareId = toStr(body.shareId || body.share_id || parsed.shareId).trim();
-        const fileId = toStr(body.fileId || body.file_id || parsed.fileId).trim();
-        const accessCode = toStr(body.accessCode || body.passcode || body.pwd || body.password).trim();
+	      instance.post('/play', async (req, reply) => {
+	        const body = normalizeBody(req && req.body);
+	        const id = toStr(body.id).trim();
+	        const parsed = parsePlayId(id);
+	        const shareId = toStr(parsed.shareId).trim();
+	        const fileId = toStr(parsed.fileId).trim();
+	        const accessCode = toStr(body.accessCode).trim();
 
-        if (!shareId) return reply.code(400).send({ ok: false, message: 'missing shareId (from id/shareId)' });
+        if (!id) return reply.code(400).send({ ok: false, message: 'missing id' });
+        if (!shareId) return reply.code(400).send({ ok: false, message: 'missing shareId (from id)' });
         if (!fileId) return reply.code(400).send({ ok: false, message: 'missing fileId (from id/fileId)' });
 
         try {
@@ -966,35 +1353,43 @@ export const apiPlugins = [
           if (!cookie && ensured && ensured.missingCred) {
             return reply.code(400).send({ ok: false, message: 'missing 189 cookie; set account["189"].cookie or account["189"].username/password in config.json' });
           }
-          let out;
-          try {
-            out = await tianyiGetFileDownloadUrl({ shareId, fileId, dt: body.dt, accessCode, cookie });
-            assertTianyiOk(out.data, 'tianyi play');
-          } catch (e) {
-            if (isTianyiSessionExpiredError(e)) {
-              ensured = await ensure189Cookie({ forceRefresh: true });
-              cookie = toStr(ensured.cookie).trim();
-              out = await tianyiGetFileDownloadUrl({ shareId, fileId, dt: body.dt, accessCode, cookie });
-              assertTianyiOk(out.data, 'tianyi play');
-            } else {
-              throw e;
+
+          if (!shareId) return reply.code(400).send({ ok: false, message: 'missing shareId (from id/shareId)' });
+          // Prefer VLC portal API for play (requires cookie). Try dt=1, then dt=3.
+          let pickedUrl = '';
+          let lastRawText = '';
+          let lastErr = null;
+          for (const dt of ['1', '3']) {
+            let vlcOut;
+            try {
+              vlcOut = await tianyiGetNewVlcVideoPlayUrl({ shareId, fileId, dt, cookie });
+              assertTianyiOk(vlcOut.data, 'tianyi vlc play');
+            } catch (e) {
+              if (isTianyiSessionExpiredError(e)) {
+                ensured = await ensure189Cookie({ forceRefresh: true });
+                cookie = toStr(ensured.cookie).trim();
+                vlcOut = await tianyiGetNewVlcVideoPlayUrl({ shareId, fileId, dt, cookie });
+                assertTianyiOk(vlcOut.data, 'tianyi vlc play');
+              } else {
+                lastErr = e;
+                continue;
+              }
+            }
+            lastRawText = toStr(vlcOut && vlcOut.text).trim();
+            const u0 = extractFirstUrlFromTianyiVlcResp(vlcOut.data);
+            if (u0) {
+              pickedUrl = u0;
+              break;
             }
           }
-          let url = extractFirstUrlFromTianyiDownloadResp(out.data);
-          if (!url) return reply.code(502).send({ ok: false, message: 'empty download url', data: out.data, rawText: out.text });
-          url = await resolveFinalUrl(url);
-          return {
-            ok: true,
-            parse: 0,
-            url,
-            shareId,
-            fileId,
-            fileName: parsed.fileName,
-          };
-        } catch (e) {
-          if (isNeedAccessCodeError(e)) return reply.code(401).send({ ok: false, needAccessCode: true, message: 'tianyi share requires accessCode' });
-          return reply.code(502).send({ ok: false, message: (e && e.message) || String(e) });
-        }
+          if (!pickedUrl) return reply.code(502).send({ ok: false, message: lastRawText || (lastErr && lastErr.message) || 'empty vlc url' });
+          const url = await resolveFinalUrl(pickedUrl);
+          if (!url) return reply.code(502).send({ ok: false, message: 'empty play url' });
+          return { ok: true, url };
+	        } catch (e) {
+	          if (isNeedAccessCodeError(e)) return reply.code(401).send({ ok: false, needAccessCode: true, message: 'tianyi share requires accessCode' });
+	          return reply.code(502).send({ ok: false, message: (e && e.message) || String(e) });
+	        }
       });
     },
   },

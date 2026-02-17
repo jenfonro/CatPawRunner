@@ -1,8 +1,4 @@
 // 139Yun (移动云盘/和彩云) OutLink API.
-// Endpoints:
-// - POST /api/139/list (0119.js-style anonymous share listing)
-// - POST /api/139/play (direct link + optional transcode link)
-
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -12,19 +8,16 @@ import zlib from 'node:zlib';
 
 const OUTLINK_API_BASE = 'https://share-kd-njs.yun.139.com/yun-share/richlifeApp/devapp/IOutLink/';
 
-// AES-128-CBC key (16 bytes). IV is randomly generated per request and is prepended to ciphertext.
 const KEY_OUTLINK_STR = 'PVGDwmcvfs1uV3d1';
 const KEY_OUTLINK = Buffer.from(KEY_OUTLINK_STR, 'utf8');
 
 const DEFAULT_UA =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
-// X-Deviceinfo format matters; the version number does not. Keep a known-good value.
 const DEFAULT_X_DEVICEINFO =
     '||9|12.27.0|chrome|143.0.0.0|pda50460feabd10141fb59a3ba787afb||windows 10|1624X1305|zh-CN|||';
 
-// config/0119.js uses this value for anonymous OutLink list requests.
-const OUTLINK_0119_X_DEVICEINFO =
+const OUTLINK_X_DEVICEINFO_SHARE =
     '||3|12.27.0|chrome|131.0.0.0|5c7c68368f048245e1ce47f1c0f8f2d0||windows 10|1536X695|zh-CN|||';
 
 function toStr(v) {
@@ -64,7 +57,6 @@ function md5HexLower(input) {
 }
 
 function calMcloudSign(plainJsonBody, ts, randStr) {
-    // Compatible with OpenList-style sign behavior.
     const encoded = encodeURIComponent(toStr(plainJsonBody));
     const chars = encoded.split('');
     chars.sort();
@@ -114,14 +106,11 @@ function decodeAccountFromAuthorization(authorization) {
         return parts && parts.length >= 3 ? toStr(parts[1]).trim() : '';
     };
 
-    // base64("xxx:<account>:<token...>")
     try {
         const decoded = Buffer.from(token, 'base64').toString('utf8');
         const account = parseDecoded(decoded);
         if (account) return account;
     } catch (_) {}
-
-    // Some callers may persist decoded form directly.
     return parseDecoded(tokenRaw);
 }
 
@@ -147,8 +136,6 @@ function readConfigJsonSafe(configPath) {
 }
 
 async function get139Authorization(instance) {
-    // Persisted in config.json (main process runtime root) under:
-    // { account: { "139": { authorization: "..." } } }
     try {
         const runtimeRoot = resolveRuntimeRootDir();
         const cfgPath = path.resolve(runtimeRoot, 'config.json');
@@ -181,14 +168,14 @@ function buildMcloudHeaders({ authorization, bodyForSign }) {
     };
 }
 
-function buildOutlinkAnonHeaders() {
-    // Mirrors config/0119.js headers: no Authorization/Mcloud-Sign.
+function buildOutlinkAnonHeaders(linkID = '') {
     return {
         'User-Agent': DEFAULT_UA,
         Accept: 'application/json, text/plain, */*',
         'Content-Type': 'application/json',
         'hcy-cool-flag': '1',
-        'x-deviceinfo': OUTLINK_0119_X_DEVICEINFO,
+        'x-deviceinfo': OUTLINK_X_DEVICEINFO_SHARE,
+        ...(toStr(linkID).trim() ? { Referer: `https://caiyun.139.com/w/i/${toStr(linkID).trim()}` } : {}),
     };
 }
 
@@ -247,7 +234,6 @@ function fetchText(urlStr, options = {}) {
                         zlib.brotliDecompress(buf, (err, outBuf) => (err ? done(buf) : done(outBuf)));
                         return;
                     }
-                    // Unknown enc (e.g. zstd) -> best-effort as utf8.
                     done(buf);
                 });
             }
@@ -286,6 +272,39 @@ function decryptOutlinkResponse(rawText) {
     return { rawText: raw, decrypted, parsed };
 }
 
+function isOutlinkSuccessCode(code) {
+    const c = toStr(code).trim();
+    if (!c) return true;
+    return c === '0' || c.toLowerCase() === 'success' || c === '200';
+}
+
+function pickOutlinkError(parsed) {
+    const root = parsed && typeof parsed === 'object' ? parsed : null;
+    if (!root) return null;
+    const code = root.code ?? root.resultCode ?? root.result_code ?? root.errcode ?? root.errorCode;
+    const desc = root.desc ?? root.message ?? root.msg ?? root.errorMessage ?? root.errmsg;
+    if (isOutlinkSuccessCode(code)) return null;
+    const d = toStr(desc).trim();
+    return { code: toStr(code).trim() || 'error', desc: d || 'request failed', raw: root };
+}
+
+function toFriendlyOutlinkErrorMessage(err) {
+    const code = err && typeof err === 'object' ? toStr(err.code).trim() : 'error';
+    const desc = err && typeof err === 'object' ? toStr(err.desc).trim() : '';
+    if (/浏览次数.*上限|达到.*次数.*上限|次数.*上限/.test(desc)) return `${code}: 分享已达到浏览次数上限`;
+    if (/来晚了/.test(desc)) return `${code}: ${desc}`;
+    return desc ? `${code}: ${desc}` : toStr(code || 'failed');
+}
+
+function makeOutlinkError(err) {
+    const e = new Error(toFriendlyOutlinkErrorMessage(err));
+    e.name = 'OutlinkError';
+    e.code = err && typeof err === 'object' ? toStr(err.code).trim() : '';
+    e.desc = err && typeof err === 'object' ? toStr(err.desc).trim() : '';
+    e.raw = err && typeof err === 'object' ? err.raw : null;
+    return e;
+}
+
 function pickRedrUrl(parsed) {
     const data = parsed && typeof parsed === 'object' ? parsed.data : null;
     const b = data && typeof data === 'object' ? data : parsed;
@@ -312,24 +331,26 @@ function normalizeRequestBody(body) {
 }
 
 function parseLinkIDFromFlag(flag) {
-    // Examples: "逸动-xxxxx" / "逸动 xxxx"
     const s = toStr(flag).trim();
     if (!s) return '';
-    const m = s.match(/(?:逸动|yidong)[-_ ]*([a-zA-Z0-9]+)/i);
-    return m && m[1] ? m[1] : '';
+    const byPrefix = s.match(/(?:逸动|yidong)[-_ ]*([a-zA-Z0-9]+)/i);
+    if (byPrefix && byPrefix[1]) return byPrefix[1];
+    const byUrl =
+        /(?:\/w\/i\/|\?linkID=|\/m\/i\/?|\/shareweb\/#.*?\/w\/i\/)([\w]+)(?=[\/#?]|$)/.exec(s) ||
+        /https:\/\/caiyun\.139\.com\/m\/i\?([^&]+)/.exec(s);
+    if (byUrl) return toStr(byUrl[1]).trim();
+    return '';
 }
 
 function parsePlayId(idStr) {
     const raw = toStr(idStr).trim();
     if (!raw) return { linkID: '', contentId: '', coID: '' };
-    // 0119.js-style: "<contentId>*<linkID>"
     if (!raw.includes('|') && raw.includes('*')) {
         const parts = raw.split('*');
         const contentId = toStr(parts[0] || '').trim();
         const linkID = toStr(parts[1] || '').trim();
         return { linkID, contentId, coID: '' };
     }
-    // Format: linkID|contentId|coID|filename...
     const parts = raw.split('|');
     const linkID = parts[0] || '';
     const contentId = parts[1] || '';
@@ -379,15 +400,20 @@ async function outlinkDlFromOutLinkV3Signed({ linkID, contentId, coID, authoriza
     return first;
 }
 
-const OUTLINK_0119_CACHE = {
-    // key: `${linkID}-${pCaID}` -> data object (or null)
+const OUTLINK_CACHE = {
     infoByKey: new Map(),
 };
 
-async function getOutLinkInfoV6_0119({ linkID, pCaID }) {
+async function getOutLinkInfoV6({ linkID, pCaID, bNum = 1, eNum = 200 }) {
     const ca = toStr(pCaID ?? '').trim();
-    const key = `${toStr(linkID).trim()}-${ca}`;
-    if (OUTLINK_0119_CACHE.infoByKey.has(key)) return OUTLINK_0119_CACHE.infoByKey.get(key);
+    const bn = Number.isFinite(Number(bNum)) ? Math.max(1, Math.trunc(Number(bNum))) : 1;
+    const en = Number.isFinite(Number(eNum)) ? Math.max(1, Math.trunc(Number(eNum))) : 200;
+    const key = `${toStr(linkID).trim()}-${ca}-${bn}-${en}`;
+    if (OUTLINK_CACHE.infoByKey.has(key)) {
+        const cached = OUTLINK_CACHE.infoByKey.get(key);
+        if (cached && typeof cached === 'object' && cached.__error) throw makeOutlinkError(cached);
+        return cached;
+    }
 
     const payload = {
         getOutLinkInfoReq: {
@@ -397,89 +423,311 @@ async function getOutLinkInfoV6_0119({ linkID, pCaID }) {
             caSrt: 0,
             coSrt: 0,
             srtDr: 1,
-            bNum: 1,
+            bNum: bn,
             pCaID: ca,
-            eNum: 200,
+            eNum: en,
         },
         commonAccountInfo: { account: '', accountType: 1 },
     };
     const plain = JSON.stringify(payload);
     const enc = aesCbcEncryptBase64(KEY_OUTLINK, plain);
     const body = JSON.stringify(enc);
-    const headers = buildOutlinkAnonHeaders();
+    const headers = buildOutlinkAnonHeaders(linkID);
     const url = `${OUTLINK_API_BASE}getOutLinkInfoV6`;
 
     try {
         const resp = await fetchText(url, { method: 'POST', headers, body });
         if (!resp || !resp.ok) {
-            OUTLINK_0119_CACHE.infoByKey.set(key, null);
+            OUTLINK_CACHE.infoByKey.set(key, null);
             return null;
         }
         const decoded = decryptOutlinkResponse(resp.text);
         const root = decoded.parsed && typeof decoded.parsed === 'object' ? decoded.parsed : null;
+        const err = pickOutlinkError(root);
+        if (err) {
+            OUTLINK_CACHE.infoByKey.set(key, { __error: true, ...err });
+            throw makeOutlinkError(err);
+        }
         const data = root && typeof root.data === 'object' && root.data ? root.data : null;
-        OUTLINK_0119_CACHE.infoByKey.set(key, data);
+        OUTLINK_CACHE.infoByKey.set(key, data);
         return data;
-    } catch (_) {
-        OUTLINK_0119_CACHE.infoByKey.set(key, null);
+    } catch (e) {
+        if (e && typeof e === 'object' && e.name === 'OutlinkError') throw e;
+        OUTLINK_CACHE.infoByKey.set(key, null);
         return null;
     }
 }
 
-async function getShareFile_0119({ linkID, pCaID }) {
+function pickListArray(node, keys) {
+    const n = node && typeof node === 'object' ? node : null;
+    if (!n) return [];
+    for (const k of Array.isArray(keys) ? keys : []) {
+        const v = n[k];
+        if (Array.isArray(v)) return v;
+    }
+    return [];
+}
+
+function pickCoId(item) {
+    const it = item && typeof item === 'object' ? item : null;
+    if (!it) return '';
+    return toStr(it.coID || it.coId || it.contentId || it.contentID || it.id || it.ID).trim();
+}
+
+function pickCaPath(item) {
+    const it = item && typeof item === 'object' ? item : null;
+    if (!it) return '';
+    return toStr(it.path || it.caPath || it.caID || it.caId || it.pCaID || it.pCaId || it.id).trim();
+}
+
+function updatePagingCollectorForDir(pagingCollector, pCaID, pageResult) {
+    const pg = ensurePagingCollector(pagingCollector);
+    const dirId = toStr(pCaID).trim() || 'root';
+
+    if (pageResult && pageResult.truncated) {
+        pg.truncated = true;
+        if (!pg.truncatedDirs.some((x) => x && x.pCaID === dirId)) {
+            pg.truncatedDirs.push({ pCaID: dirId, pagesFetched: pageResult.pagesFetched, eNum: pageResult.eNum });
+        }
+    }
+
+    if (pageResult && pageResult.suspect) {
+        pg.suspect = true;
+        if (!pg.suspectDirs.some((x) => x && x.pCaID === dirId)) {
+            pg.suspectDirs.push({
+                pCaID: dirId,
+                pagesFetched: pageResult.pagesFetched,
+                eNum: pageResult.eNum,
+                reason: toStr(pageResult.suspectReason || 'pagination may not be effective'),
+            });
+        }
+    }
+}
+
+async function getOutLinkInfoV6AllPages({ linkID, pCaID, eNum = 200, maxPages = 50 }) {
+    const en = Number.isFinite(Number(eNum)) ? Math.max(1, Math.trunc(Number(eNum))) : 200;
+    const mp = Number.isFinite(Number(maxPages)) ? Math.max(1, Math.trunc(Number(maxPages))) : 50;
+    const caAll = [];
+    const coAll = [];
+
+    let pagesFetched = 0;
+    let truncated = false;
+    let suspect = false;
+    let suspectReason = '';
+
+    const seenCo = new Set();
+    const seenCa = new Set();
+    let lastSignature = '';
+
+    for (let bn = 1; bn <= mp; bn += 1) {
+        pagesFetched = bn;
+        const data = await getOutLinkInfoV6({ linkID, pCaID, bNum: bn, eNum: en });
+        if (!data || typeof data !== 'object') break;
+
+        const ca = pickListArray(data, ['caLst']);
+        const co = pickListArray(data, ['coLst']);
+
+        if (ca.length === 0 && co.length === 0) break;
+
+        let newItems = 0;
+        const sigParts = [];
+        for (const it of co) {
+            const id = pickCoId(it);
+            if (!id) continue;
+            if (!seenCo.has(id)) {
+                seenCo.add(id);
+                newItems += 1;
+            }
+            if (sigParts.length < 16) sigParts.push(`co:${id}`);
+        }
+        for (const it of ca) {
+            const id = pickCaPath(it);
+            if (!id) continue;
+            if (!seenCa.has(id)) {
+                seenCa.add(id);
+                newItems += 1;
+            }
+            if (sigParts.length < 16) sigParts.push(`ca:${id}`);
+        }
+        const signature = sigParts.join('|');
+        if (bn > 1) {
+            if (newItems === 0) {
+                suspect = true;
+                suspectReason = 'no new items across pages (pagination may be ignored or repeating)';
+                break;
+            }
+            if (signature && signature === lastSignature) {
+                suspect = true;
+                suspectReason = 'repeated page signature (pagination may be ignored or repeating)';
+                break;
+            }
+        }
+        lastSignature = signature;
+
+        caAll.push(...ca);
+        coAll.push(...co);
+
+        const maybeHasNext = ca.length >= en || co.length >= en;
+        if (!maybeHasNext) break;
+        if (bn === mp) truncated = true;
+    }
+
+    return { caLst: caAll, coLst: coAll, eNum: en, pagesFetched, truncated, suspect, suspectReason };
+}
+
+async function getShareFile({ linkID, pCaID }) {
     if (!pCaID) return null;
     const ca = toStr(pCaID).trim();
-    try {
-        const o = await getOutLinkInfoV6_0119({ linkID, pCaID: ca.startsWith('http') ? 'root' : ca });
-        if (!o || !o.caLst) return null;
-        const i = o.caLst;
-        const a = Array.isArray(i) ? i.map((x) => x && x.caName) : [];
-        const s = Array.isArray(i) ? i.map((x) => x && x.path) : [];
-        const c = /App|活动中心|免费|1T空间|免流/;
-        const u = [];
-        if (Array.isArray(i) && i.length > 0) {
-            a.forEach((d, l) => {
-                if (!d || c.test(toStr(d))) return;
-                const path = toStr(s[l] || '').trim();
-                if (!path) return;
-                u.push({ name: toStr(d), path });
-            });
-            let x = await Promise.all(s.map(async (d) => getShareFile_0119({ linkID, pCaID: d })));
-            x = x.filter((d) => d != null);
-            return [...u, ...x.flat()];
-        }
-    } catch (_) {}
+    const all = await getOutLinkInfoV6AllPages({ linkID, pCaID: ca.startsWith('http') ? 'root' : ca });
+    const i = Array.isArray(all && all.caLst) ? all.caLst : [];
+    if (i.length === 0) return null;
+    const a = Array.isArray(i) ? i.map((x) => x && x.caName) : [];
+    const s = Array.isArray(i) ? i.map((x) => x && x.path) : [];
+    const c = /App|活动中心|免费|1T空间|免流/;
+    const u = [];
+    if (Array.isArray(i) && i.length > 0) {
+        a.forEach((d, l) => {
+            if (!d || c.test(toStr(d))) return;
+            const path = toStr(s[l] || '').trim();
+            if (!path) return;
+            u.push({ name: toStr(d), path });
+        });
+        let x = await Promise.all(s.map(async (d) => getShareFile({ linkID, pCaID: d })));
+        x = x.filter((d) => d != null);
+        return [...u, ...x.flat()];
+    }
     return null;
 }
 
-async function getShareUrl_0119({ linkID, pCaID }) {
-    try {
-        const t = await getOutLinkInfoV6_0119({ linkID, pCaID });
-        if (!t || typeof t !== 'object' || !('coLst' in t)) return null;
-        const o = t.coLst;
-        if (o !== null) {
-            return Array.isArray(o)
-                ? o
-                      .filter((a) => a && a.coType === 3)
-                      .map((a) => ({
-                          name: toStr(a.coName),
-                          contentId: toStr(a.coID),
-                          linkID: toStr(linkID),
-                          size: a.coSize,
-                      }))
-                : [];
-        }
-        if (t.caLst !== null) {
-            const i = Array.isArray(t.caLst) ? t.caLst.map((s) => s && s.path) : [];
-            let a = await Promise.all(i.map((s) => getShareUrl_0119({ linkID, pCaID: s })));
-            a = a.filter((s) => s && s.length > 0);
-            return a.flat();
-        }
-    } catch (_) {}
-    return null;
+function ensurePagingCollector(input) {
+    const out =
+        input && typeof input === 'object' && !Array.isArray(input)
+            ? input
+            : { eNum: 200, maxPages: 50, truncated: false, suspect: false, scannedDirs: 0, truncatedDirs: [], suspectDirs: [] };
+    if (!Number.isFinite(Number(out.eNum))) out.eNum = 200;
+    if (!Number.isFinite(Number(out.maxPages))) out.maxPages = 50;
+    if (typeof out.truncated !== 'boolean') out.truncated = false;
+    if (typeof out.suspect !== 'boolean') out.suspect = false;
+    if (!Number.isFinite(Number(out.scannedDirs))) out.scannedDirs = 0;
+    if (!Array.isArray(out.truncatedDirs)) out.truncatedDirs = [];
+    if (!Array.isArray(out.suspectDirs)) out.suspectDirs = [];
+    return out;
 }
 
-async function outlinkGetContentInfoFromOutLink_0119({ linkID, contentId }) {
+function formatDirPath(dirParts) {
+    const parts = Array.isArray(dirParts) ? dirParts.map((x) => toStr(x).trim()).filter(Boolean) : [];
+    return parts.length === 0 ? '/' : parts.join('/');
+}
+
+async function resolveLogicalRootDir({ linkID, pCaID, paging }) {
+    const pg = ensurePagingCollector(paging);
+    const removed = [];
+    let current = toStr(pCaID).trim() || 'root';
+
+    if (current !== 'root') return { pCaID: current, removed };
+
+    for (let i = 0; i < 10; i += 1) {
+        const all = await getOutLinkInfoV6AllPages({ linkID, pCaID: current, eNum: pg.eNum, maxPages: pg.maxPages });
+        updatePagingCollectorForDir(pg, current, all);
+        pg.scannedDirs += 1;
+
+        const co = Array.isArray(all && all.coLst) ? all.coLst : [];
+        const ca = Array.isArray(all && all.caLst) ? all.caLst : [];
+
+        const files = co.filter((x) => x && x.coType === 3);
+        const dirs = ca.filter((x) => x && toStr(x.path).trim());
+
+        if (files.length === 0 && dirs.length === 1) {
+            removed.push(toStr(dirs[0].caName).trim() || '');
+            current = toStr(dirs[0].path).trim();
+            continue;
+        }
+        break;
+    }
+
+    return { pCaID: current, removed: removed.filter(Boolean) };
+}
+
+async function collectShareFilesRecursive({ linkID, pCaID, dirParts, paging }) {
+    const pg = ensurePagingCollector(paging);
+    const caId = toStr(pCaID).trim() || 'root';
+    const parts = Array.isArray(dirParts) ? dirParts : [];
+
+    const all = await getOutLinkInfoV6AllPages({ linkID, pCaID: caId, eNum: pg.eNum, maxPages: pg.maxPages });
+    updatePagingCollectorForDir(pg, caId, all);
+    pg.scannedDirs += 1;
+
+    const out = [];
+    const co = Array.isArray(all && all.coLst) ? all.coLst : [];
+    for (const it of co) {
+        if (!it || it.coType !== 3) continue;
+        out.push({
+            name: toStr(it.coName),
+            contentId: toStr(it.coID),
+            linkID: toStr(linkID),
+            size: it.coSize,
+            pCaID: caId,
+            dirPath: formatDirPath(parts),
+        });
+    }
+
+    const ca = Array.isArray(all && all.caLst) ? all.caLst : [];
+    const children = ca
+        .map((x) => ({
+            name: toStr(x && x.caName).trim(),
+            path: toStr(x && x.path).trim(),
+        }))
+        .filter((x) => x.path);
+
+    if (children.length > 0) {
+        const nested = await Promise.all(
+            children.map(async (c) =>
+                collectShareFilesRecursive({ linkID, pCaID: c.path, dirParts: [...parts, c.name || c.path], paging: pg })
+            )
+        );
+        for (const arr of nested) if (Array.isArray(arr) && arr.length > 0) out.push(...arr);
+    }
+
+    return out;
+}
+
+async function getShareUrl({ linkID, pCaID, paging }) {
+    const pagingCollector = ensurePagingCollector(paging);
+    const all = await getOutLinkInfoV6AllPages({
+        linkID,
+        pCaID,
+        eNum: pagingCollector.eNum,
+        maxPages: pagingCollector.maxPages,
+    });
+    const t = all && typeof all === 'object' ? all : null;
+    if (!t) return null;
+    pagingCollector.scannedDirs += 1;
+    updatePagingCollectorForDir(pagingCollector, pCaID, t);
+    const out = [];
+    const o = Array.isArray(t.coLst) ? t.coLst : [];
+    if (Array.isArray(o) && o.length > 0) {
+        out.push(
+            ...o
+                .filter((a) => a && a.coType === 3)
+                .map((a) => ({
+                    name: toStr(a.coName),
+                    contentId: toStr(a.coID),
+                    linkID: toStr(linkID),
+                    size: a.coSize,
+                    pCaID: toStr(pCaID),
+                }))
+        );
+    }
+    if (Array.isArray(t.caLst) && t.caLst.length > 0) {
+        const i = t.caLst.map((s) => (s && s.path ? toStr(s.path).trim() : '')).filter(Boolean);
+        let a = await Promise.all(i.map((s) => getShareUrl({ linkID, pCaID: s, paging: pagingCollector })));
+        a = a.filter((s) => Array.isArray(s) && s.length > 0);
+        out.push(...a.flat());
+    }
+    return out;
+}
+
+async function outlinkGetContentInfoFromOutLink({ linkID, contentId }) {
     const payload = {
         getContentInfoFromOutLinkReq: { contentId: toStr(contentId), linkID: toStr(linkID), account: '' },
         commonAccountInfo: { account: '', accountType: 1 },
@@ -488,7 +736,6 @@ async function outlinkGetContentInfoFromOutLink_0119({ linkID, contentId }) {
     const headers = {
         'User-Agent': DEFAULT_UA,
         Accept: 'application/json, text/plain, */*',
-        // 0119.js sets this; we can handle gzip/deflate/br, unknown (zstd) falls back to raw.
         'Accept-Encoding': 'gzip, deflate, br, zstd',
         'Content-Type': 'application/json',
     };
@@ -505,7 +752,6 @@ async function outlinkGetContentInfoFromOutLink_0119({ linkID, contentId }) {
     if (!resp || !resp.ok) return { ok: false, url: '', rawText: resp ? resp.text : '' };
     let parsed = parseResp(resp.text);
     if (!parsed) {
-        // If server picked zstd (or other unsupported encoding), retry with identity encoding.
         const enc = toStr(resp.headers && (resp.headers['content-encoding'] || resp.headers['Content-Encoding'])).trim().toLowerCase();
         if (enc === 'zstd') {
             const headers2 = { ...headers, 'Accept-Encoding': 'identity' };
@@ -524,8 +770,6 @@ export const apiPlugins = [
     {
         prefix: '/api/139',
         plugin: async function pan139Api(instance) {
-            // List OutLink root files and return 0119-style `vod_play_url`.
-            // Input: { flag: "逸动-<linkID>" }  Output: { ok, vod_play_url }
             instance.post('/list', async (req, reply) => {
                 const body = normalizeRequestBody(req && req.body);
                 const flag = toStr(body.flag || '').trim();
@@ -537,52 +781,39 @@ export const apiPlugins = [
                 try {
                     const pCaID0 = toStr(body.pCaID || body.pcaid || body.caID || body.caId || '').trim() || 'root';
 
-                    const data = {};
-                    const folders = await getShareFile_0119({ linkID, pCaID: pCaID0 });
-                    if (folders && Array.isArray(folders)) {
-                        await Promise.all(
-                            folders.map(async (s) => {
-                                if (!s || typeof s !== 'object') return;
-                                const name = toStr(s.name).trim();
-                                const path = toStr(s.path).trim();
-                                if (!name || !path) return;
-                                if (!(name in data)) data[name] = [];
-                                const c = await getShareUrl_0119({ linkID, pCaID: path });
-                                if (c && c.length > 0) data[name].push(...c);
-                            })
-                        );
-                    }
+                    const paging = ensurePagingCollector({
+                        eNum: 200,
+                        maxPages: 50,
+                        truncated: false,
+                        suspect: false,
+                        scannedDirs: 0,
+                        truncatedDirs: [],
+                        suspectDirs: [],
+                    });
 
-                    for (const k of Object.keys(data)) if (!Array.isArray(data[k]) || data[k].length === 0) delete data[k];
+                    const logical = await resolveLogicalRootDir({ linkID, pCaID: pCaID0, paging });
+                    const startCaID = toStr((logical && logical.pCaID) || pCaID0).trim() || 'root';
+                    const removedWrappers = Array.isArray(logical && logical.removed) ? logical.removed : [];
 
-                    if (Object.keys(data).length === 0) {
-                        // Keep 0119.js behavior (even though it may return empty for shares without caLst).
-                        data.root = (await getShareFile_0119({ linkID, pCaID: pCaID0 })) || [];
-                        if (Array.isArray(data.root)) data.root = data.root.filter((s) => s && Object.keys(s).length > 0);
-                    }
-
-                    // 0119.js-style vod_id: "<contentId>*<linkID>"
-                    for (const k of Object.keys(data)) {
-                        if (!Array.isArray(data[k])) continue;
-                        data[k] = data[k].map((c) => ({
-                            vod_name: toStr(c && c.name),
-                            vod_id: `${toStr(c && c.contentId)}*${toStr(c && c.linkID)}`,
-                            vod_size: c && c.size,
-                        }));
-                    }
-
+                    const files = await collectShareFilesRecursive({ linkID, pCaID: startCaID, dirParts: [], paging });
+                    const list = Array.isArray(files)
+                        ? files.map((c) => ({
+                              vod_name: toStr(c && c.dirPath) || '/',
+                              vod_id: `${toStr(c && c.contentId)}*${toStr(c && c.linkID)}***${toStr(c && c.name)}`,
+                              vod_size: c && c.size,
+                              pCaID: toStr(c && c.pCaID),
+                              dirPath: toStr(c && c.dirPath),
+                              fileName: toStr(c && c.name),
+                          }))
+                        : [];
                     const parts = [];
-                    for (const k of Object.keys(data)) {
-                        const arr = Array.isArray(data[k]) ? data[k] : [];
-                        for (const it of arr) {
-                            const n = toStr(it && it.vod_name).trim();
-                            const id = toStr(it && it.vod_id).trim();
-                            if (!n || !id) continue;
-                            parts.push(`${n}$${id}`);
-                        }
+                    for (const it of list) {
+                        const n = toStr(it && it.vod_name).trim();
+                        const vid = toStr(it && it.vod_id).trim();
+                        if (!n || !vid) continue;
+                        parts.push(`${n}$${vid}`);
                     }
-
-                    return { ok: true, vod_play_url: parts.join('#'), data };
+                    return { ok: true, vod_play_url: parts.join('#') };
                 } catch (e) {
                     reply.code(502);
                     return { ok: false, message: (e && e.message) || String(e) };
@@ -593,9 +824,15 @@ export const apiPlugins = [
                 const body = normalizeRequestBody(req && req.body);
                 const flag = toStr(body.flag || '').trim();
                 const id = toStr(body.id || '').trim();
+                const wantRaw = toStr(body.want || body.type || '').trim().toLowerCase();
+                const want = wantRaw || 'download_url'; // default: prefer direct download url
                 if (!id) {
                     reply.code(400);
                     return { ok: false, message: 'missing id' };
+                }
+                if (want !== 'download_url' && want !== 'play_url') {
+                    reply.code(400);
+                    return { ok: false, message: 'invalid want (expected: download_url|play_url)' };
                 }
 
                 const parsed = parsePlayId(id);
@@ -614,51 +851,37 @@ export const apiPlugins = [
                 }
 
                 try {
-                    // For 0119.js-style id ("contentId*linkID"):
-                    // - `url` is the direct download link (signed dlFromOutLinkV3)
-                    if (contentId && !coID && isStarId) {
-                        const trans = await outlinkGetContentInfoFromOutLink_0119({ linkID, contentId });
-                        const play_url = toStr(trans && trans.url).trim();
-
-                        const authorization = await get139Authorization(instance);
-                        // In 0119.js list, "contentId" is actually `coID` from `coLst`.
-                        const dl = await outlinkDlFromOutLinkV3Signed({ linkID, contentId: '', coID: contentId, authorization });
-                        if (!dl.url) {
-                            const code = dl.parsed && (dl.parsed.code || dl.parsed.resultCode);
-                            const desc = dl.parsed && (dl.parsed.desc || dl.parsed.message);
-                            reply.code(502);
-                            return {
-                                ok: false,
-                                message: desc ? `${toStr(code || 'error')}: ${toStr(desc)}` : toStr(code || 'failed'),
-                                raw: dl.rawText || '',
-                                play_url,
-                            };
+                    if (want === 'play_url') {
+                        if (!contentId) {
+                            reply.code(400);
+                            return { ok: false, message: 'want=play_url requires contentId (expected id: <coID>*<linkID>)' };
                         }
-
-                        return {
-                            ok: true,
-                            parse: 0,
-                            url: dl.url,
-                            downloadUrl: dl.url,
-                            play_url,
-                            playUrl: play_url || dl.url,
-                        };
+                        const trans = await outlinkGetContentInfoFromOutLink({ linkID, contentId });
+                        const url = toStr(trans && trans.url).trim();
+                        if (!url) {
+                            reply.code(502);
+                            return { ok: false, message: 'play url unavailable' };
+                        }
+                        return { ok: true, url };
                     }
 
-                    // Legacy id formats (with coID etc): keep signed dlFromOutLinkV3 behavior.
                     const authorization = await get139Authorization(instance);
-                    const out = await outlinkDlFromOutLinkV3Signed({ linkID, contentId, coID, authorization });
-                    if (!out.url) {
-                        const code = out.parsed && (out.parsed.code || out.parsed.resultCode);
-                        const desc = out.parsed && (out.parsed.desc || out.parsed.message);
-                        reply.code(502);
-                        return {
-                            ok: false,
-                            message: desc ? `${toStr(code || 'error')}: ${toStr(desc)}` : toStr(code || 'failed'),
-                            raw: out.rawText || '',
-                        };
+                    const auth = stripBasicPrefix(authorization);
+                    const canSigned = Boolean(decodeAccountFromAuthorization(auth));
+                    if (!canSigned) {
+                        reply.code(400);
+                        return { ok: false, message: 'missing authorization' };
                     }
-                    return { ok: true, parse: 0, url: out.url, playUrl: out.url, downloadUrl: out.url };
+                    const dl =
+                        isStarId && contentId && !coID
+                            ? await outlinkDlFromOutLinkV3Signed({ linkID, contentId: '', coID: contentId, authorization })
+                            : await outlinkDlFromOutLinkV3Signed({ linkID, contentId, coID, authorization });
+                    const url = toStr(dl && dl.url).trim();
+                    if (!url) {
+                        reply.code(502);
+                        return { ok: false, message: 'download url unavailable' };
+                    }
+                    return { ok: true, url };
                 } catch (e) {
                     reply.code(502);
                     return { ok: false, message: (e && e.message) || String(e) };

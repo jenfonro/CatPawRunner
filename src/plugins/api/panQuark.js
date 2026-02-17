@@ -10,7 +10,6 @@ const QUARK_UA =
 const QUARK_REFERER = 'https://pan.quark.cn';
 const PAN_DEBUG = process.env.PAN_DEBUG === '1';
 
-// QuarkTV (open-api-drive) config: ported from OpenList `drivers/quark_uc_tv`.
 const QUARK_TV_API = 'https://open-api-drive.quark.cn';
 const QUARK_TV_CODE_API = 'http://api.extscreen.com/quarkdrive';
 const QUARK_TV_CLIENT_ID = 'd3194e61504e493eb6222857bccfed94';
@@ -44,9 +43,6 @@ function maskForLog(value, head = 6, tail = 4) {
   return `${s.slice(0, head)}...${s.slice(-tail)}`;
 }
 
-// 1-minute in-memory cache for `/api/quark/play` resolved URLs.
-// Rationale: Quark clear/save/list is async/eventually-consistent; recently resolved direct URLs can remain valid
-// even if the transferred file is deleted shortly after.
 const QUARK_PLAY_URL_CACHE_TTL_MS = 60_000;
 const quarkPlayUrlCache = new Map(); // key -> { exp, value }
 
@@ -701,6 +697,35 @@ function tryGetStringArrayByPath(root, pathParts) {
   return [];
 }
 
+function tryGetNumberByPath(root, pathParts) {
+  try {
+    let cur = root;
+    for (const p of pathParts) {
+      if (!cur || typeof cur !== 'object') return NaN;
+      cur = cur[p];
+    }
+    const n = Number(cur);
+    return Number.isFinite(n) ? n : NaN;
+  } catch {}
+  return NaN;
+}
+
+function tryGetBoolByPath(root, pathParts) {
+  try {
+    let cur = root;
+    for (const p of pathParts) {
+      if (!cur || typeof cur !== 'object') return false;
+      cur = cur[p];
+    }
+    if (typeof cur === 'boolean') return cur;
+    if (typeof cur === 'number') return cur !== 0;
+    const s = String(cur || '').trim().toLowerCase();
+    if (!s) return false;
+    return s === 'true' || s === '1' || s === 'yes' || s === 'y';
+  } catch {}
+  return false;
+}
+
 async function fetchJsonDetailed(url, init) {
   const res = await fetch(url, { redirect: 'manual', ...init });
   const text = await res.text();
@@ -777,6 +802,33 @@ function sanitizeQuarkFolderName(value) {
   const cleaned = raw.replace(/[\\/]+/g, '_').replace(/\0/g, '').trim();
   if (!cleaned || cleaned === '.' || cleaned === '..') return '';
   return cleaned.length > 120 ? cleaned.slice(0, 120) : cleaned;
+}
+
+function sanitizeVodPlayName(value) {
+  return String(value || '')
+    .replace(/\r?\n|\r/g, ' ')
+    .replace(/[<>《》]/g, '')
+    .replace(/[$#]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function encodeVodIdNameSuffix(value) {
+  const s = String(value || '').trim();
+  if (!s) return '';
+  // Keep `vod_play_url` parseable:
+  // - '#' splits episodes
+  // - '$' splits name/id
+  // - some clients split id by '*'
+  return encodeURIComponent(s).replace(/\*/g, '%2A');
+}
+
+function sanitizePathSegmentForDisplay(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  // Keep display path stable even when folder names contain slashes/backslashes.
+  const seg = raw.replace(/[\\/]+/g, '_');
+  return sanitizeVodPlayName(seg);
 }
 
 function getTvUserFromReq(req) {
@@ -974,7 +1026,7 @@ async function quarkShareSave({ shareId, stoken, fid, fidToken, toPdirFid, cooki
   return { ok: true, task: lastTask, toPdirFid: toPdir, savedFids };
 }
 
-async function getShareDetail({ shareId, stoken, passcode, cookie, pdirFid }) {
+async function getShareDetail({ shareId, stoken, passcode, cookie, pdirFid, page, size }) {
   const pwdId = String(shareId || '').trim();
   if (!pwdId) throw new Error('missing shareId');
   let sToken = String(stoken || '').trim();
@@ -986,8 +1038,18 @@ async function getShareDetail({ shareId, stoken, passcode, cookie, pdirFid }) {
   }
   const headers = buildQuarkHeaders(cookie);
   const dir = String(pdirFid || '0').trim() || '0';
+  const pg = Number.isFinite(Number(page)) ? Math.max(1, Math.trunc(Number(page))) : 1;
+  const sz = Number.isFinite(Number(size)) ? Math.max(1, Math.min(500, Math.trunc(Number(size)))) : 200;
   const url = 'https://drive.quark.cn/1/clouddrive/share/sharepage/detail?pr=ucpro&fr=pc';
-  const body = { pwd_id: pwdId, stoken: sToken, pdir_fid: dir, _fetch_total: 1, _size: 200 };
+  const body = {
+    pwd_id: pwdId,
+    stoken: sToken,
+    pdir_fid: dir,
+    _fetch_total: 1,
+    _page: pg,
+    _size: sz,
+    _sort: 'file_type:asc,file_name:asc',
+  };
 
   // Quark deployments differ:
   // - some accept POST JSON body
@@ -1001,8 +1063,8 @@ async function getShareDetail({ shareId, stoken, passcode, cookie, pdirFid }) {
       u.searchParams.set('pdir_fid', dir);
       // best-effort pagination knobs (some clients include these)
       u.searchParams.set('force', '0');
-      u.searchParams.set('_page', '1');
-      u.searchParams.set('_size', '200');
+      u.searchParams.set('_page', String(pg));
+      u.searchParams.set('_size', String(sz));
       u.searchParams.set('_sort', 'file_type:asc,file_name:asc');
       return await fetchJson(u.toString(), { method: 'GET', headers });
     },
@@ -1018,6 +1080,85 @@ async function getShareDetail({ shareId, stoken, passcode, cookie, pdirFid }) {
     }
   }
   throw lastErr || new Error('share detail failed');
+}
+
+async function listShareDirAllPages({ shareId, stoken, passcode, cookie, pdirFid, size, maxPages }) {
+  const pwdId = String(shareId || '').trim();
+  const dir = String(pdirFid || '0').trim() || '0';
+  const sz = Number.isFinite(Number(size)) ? Math.max(1, Math.min(500, Math.trunc(Number(size)))) : 200;
+  const limitPages = Number.isFinite(Number(maxPages)) ? Math.max(1, Math.min(500, Math.trunc(Number(maxPages)))) : 200;
+
+  let page = 1;
+  let token = String(stoken || '').trim();
+  const items = [];
+  const seenFids = new Set();
+  let total = NaN;
+
+  while (page <= limitPages) {
+    const out = await getShareDetail({
+      shareId: pwdId,
+      stoken: token,
+      passcode,
+      cookie,
+      pdirFid: dir,
+      page,
+      size: sz,
+    });
+    token = String(out && out.stoken ? out.stoken : token).trim();
+    const detail = out && out.detail ? out.detail : null;
+    const list = pickQuarkShareFileList(detail);
+
+    const pageItems = Array.isArray(list) ? list : [];
+    if (!pageItems.length) break;
+
+    for (const it of pageItems) {
+      const fid = getQuarkItemFid(it);
+      if (!fid) continue;
+      if (seenFids.has(fid)) continue;
+      seenFids.add(fid);
+      items.push(it);
+    }
+
+    if (!Number.isFinite(total)) {
+      const t =
+        tryGetNumberByPath(detail, ['data', 'total']) ||
+        tryGetNumberByPath(detail, ['data', '_total']) ||
+        tryGetNumberByPath(detail, ['data', 'total_count']) ||
+        tryGetNumberByPath(detail, ['data', 'totalCount']);
+      if (Number.isFinite(t) && t > 0) total = t;
+    }
+
+    if (Number.isFinite(total) && items.length >= total) break;
+
+    const hasMore =
+      tryGetBoolByPath(detail, ['data', 'has_more']) ||
+      tryGetBoolByPath(detail, ['data', 'hasMore']) ||
+      tryGetBoolByPath(detail, ['data', 'more']);
+    const nextPage =
+      tryGetNumberByPath(detail, ['data', 'next_page']) ||
+      tryGetNumberByPath(detail, ['data', 'nextPage']) ||
+      tryGetNumberByPath(detail, ['data', 'next_page_num']) ||
+      tryGetNumberByPath(detail, ['data', 'nextPageNum']);
+
+    if (Number.isFinite(nextPage) && nextPage > page) {
+      page = Math.trunc(nextPage);
+      continue;
+    }
+
+    if (hasMore) {
+      page += 1;
+      continue;
+    }
+
+    // Fallback: if we got a full page, assume there might be more.
+    if (pageItems.length >= sz) {
+      page += 1;
+      continue;
+    }
+    break;
+  }
+
+  return { stoken: token, items, total };
 }
 
 async function quarkFileInfo({ fid, cookie }) {
@@ -1266,11 +1407,9 @@ const apiPlugins = [
         }
       });
 
-      // List share root files and return 0119-style `vod_play_url`.
-      // Input: { flag: "夸父-<shareId>" | "quark-<shareId>", passcode? }  Output: { ok, vod_play_url }
       instance.post('/list', async (req, reply) => {
         const body = req && typeof req.body === 'object' ? req.body : {};
-        const flag = String(body.flag || body.shareCode || body.shareId || body.share_id || '').trim();
+        const flag = String(body.flag || '').trim();
         const shareId = parseQuarkShareIdFromFlag(flag);
         if (!shareId) {
           reply.code(400);
@@ -1284,27 +1423,111 @@ const apiPlugins = [
         }
         const passcodeIn = String(body.passcode || body.pwd || '').trim();
         try {
-          const out = await getShareDetail({
-            shareId,
-            stoken: '',
-            passcode: passcodeIn,
-            pdirFid: '0',
-            cookie,
-          });
-          const stoken = String(out && out.stoken ? out.stoken : '').trim();
-          const detail = out && out.detail ? out.detail : null;
-          const list = pickQuarkShareFileList(detail);
+          // Intentionally keep the input surface minimal: caller provides `flag` (and optional passcode).
+          // Everything else is fixed defaults to avoid clients depending on extra params.
+          const maxDepth = 20;
+          const maxItems = 20000;
+          const pageSize = 200;
+          const maxPagesPerDir = 200;
+          const includePath = true;
 
+          let stoken = '';
+          let truncated = false;
           const parts = [];
-          for (const it of list) {
-            if (isQuarkDirItem(it)) continue;
-            const fid = getQuarkItemFid(it);
-            const fidToken = getQuarkItemFidToken(it);
-            const name = getQuarkItemName(it);
-            if (!fid || !fidToken || !name) continue;
-            const id = `${shareId}*${stoken}*${fid}*${fidToken}***${name}`;
-            parts.push(`${name}$${id}`);
+          const visitedDirs = new Set();
+
+          const formatDisplayName = (pathSegs) => {
+            // Display name shows directory path only:
+            // - root files => "/"
+            // - nested files => "/dir/subdir"
+            if (!includePath) return '/';
+            const segs = Array.isArray(pathSegs) ? pathSegs.filter(Boolean) : [];
+            return segs.length ? `/${segs.join('/')}` : '/';
+          };
+
+          const walk = async (pdirFid, depth, pathSegs) => {
+            if (truncated) return;
+            if (depth > maxDepth) return;
+            const key = String(pdirFid == null ? '0' : pdirFid).trim() || '0';
+            if (visitedDirs.has(key)) return;
+            visitedDirs.add(key);
+
+            const out = await listShareDirAllPages({
+              shareId,
+              stoken,
+              passcode: passcodeIn,
+              cookie,
+              pdirFid: key,
+              size: pageSize,
+              maxPages: maxPagesPerDir,
+            });
+            stoken = String(out && out.stoken ? out.stoken : stoken).trim();
+            const items = Array.isArray(out && out.items) ? out.items : [];
+
+            for (const it of items) {
+              if (!it || typeof it !== 'object') continue;
+              if (isQuarkDirItem(it)) {
+                const fid = getQuarkItemFid(it);
+                if (!fid) continue;
+                const dirName = getQuarkItemName(it);
+                const seg = sanitizePathSegmentForDisplay(dirName) || String(dirName || '').trim() || fid;
+                await walk(fid, depth + 1, [...pathSegs, seg]);
+                continue;
+              }
+
+              const fid = getQuarkItemFid(it);
+              const fidToken = getQuarkItemFidToken(it);
+              const name = getQuarkItemName(it);
+              if (!fid || !fidToken || !name) continue;
+
+              const displayName = formatDisplayName(pathSegs);
+              const rawName = String(name || '').trim();
+              const id = `${shareId}*${stoken}*${fid}*${fidToken}${rawName ? `***${rawName}` : ''}`;
+              parts.push(`${displayName}$${id}`);
+
+              if (parts.length >= maxItems) {
+                truncated = true;
+                return;
+              }
+            }
+          };
+
+          // If share root contains exactly one folder and no files, treat that folder as the logical root.
+          // This avoids an extra wrapper directory in display paths.
+          let startFid = '0';
+          try {
+            const rootOut = await listShareDirAllPages({
+              shareId,
+              stoken,
+              passcode: passcodeIn,
+              cookie,
+              pdirFid: '0',
+              size: pageSize,
+              maxPages: 2,
+            });
+            stoken = String(rootOut && rootOut.stoken ? rootOut.stoken : stoken).trim();
+            const rootItems = Array.isArray(rootOut && rootOut.items) ? rootOut.items : [];
+            const rootDirs = [];
+            let rootFileCount = 0;
+            for (const it of rootItems) {
+              if (!it || typeof it !== 'object') continue;
+              if (isQuarkDirItem(it)) {
+                const fid = getQuarkItemFid(it);
+                if (fid) rootDirs.push(it);
+                continue;
+              }
+              const fid = getQuarkItemFid(it);
+              const fidToken = getQuarkItemFidToken(it);
+              if (fid && fidToken) rootFileCount += 1;
+            }
+            if (rootFileCount === 0 && rootDirs.length === 1) {
+              startFid = getQuarkItemFid(rootDirs[0]) || '0';
+            }
+          } catch {
+            startFid = '0';
           }
+
+          await walk(startFid, 0, []);
           return { ok: true, vod_play_url: parts.join('#') };
         } catch (e) {
           const msg = (e && e.message) || String(e);
@@ -1578,8 +1801,11 @@ const apiPlugins = [
         }
 
         const query = (req && req.query) || {};
-        const want = String(body.want || query.want || 'download_url').trim() || 'download_url';
         const tvUserForCache = getTvUserFromReq(req) || '';
+        const tvAcc = getQuarkTvAccountFromDbRoot(root);
+        const hasTvCred = !!(tvAcc && tvAcc.refreshToken && tvAcc.deviceId);
+        const wantIn = Object.prototype.hasOwnProperty.call(body, 'want') ? body.want : query.want;
+        const want = String(wantIn || (hasTvCred ? 'play_url' : 'download_url')).trim() || (hasTvCred ? 'play_url' : 'download_url');
         panLog(`quark play recv id=${reqId}`, {
           idLen: rawId.length,
           shareId: maskForLog(parsed.shareId, 4, 4),
@@ -1587,20 +1813,18 @@ const apiPlugins = [
           tvUser: tvUserForCache,
         });
 
-        // Cache only resolved URLs (play_url + download_url).
+        // Cache resolved URL (plus optional required headers).
         if (tvUserForCache) {
-          const cacheKey = `v2|${tvUserForCache}|${rawId}`;
+          const cacheKey = `v3|${tvUserForCache}|${want.toLowerCase()}|${rawId}`;
           const cached = getQuarkPlayUrlCache(cacheKey);
-          if (cached && (cached.playUrl || cached.downloadUrl || cached.url)) {
+          if (cached && cached.url) {
             panLog(`quark play cache hit id=${reqId}`, { ms: Date.now() - tStart });
+            const chosen = String(cached.url || '').trim();
             return {
               ok: true,
-              url: cached.playUrl || cached.url || cached.downloadUrl || '',
-              playUrl: cached.playUrl || '',
-              downloadUrl: cached.downloadUrl || '',
+              url: chosen,
               parse: 0,
-              ...(cached.header ? { header: cached.header } : {}),
-              ...(cached.downloadHeader ? { downloadHeader: cached.downloadHeader } : {}),
+              ...(cached.header ? { header: cached.header, headers: cached.header } : {}),
             };
           }
         }
@@ -1695,13 +1919,9 @@ const apiPlugins = [
         }
 
         try {
-          const tvAcc = getQuarkTvAccountFromDbRoot(root);
-          const hasTvCred = !!(tvAcc && tvAcc.refreshToken && tvAcc.deviceId);
-
           let playUrl = '';
           let downloadUrl = '';
           let headerOut = null;
-          let downloadHeaderOut = null;
 
           if (hasTvCred) {
             // Prefer QuarkTV urls (no cookie headers required).
@@ -1737,15 +1957,13 @@ const apiPlugins = [
 
           if (!playUrl || !downloadUrl) {
             // Fallback to cookie-based resolver. Some environments require headers.
-            headerOut = playHeader;
-            downloadHeaderOut = playHeader;
             if (!playUrl) {
               stage = 'cookie_play_url';
               const outPlay = await quarkDirectDownload({ fid: pickedFid, fidToken: pickedToken, cookie, want: 'play_url' });
               playCookie = outPlay.cookie || playCookie;
               playHeader.Cookie = playCookie;
               playUrl = outPlay.url;
-              headerOut = { ...playHeader };
+              headerOut = playHeader;
             }
             if (!downloadUrl) {
               stage = 'cookie_download_url';
@@ -1753,12 +1971,13 @@ const apiPlugins = [
               playCookie = outDl.cookie || playCookie;
               playHeader.Cookie = playCookie;
               downloadUrl = outDl.url;
-              downloadHeaderOut = { ...playHeader };
+              headerOut = playHeader;
             }
           }
 
-          // Legacy field: keep `url` as the primary play url when available.
-          const url = playUrl || downloadUrl || '';
+          const w = String(want || '').trim().toLowerCase();
+          const preferDownload = w === 'download_url' || w === 'download';
+          const url = preferDownload ? downloadUrl || playUrl || '' : playUrl || downloadUrl || '';
 
           panLog(`quark play done id=${reqId}`, {
             ms: Date.now() - tStart,
@@ -1776,17 +1995,14 @@ const apiPlugins = [
           });
 
           if (tvUserForCache && (playUrl || downloadUrl || url)) {
-            const cacheKey = `v2|${tvUserForCache}|${rawId}`;
-            setQuarkPlayUrlCache(cacheKey, { url, playUrl, downloadUrl, header: headerOut, downloadHeader: downloadHeaderOut });
+            const cacheKey = `v3|${tvUserForCache}|${want.toLowerCase()}|${rawId}`;
+            setQuarkPlayUrlCache(cacheKey, { url, header: headerOut || null });
           }
           return {
             ok: true,
             url,
-            playUrl,
-            downloadUrl,
             parse: 0,
-            ...(headerOut ? { header: headerOut } : {}),
-            ...(downloadHeaderOut ? { downloadHeader: downloadHeaderOut } : {}),
+            ...(headerOut ? { header: headerOut, headers: headerOut } : {}),
           };
         } catch (e) {
           const msg = ((e && e.message) || String(e)).slice(0, 400);

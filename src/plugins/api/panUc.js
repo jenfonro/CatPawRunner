@@ -399,6 +399,32 @@ function collectFirstStringByKey(root, keyLower) {
   return '';
 }
 
+function collectFirstNumberByKey(root, keyLower) {
+  const queue = [root];
+  const seen = new Set();
+  let steps = 0;
+  while (queue.length && steps < 5000) {
+    steps += 1;
+    const v = queue.shift();
+    if (!v) continue;
+    if (typeof v !== 'object') continue;
+    if (seen.has(v)) continue;
+    seen.add(v);
+    if (Array.isArray(v)) {
+      for (const it of v) queue.push(it);
+      continue;
+    }
+    for (const [k, val] of Object.entries(v)) {
+      if (String(k || '').toLowerCase() === keyLower) {
+        const n = Number(val);
+        if (Number.isFinite(n)) return n;
+      }
+      queue.push(val);
+    }
+  }
+  return NaN;
+}
+
 function resolveRuntimeRootDir() {
   try {
     if (process && process.pkg && typeof process.execPath === 'string' && process.execPath) {
@@ -696,6 +722,30 @@ function parseSubPathSegments(value) {
   return parts.slice(0, 20);
 }
 
+function sanitizeVodPlayName(value) {
+  return String(value || '')
+    .replace(/\r?\n|\r/g, ' ')
+    .replace(/[<>《》]/g, '')
+    .replace(/[$#]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function encodeVodIdNameSuffix(value) {
+  const s = String(value || '').trim();
+  if (!s) return '';
+  // Keep original file name (no URL encoding).
+  // NOTE: `vod_play_url` itself is delimiter-based ("#" and "$"), so names containing those
+  // characters can still break parsing. Caller requested no URL formatting here.
+  return s;
+}
+
+function decodeVodIdNameSuffix(value) {
+  const s = String(value || '').trim();
+  if (!s) return '';
+  return s;
+}
+
 async function ucListDir({ pdirFid, cookie, size, persist }) {
   const fid = String(pdirFid == null ? '0' : pdirFid).trim() || '0';
   const sz = Number.isFinite(Number(size)) ? Math.max(1, Math.min(500, Number(size))) : 200;
@@ -807,7 +857,8 @@ function parseUcPlayId(idStr) {
   const fid = String(parts[2] || '').trim();
   const fidToken = String(parts[3] || '').trim();
   if (!shareId || !stoken || !fid || !fidToken) return null;
-  return { shareId, stoken, fid, fidToken, name: String(name || '').trim() };
+  const decodedName = decodeVodIdNameSuffix(name);
+  return { shareId, stoken, fid, fidToken, name: String(decodedName || '').trim() };
 }
 
 async function ensureUcDestDirFid({ req, cookie, toPdirFid, toPdirPath, persist }) {
@@ -821,7 +872,6 @@ async function ensureUcDestDirFid({ req, cookie, toPdirFid, toPdirPath, persist 
     return { fid: out.fid, cookie: out.cookie || String(cookie || '').trim() };
   }
 
-  // 0119.js style fallback: ensure a stable root folder for transfers.
   let curCookie = String(cookie || '').trim();
   const rootOut = await ensureFolderFid({ name: 'MeowFilm', cookie: curCookie, parentFid: '0', persist });
   curCookie = rootOut.cookie || curCookie;
@@ -894,7 +944,6 @@ async function ensureUcTransferCookie({ shareId, cookie }) {
   if (!pwdId) return curCookie;
   if (cookieHasKey(curCookie, '__puus') && cookieHasKey(curCookie, 'Video-Auth')) return curCookie;
 
-  // Follow the 0119.js flow: touch share page (to get __pus) then call upload/pdir (to get __puus).
   try {
     const sharePageUrl = `https://drive.uc.cn/s/${encodeURIComponent(pwdId)}?platform=pc`;
     const shareHeaders = {
@@ -987,28 +1036,202 @@ async function ucShareSave({ shareId, stoken, fid, fidToken, toPdirFid, cookie }
   return { ok: true, task: lastTask, toPdirFid: toPdir, cookie: curCookie, savedFids };
 }
 
-async function getUcShareDetail({ shareId, stoken, passcode, cookie, pdirFid }) {
+async function getUcShareDetail({ shareId, stoken, passcode, cookie, pdirFid, page, size }) {
   const pwdId = String(shareId || '').trim();
   if (!pwdId) throw new Error('missing shareId');
+  let curCookie = String(cookie || '').trim();
   let sToken = String(stoken || '').trim();
+  const pg = Number.isFinite(Number(page)) ? Math.max(1, Math.trunc(Number(page))) : 1;
+  const sz = Number.isFinite(Number(size)) ? Math.max(1, Math.min(500, Math.trunc(Number(size)))) : 200;
   let raw = null;
   if (!sToken) {
-    const out = await tryGetUcShareStoken({ shareId: pwdId, passcode, cookie });
+    const out = await tryGetUcShareStoken({ shareId: pwdId, passcode, cookie: curCookie });
     sToken = out.stoken;
     raw = out.raw;
+    curCookie = out.cookie || curCookie;
   }
-  const headers = buildUcHeaders(cookie);
+  const headers = buildUcHeaders(curCookie);
   const dir = String(pdirFid || '0').trim() || '0';
   const url = `${UC_API_BASE}/share/sharepage/detail?pr=UCBrowser&fr=pc`;
-  const body = { pwd_id: pwdId, stoken: sToken, pdir_fid: dir, _fetch_total: 1, _size: 200 };
-  const out2 = await ucFetchJsonWithCookie({
-    url,
-    init: { method: 'POST', headers, body: JSON.stringify(body) },
-    cookie,
-    persist: true,
-  });
-  const detail = out2.data;
-  return { shareId: pwdId, stoken: sToken, detail, raw };
+  const body = {
+    pwd_id: pwdId,
+    stoken: sToken,
+    pdir_fid: dir,
+    force: 0,
+    _fetch_total: 1,
+    _page: pg,
+    _size: sz,
+    _sort: 'file_type:asc,file_name:asc',
+  };
+
+  const attempts = [
+    async () =>
+      await ucFetchJsonWithCookie({
+        url,
+        init: { method: 'POST', headers, body: JSON.stringify(body) },
+        cookie: curCookie,
+        persist: true,
+      }),
+    async () => {
+      const u = new URL(url);
+      u.searchParams.set('pwd_id', pwdId);
+      u.searchParams.set('stoken', sToken);
+      u.searchParams.set('pdir_fid', dir);
+      u.searchParams.set('force', '0');
+      u.searchParams.set('_fetch_total', '1');
+      u.searchParams.set('_page', String(pg));
+      u.searchParams.set('_size', String(sz));
+      u.searchParams.set('_sort', 'file_type:asc,file_name:asc');
+      return await ucFetchJsonWithCookie({
+        url: u.toString(),
+        init: { method: 'GET', headers },
+        cookie: curCookie,
+        persist: true,
+      });
+    },
+  ];
+
+  let lastErr = null;
+  for (const fn of attempts) {
+    try {
+      const out2 = await fn();
+      curCookie = out2.cookie || curCookie;
+      return { shareId: pwdId, stoken: sToken, detail: out2.data, raw, cookie: curCookie };
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('share detail failed');
+}
+
+async function listUcShareFilesRecursive({ shareId, passcode, cookie }) {
+  const pwdId = String(shareId || '').trim();
+  if (!pwdId) throw new Error('missing shareId');
+
+  let curCookie = String(cookie || '').trim();
+  const pass = String(passcode || '').trim();
+
+  let rootOut = await getUcShareDetail({ shareId: pwdId, stoken: '', passcode: pass, cookie: curCookie, pdirFid: '0' });
+  curCookie = rootOut.cookie || curCookie;
+  const stoken = String(rootOut.stoken || '').trim();
+  if (!stoken) throw new Error('stoken not found');
+
+  // Virtual-root unwrapping:
+  // If share root contains exactly 1 folder and no files, treat that folder as the root.
+  // This matches common share patterns where everything is wrapped by a single top-level folder.
+  let rootPdirFid = '0';
+  let rootDetail = rootOut.detail;
+  for (let i = 0; i < 5; i += 1) {
+    const list0 = pickUcShareFileList(rootDetail);
+    if (!Array.isArray(list0) || !list0.length) break;
+    const dirs = [];
+    const files0 = [];
+    for (const it of list0) {
+      if (!it || typeof it !== 'object') continue;
+      if (isUcDirItem(it)) dirs.push(it);
+      else files0.push(it);
+    }
+    if (files0.length !== 0 || dirs.length !== 1) break;
+    const onlyDirFid = getUcItemFid(dirs[0]);
+    if (!onlyDirFid) break;
+    rootPdirFid = onlyDirFid;
+    const out = await getUcShareDetail({ shareId: pwdId, stoken, passcode: pass, cookie: curCookie, pdirFid: rootPdirFid });
+    curCookie = out.cookie || curCookie;
+    rootDetail = out.detail;
+  }
+
+  const files = [];
+  const visited = new Set();
+  const queue = [{ pdirFid: rootPdirFid, path: [], detail: rootDetail }];
+
+  const MAX_DEPTH = 12;
+  const MAX_DIRS = 800;
+  const MAX_FILES = 5000;
+  const PAGE_SIZE = 200;
+  const MAX_PAGES_PER_DIR = 100;
+
+  while (queue.length) {
+    const cur = queue.shift();
+    if (!cur) break;
+    const dirFid = String(cur.pdirFid || '0').trim() || '0';
+    if (visited.has(dirFid)) continue;
+    visited.add(dirFid);
+    if (visited.size > MAX_DIRS) break;
+
+    const depth = Array.isArray(cur.path) ? cur.path.length : 0;
+    if (depth > MAX_DEPTH) continue;
+
+    const seenFileFids = new Set();
+    let expectedTotal = NaN;
+    let fetchedInDir = 0;
+
+    for (let page = 1; page <= MAX_PAGES_PER_DIR; page += 1) {
+      let detail = null;
+      if (page === 1 && cur.detail && typeof cur.detail === 'object') {
+        detail = cur.detail;
+      } else {
+        const out = await getUcShareDetail({
+          shareId: pwdId,
+          stoken,
+          passcode: pass,
+          cookie: curCookie,
+          pdirFid: dirFid,
+          page,
+          size: PAGE_SIZE,
+        });
+        curCookie = out.cookie || curCookie;
+        detail = out.detail;
+      }
+
+      if (!detail || typeof detail !== 'object') break;
+      const list = pickUcShareFileList(detail);
+      if (!Array.isArray(list) || !list.length) break;
+
+      if (!Number.isFinite(expectedTotal)) {
+        const total1 = collectFirstNumberByKey(detail, 'total');
+        const total2 = collectFirstNumberByKey(detail, '_total');
+        const picked = Number.isFinite(total1) ? total1 : total2;
+        if (Number.isFinite(picked) && picked > 0) expectedTotal = picked;
+      }
+
+      let newCount = 0;
+      for (const it of list) {
+        if (!it || typeof it !== 'object') continue;
+        const name = getUcItemName(it);
+        if (isUcDirItem(it)) {
+          const childFid = getUcItemFid(it);
+          if (!childFid) continue;
+          const seg = sanitizePanFolderName(name);
+          const nextPath = seg ? [...(cur.path || []), seg] : [...(cur.path || [])];
+          queue.push({ pdirFid: childFid, path: nextPath, detail: null });
+          continue;
+        }
+        const fid = getUcItemFid(it);
+        const fidToken = getUcItemFidToken(it);
+        if (!fid || !fidToken) continue;
+        if (seenFileFids.has(fid)) continue;
+        seenFileFids.add(fid);
+        files.push({ fid, fidToken, name, path: Array.isArray(cur.path) ? cur.path : [] });
+        newCount += 1;
+        if (files.length >= MAX_FILES) break;
+      }
+
+      fetchedInDir += list.length;
+      if (files.length >= MAX_FILES) break;
+
+      // Stop paging when:
+      // - server returns fewer than page size
+      // - no new items added (avoid infinite loops if server repeats same page)
+      // - we believe we've fetched all items by total
+      if (list.length < PAGE_SIZE) break;
+      if (newCount === 0) break;
+      if (Number.isFinite(expectedTotal) && fetchedInDir >= expectedTotal) break;
+    }
+
+    if (files.length >= MAX_FILES) break;
+  }
+
+  return { shareId: pwdId, stoken, cookie: curCookie, files };
 }
 
 async function ucDirectDownload({ fid, fidToken, cookie, want }) {
@@ -1383,11 +1606,13 @@ const apiPlugins = [
         }
       });
 
-      // List share root files and return 0119-style `vod_play_url`.
-      // Input: { flag: "优夕-<shareId>" | "uc-<shareId>", passcode? }  Output: { ok, vod_play_url }
       instance.post('/list', async (req, reply) => {
         const body = req && typeof req.body === 'object' ? req.body : {};
-        const flag = String(body.flag || body.shareCode || body.shareId || body.share_id || '').trim();
+        const flag = String(body.flag || '').trim();
+        if (!flag) {
+          reply.code(400);
+          return { ok: false, message: 'missing flag' };
+        }
         const shareId = parseUcShareIdFromFlag(flag);
         if (!shareId) {
           reply.code(400);
@@ -1401,26 +1626,22 @@ const apiPlugins = [
         }
         const passcodeIn = String(body.passcode || body.pwd || '').trim();
         try {
-          const out = await getUcShareDetail({
-            shareId,
-            stoken: '',
-            passcode: passcodeIn,
-            pdirFid: '0',
-            cookie,
-          });
+          const out = await listUcShareFilesRecursive({ shareId, passcode: passcodeIn, cookie });
           const stoken = String(out && out.stoken ? out.stoken : '').trim();
-          const detail = out && out.detail ? out.detail : null;
-          const list = pickUcShareFileList(detail);
+          const list = Array.isArray(out && out.files ? out.files : null) ? out.files : [];
 
           const parts = [];
           for (const it of list) {
-            if (isUcDirItem(it)) continue;
-            const fid = getUcItemFid(it);
-            const fidToken = getUcItemFidToken(it);
-            const name = getUcItemName(it);
+            if (!it) continue;
+            const fid = String(it.fid || '').trim();
+            const fidToken = String(it.fidToken || '').trim();
+            const name = String(it.name || '').trim();
             if (!fid || !fidToken || !name) continue;
-            const id = `${shareId}*${stoken}*${fid}*${fidToken}***${name}`;
-            parts.push(`${name}$${id}`);
+            const dirPath = Array.isArray(it.path) && it.path.length ? `/${it.path.join('/')}` : '/';
+            const displayName = sanitizeVodPlayName(dirPath) || '/';
+            const suffix = encodeVodIdNameSuffix(name);
+            const id = `${shareId}*${stoken}*${fid}*${fidToken}${suffix ? `***${suffix}` : ''}`;
+            parts.push(`${displayName}$${id}`);
           }
           return { ok: true, vod_play_url: parts.join('#') };
         } catch (e) {
@@ -1528,9 +1749,6 @@ const apiPlugins = [
         }
       });
 
-      // 0119-style: accept { flag, id } and do share-save (transfer) only.
-      // - flag: usually "uc" or the share url (best-effort)
-      // - id: "shareId*stoken*fid*fidToken***filename"
       instance.post('/play', async (req, reply) => {
         const body = req && typeof req.body === 'object' ? req.body : {};
         const flag = String(body.flag || '').trim();
@@ -1620,19 +1838,23 @@ const apiPlugins = [
 
           let playUrl = '';
           let downloadUrl = '';
-          let headerOut = null;
-          let downloadHeaderOut = null;
+          let playHeader = null;
+          let downloadHeader = null;
+          let playSource = '';
+          let downloadSource = '';
 
           if (hasTvCred) {
             try {
               const tvOut = await ucTvLinkByFid({ fid: savedFid, rootDir: resolveRuntimeRootDir(), method: 'streaming' });
               playUrl = tvOut.url || '';
+              if (playUrl) playSource = 'tv';
             } catch {
               playUrl = '';
             }
             try {
               const tvOut2 = await ucTvLinkByFid({ fid: savedFid, rootDir: resolveRuntimeRootDir(), method: 'download' });
               downloadUrl = tvOut2.url || '';
+              if (downloadUrl) downloadSource = 'tv';
             } catch {
               downloadUrl = '';
             }
@@ -1644,29 +1866,29 @@ const apiPlugins = [
               const outPlay = await ucDirectDownload({ fid: savedFid, fidToken: '', cookie, want: 'play_url' });
               cookie = outPlay.cookie || cookie;
               playUrl = outPlay.url;
-              headerOut = { Cookie: cookie, Referer: UC_REFERER, 'User-Agent': UC_UA };
+              playHeader = { Cookie: cookie, Referer: UC_REFERER, 'User-Agent': UC_UA };
+              playSource = playUrl ? 'cookie' : playSource;
             }
             if (!downloadUrl) {
               const outDl = await ucDirectDownload({ fid: savedFid, fidToken: '', cookie, want: 'download_url' });
               cookie = outDl.cookie || cookie;
               downloadUrl = outDl.url;
-              downloadHeaderOut = { Cookie: cookie, Referer: UC_REFERER, 'User-Agent': UC_UA };
+              downloadHeader = { Cookie: cookie, Referer: UC_REFERER, 'User-Agent': UC_UA };
+              downloadSource = downloadUrl ? 'cookie' : downloadSource;
             }
           }
 
-          const url = playUrl || downloadUrl || '';
-          return {
-            ok: true,
-            url,
-            playUrl,
-            downloadUrl,
-            fid: savedFid,
-            toPdirFid: dest.fid,
-            task: out.task || null,
-            parse: 0,
-            ...(headerOut ? { header: headerOut } : {}),
-            ...(downloadHeaderOut ? { downloadHeader: downloadHeaderOut } : {}),
-          };
+          const preferDownload = method === 'download';
+          const chosenUrl = preferDownload ? (downloadUrl || playUrl || '') : (playUrl || downloadUrl || '');
+          const chosenSource = preferDownload
+            ? (downloadUrl ? downloadSource : playSource)
+            : (playUrl ? playSource : downloadSource);
+          const chosenHeader = preferDownload ? (downloadUrl ? downloadHeader : playHeader) : (playUrl ? playHeader : downloadHeader);
+
+          // `version` is injected globally by CatPawOpen server preSerialization hook (see `src/index.js`).
+          const resp = { ok: true, url: chosenUrl };
+          if (chosenSource === 'cookie' && chosenHeader) resp.header = chosenHeader;
+          return resp;
         } catch (e) {
           const msg = (e && e.message) || String(e);
           reply.code(502);
@@ -1674,8 +1896,6 @@ const apiPlugins = [
         }
       });
 
-      // TV-friendly: accept { flag, id } and return a direct download url (and required headers).
-      // This follows the 0119.js style where "play" first transfers then requests download link.
       instance.post('/tv/download', async (req, reply) => {
         const body = req && typeof req.body === 'object' ? req.body : {};
         const fidIn = String(body.fid || body.file_id || body.fileId || body.id_fid || '').trim();
@@ -1770,7 +1990,6 @@ const apiPlugins = [
           let playUrl = '';
           let downloadUrl = '';
           let headerOut = null;
-          let downloadHeaderOut = null;
 
           const playRes = await resolveOne('streaming');
           playUrl = playRes.url || '';
@@ -1778,11 +1997,11 @@ const apiPlugins = [
 
           const dlRes = await resolveOne('download');
           downloadUrl = dlRes.url || '';
-          downloadHeaderOut = dlRes.header;
+          if (!headerOut) headerOut = dlRes.header;
 
           // Keep legacy `url` according to requested method.
           const url = method === 'download' ? (downloadUrl || playUrl) : (playUrl || downloadUrl);
-          const legacyHeader = method === 'download' ? (downloadHeaderOut || headerOut) : (headerOut || downloadHeaderOut);
+          const legacyHeader = headerOut || null;
 
           return {
             ok: true,
@@ -1793,8 +2012,7 @@ const apiPlugins = [
             fid: finalFid,
             task,
             parse: 0,
-            ...(legacyHeader ? { header: legacyHeader } : { header: {} }),
-            ...(downloadHeaderOut ? { downloadHeader: downloadHeaderOut } : {}),
+            ...(legacyHeader ? { header: legacyHeader, headers: legacyHeader } : { header: {}, headers: {} }),
           };
         } catch (e) {
           const msg = (e && e.message) || String(e);
