@@ -59,7 +59,9 @@ OUT_PATH="$OUT_DIR/$OUT_NAME"
 rm -f "$OUT_PATH" "$OUT_PATH.exe"
 
 # pkg will pick up `require('./dist/index.js')` from standalone.cjs as long as dist exists before packaging.
-"$PKG_BIN" "$ROOT_DIR/standalone.cjs" --targets "$TARGET" --output "$OUT_PATH"
+# Work around pkg-fetch progress-bar bugs in some terminals/TTYs.
+CI=1 PKG_DISABLE_PROGRESS=1 "$PKG_BIN" "$ROOT_DIR/standalone.cjs" --targets "$TARGET" --output "$OUT_PATH" || \
+CI=1 PKG_DISABLE_PROGRESS=1 "$PKG_BIN" "$ROOT_DIR/standalone.cjs" --no-progress --targets "$TARGET" --output "$OUT_PATH"
 
 if [ -f "$OUT_PATH.exe" ] && [ ! -f "$OUT_PATH" ]; then
   mv -f "$OUT_PATH.exe" "$OUT_PATH"

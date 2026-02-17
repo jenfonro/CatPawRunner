@@ -1,11 +1,14 @@
-// 139Yun (移动云盘/和彩云) OutLink play API.
-// Keep only: POST /api/139/play
+// 139Yun (移动云盘/和彩云) OutLink API.
+// Endpoints:
+// - POST /api/139/list (0119.js-style anonymous share listing)
+// - POST /api/139/play (direct link + optional transcode link)
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
 import https from 'node:https';
+import zlib from 'node:zlib';
 
 const OUTLINK_API_BASE = 'https://share-kd-njs.yun.139.com/yun-share/richlifeApp/devapp/IOutLink/';
 
@@ -19,6 +22,10 @@ const DEFAULT_UA =
 // X-Deviceinfo format matters; the version number does not. Keep a known-good value.
 const DEFAULT_X_DEVICEINFO =
     '||9|12.27.0|chrome|143.0.0.0|pda50460feabd10141fb59a3ba787afb||windows 10|1624X1305|zh-CN|||';
+
+// config/0119.js uses this value for anonymous OutLink list requests.
+const OUTLINK_0119_X_DEVICEINFO =
+    '||3|12.27.0|chrome|131.0.0.0|5c7c68368f048245e1ce47f1c0f8f2d0||windows 10|1536X695|zh-CN|||';
 
 function toStr(v) {
     return typeof v === 'string' ? v : v == null ? '' : String(v);
@@ -174,6 +181,17 @@ function buildMcloudHeaders({ authorization, bodyForSign }) {
     };
 }
 
+function buildOutlinkAnonHeaders() {
+    // Mirrors config/0119.js headers: no Authorization/Mcloud-Sign.
+    return {
+        'User-Agent': DEFAULT_UA,
+        Accept: 'application/json, text/plain, */*',
+        'Content-Type': 'application/json',
+        'hcy-cool-flag': '1',
+        'x-deviceinfo': OUTLINK_0119_X_DEVICEINFO,
+    };
+}
+
 function fetchText(urlStr, options = {}) {
     const opts = options && typeof options === 'object' ? options : {};
     const method = String(opts.method || 'GET').toUpperCase();
@@ -203,14 +221,34 @@ function fetchText(urlStr, options = {}) {
                 const chunks = [];
                 res.on('data', (c) => chunks.push(c));
                 res.on('end', () => {
-                    const text = Buffer.concat(chunks).toString('utf8');
-                    resolve({
-                        status: res ? Number(res.statusCode || 0) : 0,
-                        ok: res ? res.statusCode >= 200 && res.statusCode < 300 : false,
-                        headers: res ? res.headers || {} : {},
-                        text,
-                        url: urlStr,
-                    });
+                    const buf = Buffer.concat(chunks);
+                    const h = res ? res.headers || {} : {};
+                    const enc = toStr(h['content-encoding'] || h['Content-Encoding'] || '').trim().toLowerCase();
+                    const done = (outBuf) => {
+                        const text = Buffer.isBuffer(outBuf) ? outBuf.toString('utf8') : buf.toString('utf8');
+                        resolve({
+                            status: res ? Number(res.statusCode || 0) : 0,
+                            ok: res ? res.statusCode >= 200 && res.statusCode < 300 : false,
+                            headers: h,
+                            text,
+                            url: urlStr,
+                        });
+                    };
+
+                    if (enc === 'gzip') {
+                        zlib.gunzip(buf, (err, outBuf) => (err ? done(buf) : done(outBuf)));
+                        return;
+                    }
+                    if (enc === 'deflate') {
+                        zlib.inflate(buf, (err, outBuf) => (err ? done(buf) : done(outBuf)));
+                        return;
+                    }
+                    if (enc === 'br') {
+                        zlib.brotliDecompress(buf, (err, outBuf) => (err ? done(buf) : done(outBuf)));
+                        return;
+                    }
+                    // Unknown enc (e.g. zstd) -> best-effort as utf8.
+                    done(buf);
                 });
             }
         );
@@ -284,42 +322,19 @@ function parseLinkIDFromFlag(flag) {
 function parsePlayId(idStr) {
     const raw = toStr(idStr).trim();
     if (!raw) return { linkID: '', contentId: '', coID: '' };
+    // 0119.js-style: "<contentId>*<linkID>"
+    if (!raw.includes('|') && raw.includes('*')) {
+        const parts = raw.split('*');
+        const contentId = toStr(parts[0] || '').trim();
+        const linkID = toStr(parts[1] || '').trim();
+        return { linkID, contentId, coID: '' };
+    }
     // Format: linkID|contentId|coID|filename...
     const parts = raw.split('|');
     const linkID = parts[0] || '';
     const contentId = parts[1] || '';
     const coID = parts[2] || '';
     return { linkID, contentId, coID };
-}
-
-async function getOutLinkInfoV6Signed({ linkID, pCaID, authorization }) {
-    const auth = stripBasicPrefix(authorization);
-    if (!auth) throw new Error('missing authorization');
-    const account = decodeAccountFromAuthorization(auth);
-    if (!account) throw new Error('authorization invalid (missing account)');
-
-    const payload = {
-        getOutLinkInfoReq: { account, linkID: toStr(linkID), pCaID: toStr(pCaID || '') },
-        commonAccountInfo: { account, accountType: 1 },
-    };
-    const plain = JSON.stringify(payload);
-    const enc = aesCbcEncryptBase64(KEY_OUTLINK, plain);
-    const body = JSON.stringify(enc);
-    const headers = buildMcloudHeaders({ authorization: auth, bodyForSign: plain });
-    const url = `${OUTLINK_API_BASE}getOutLinkInfoV6`;
-
-    const resp = await fetchText(url, { method: 'POST', headers, body });
-    const decoded = decryptOutlinkResponse(resp.text);
-    return { resp, parsed: decoded.parsed, rawText: decoded.rawText, decrypted: decoded.decrypted };
-}
-
-function pickOutlinkCoList(parsed) {
-    const p = parsed && typeof parsed === 'object' ? parsed : null;
-    const data = p && typeof p.data === 'object' && p.data ? p.data : null;
-    const list = (data && (data.coLst || data.co_list || data.list)) || (p && (p.coLst || p.list)) || [];
-    if (Array.isArray(list)) return list;
-    if (list && typeof list === 'object' && Array.isArray(list.item)) return list.item;
-    return [];
 }
 
 async function outlinkDlFromOutLinkV3Signed({ linkID, contentId, coID, authorization }) {
@@ -364,6 +379,147 @@ async function outlinkDlFromOutLinkV3Signed({ linkID, contentId, coID, authoriza
     return first;
 }
 
+const OUTLINK_0119_CACHE = {
+    // key: `${linkID}-${pCaID}` -> data object (or null)
+    infoByKey: new Map(),
+};
+
+async function getOutLinkInfoV6_0119({ linkID, pCaID }) {
+    const ca = toStr(pCaID ?? '').trim();
+    const key = `${toStr(linkID).trim()}-${ca}`;
+    if (OUTLINK_0119_CACHE.infoByKey.has(key)) return OUTLINK_0119_CACHE.infoByKey.get(key);
+
+    const payload = {
+        getOutLinkInfoReq: {
+            account: '',
+            linkID: toStr(linkID),
+            passwd: '',
+            caSrt: 0,
+            coSrt: 0,
+            srtDr: 1,
+            bNum: 1,
+            pCaID: ca,
+            eNum: 200,
+        },
+        commonAccountInfo: { account: '', accountType: 1 },
+    };
+    const plain = JSON.stringify(payload);
+    const enc = aesCbcEncryptBase64(KEY_OUTLINK, plain);
+    const body = JSON.stringify(enc);
+    const headers = buildOutlinkAnonHeaders();
+    const url = `${OUTLINK_API_BASE}getOutLinkInfoV6`;
+
+    try {
+        const resp = await fetchText(url, { method: 'POST', headers, body });
+        if (!resp || !resp.ok) {
+            OUTLINK_0119_CACHE.infoByKey.set(key, null);
+            return null;
+        }
+        const decoded = decryptOutlinkResponse(resp.text);
+        const root = decoded.parsed && typeof decoded.parsed === 'object' ? decoded.parsed : null;
+        const data = root && typeof root.data === 'object' && root.data ? root.data : null;
+        OUTLINK_0119_CACHE.infoByKey.set(key, data);
+        return data;
+    } catch (_) {
+        OUTLINK_0119_CACHE.infoByKey.set(key, null);
+        return null;
+    }
+}
+
+async function getShareFile_0119({ linkID, pCaID }) {
+    if (!pCaID) return null;
+    const ca = toStr(pCaID).trim();
+    try {
+        const o = await getOutLinkInfoV6_0119({ linkID, pCaID: ca.startsWith('http') ? 'root' : ca });
+        if (!o || !o.caLst) return null;
+        const i = o.caLst;
+        const a = Array.isArray(i) ? i.map((x) => x && x.caName) : [];
+        const s = Array.isArray(i) ? i.map((x) => x && x.path) : [];
+        const c = /App|活动中心|免费|1T空间|免流/;
+        const u = [];
+        if (Array.isArray(i) && i.length > 0) {
+            a.forEach((d, l) => {
+                if (!d || c.test(toStr(d))) return;
+                const path = toStr(s[l] || '').trim();
+                if (!path) return;
+                u.push({ name: toStr(d), path });
+            });
+            let x = await Promise.all(s.map(async (d) => getShareFile_0119({ linkID, pCaID: d })));
+            x = x.filter((d) => d != null);
+            return [...u, ...x.flat()];
+        }
+    } catch (_) {}
+    return null;
+}
+
+async function getShareUrl_0119({ linkID, pCaID }) {
+    try {
+        const t = await getOutLinkInfoV6_0119({ linkID, pCaID });
+        if (!t || typeof t !== 'object' || !('coLst' in t)) return null;
+        const o = t.coLst;
+        if (o !== null) {
+            return Array.isArray(o)
+                ? o
+                      .filter((a) => a && a.coType === 3)
+                      .map((a) => ({
+                          name: toStr(a.coName),
+                          contentId: toStr(a.coID),
+                          linkID: toStr(linkID),
+                          size: a.coSize,
+                      }))
+                : [];
+        }
+        if (t.caLst !== null) {
+            const i = Array.isArray(t.caLst) ? t.caLst.map((s) => s && s.path) : [];
+            let a = await Promise.all(i.map((s) => getShareUrl_0119({ linkID, pCaID: s })));
+            a = a.filter((s) => s && s.length > 0);
+            return a.flat();
+        }
+    } catch (_) {}
+    return null;
+}
+
+async function outlinkGetContentInfoFromOutLink_0119({ linkID, contentId }) {
+    const payload = {
+        getContentInfoFromOutLinkReq: { contentId: toStr(contentId), linkID: toStr(linkID), account: '' },
+        commonAccountInfo: { account: '', accountType: 1 },
+    };
+    const body = JSON.stringify(payload);
+    const headers = {
+        'User-Agent': DEFAULT_UA,
+        Accept: 'application/json, text/plain, */*',
+        // 0119.js sets this; we can handle gzip/deflate/br, unknown (zstd) falls back to raw.
+        'Accept-Encoding': 'gzip, deflate, br, zstd',
+        'Content-Type': 'application/json',
+    };
+    const url = `${OUTLINK_API_BASE}getContentInfoFromOutLink`;
+    const parseResp = (text) => {
+        try {
+            return text && text.trim() ? JSON.parse(text) : null;
+        } catch (_) {
+            return null;
+        }
+    };
+
+    let resp = await fetchText(url, { method: 'POST', headers, body });
+    if (!resp || !resp.ok) return { ok: false, url: '', rawText: resp ? resp.text : '' };
+    let parsed = parseResp(resp.text);
+    if (!parsed) {
+        // If server picked zstd (or other unsupported encoding), retry with identity encoding.
+        const enc = toStr(resp.headers && (resp.headers['content-encoding'] || resp.headers['Content-Encoding'])).trim().toLowerCase();
+        if (enc === 'zstd') {
+            const headers2 = { ...headers, 'Accept-Encoding': 'identity' };
+            resp = await fetchText(url, { method: 'POST', headers: headers2, body });
+            if (!resp || !resp.ok) return { ok: false, url: '', rawText: resp ? resp.text : '' };
+            parsed = parseResp(resp.text);
+        }
+    }
+    const present =
+        toStr(parsed && parsed.data && parsed.data.contentInfo && (parsed.data.contentInfo.presentURL || parsed.data.contentInfo.presentUrl)).trim() ||
+        '';
+    return { ok: Boolean(present), url: present, rawText: resp.text || '', parsed };
+}
+
 export const apiPlugins = [
     {
         prefix: '/api/139',
@@ -379,27 +535,54 @@ export const apiPlugins = [
                     return { ok: false, message: 'missing/invalid flag (expected: 逸动-<linkID>)' };
                 }
                 try {
-                    const authorization = await get139Authorization(instance);
-                    const out = await getOutLinkInfoV6Signed({ linkID, pCaID: '', authorization });
-                    const parsed = out.parsed;
-                    const code = parsed && (parsed.code ?? parsed.resultCode);
-                    if (String(code) !== '0') {
-                        const desc = parsed && (parsed.desc || parsed.message);
-                        reply.code(502);
-                        return { ok: false, message: desc ? `${toStr(code || 'error')}: ${toStr(desc)}` : toStr(code || 'failed') };
+                    const pCaID0 = toStr(body.pCaID || body.pcaid || body.caID || body.caId || '').trim() || 'root';
+
+                    const data = {};
+                    const folders = await getShareFile_0119({ linkID, pCaID: pCaID0 });
+                    if (folders && Array.isArray(folders)) {
+                        await Promise.all(
+                            folders.map(async (s) => {
+                                if (!s || typeof s !== 'object') return;
+                                const name = toStr(s.name).trim();
+                                const path = toStr(s.path).trim();
+                                if (!name || !path) return;
+                                if (!(name in data)) data[name] = [];
+                                const c = await getShareUrl_0119({ linkID, pCaID: path });
+                                if (c && c.length > 0) data[name].push(...c);
+                            })
+                        );
                     }
 
-                    const coLst = pickOutlinkCoList(parsed);
-                    const parts = [];
-                    for (const it of coLst) {
-                        if (!it || typeof it !== 'object') continue;
-                        const name = toStr(it.coName || it.name || it.fileName || '').trim();
-                        const coID = toStr(it.coID || it.coId || it.id || '').trim();
-                        if (!name || !coID) continue;
-                        const id = `${linkID}||${coID}|${name}`;
-                        parts.push(`${name}$${id}`);
+                    for (const k of Object.keys(data)) if (!Array.isArray(data[k]) || data[k].length === 0) delete data[k];
+
+                    if (Object.keys(data).length === 0) {
+                        // Keep 0119.js behavior (even though it may return empty for shares without caLst).
+                        data.root = (await getShareFile_0119({ linkID, pCaID: pCaID0 })) || [];
+                        if (Array.isArray(data.root)) data.root = data.root.filter((s) => s && Object.keys(s).length > 0);
                     }
-                    return { ok: true, vod_play_url: parts.join('#') };
+
+                    // 0119.js-style vod_id: "<contentId>*<linkID>"
+                    for (const k of Object.keys(data)) {
+                        if (!Array.isArray(data[k])) continue;
+                        data[k] = data[k].map((c) => ({
+                            vod_name: toStr(c && c.name),
+                            vod_id: `${toStr(c && c.contentId)}*${toStr(c && c.linkID)}`,
+                            vod_size: c && c.size,
+                        }));
+                    }
+
+                    const parts = [];
+                    for (const k of Object.keys(data)) {
+                        const arr = Array.isArray(data[k]) ? data[k] : [];
+                        for (const it of arr) {
+                            const n = toStr(it && it.vod_name).trim();
+                            const id = toStr(it && it.vod_id).trim();
+                            if (!n || !id) continue;
+                            parts.push(`${n}$${id}`);
+                        }
+                    }
+
+                    return { ok: true, vod_play_url: parts.join('#'), data };
                 } catch (e) {
                     reply.code(502);
                     return { ok: false, message: (e && e.message) || String(e) };
@@ -419,6 +602,7 @@ export const apiPlugins = [
                 const linkID = toStr(parsed.linkID || parseLinkIDFromFlag(flag)).trim();
                 const contentId = toStr(parsed.contentId).trim();
                 const coID = toStr(parsed.coID).trim();
+                const isStarId = id.includes('*') && !id.includes('|');
 
                 if (!linkID) {
                     reply.code(400);
@@ -430,6 +614,38 @@ export const apiPlugins = [
                 }
 
                 try {
+                    // For 0119.js-style id ("contentId*linkID"):
+                    // - `url` is the direct download link (signed dlFromOutLinkV3)
+                    if (contentId && !coID && isStarId) {
+                        const trans = await outlinkGetContentInfoFromOutLink_0119({ linkID, contentId });
+                        const play_url = toStr(trans && trans.url).trim();
+
+                        const authorization = await get139Authorization(instance);
+                        // In 0119.js list, "contentId" is actually `coID` from `coLst`.
+                        const dl = await outlinkDlFromOutLinkV3Signed({ linkID, contentId: '', coID: contentId, authorization });
+                        if (!dl.url) {
+                            const code = dl.parsed && (dl.parsed.code || dl.parsed.resultCode);
+                            const desc = dl.parsed && (dl.parsed.desc || dl.parsed.message);
+                            reply.code(502);
+                            return {
+                                ok: false,
+                                message: desc ? `${toStr(code || 'error')}: ${toStr(desc)}` : toStr(code || 'failed'),
+                                raw: dl.rawText || '',
+                                play_url,
+                            };
+                        }
+
+                        return {
+                            ok: true,
+                            parse: 0,
+                            url: dl.url,
+                            downloadUrl: dl.url,
+                            play_url,
+                            playUrl: play_url || dl.url,
+                        };
+                    }
+
+                    // Legacy id formats (with coID etc): keep signed dlFromOutLinkV3 behavior.
                     const authorization = await get139Authorization(instance);
                     const out = await outlinkDlFromOutLinkV3Signed({ linkID, contentId, coID, authorization });
                     if (!out.url) {
