@@ -768,7 +768,12 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			          const linkID = req && typeof req === 'object' ? String(req.linkID || '').trim() : '';
 			          const pCaID = req && typeof req === 'object' ? String(req.pCaID || '').trim() : '';
 			          const contentId = req && typeof req === 'object' ? String(req.contentId || '').trim() : '';
-			          return { linkID, pCaID, contentId, hasPassword: false };
+			          const passwd =
+			            req && typeof req === 'object'
+			              ? String(req.passwd || req.passwdStr || req.password || req.pwd || '').trim()
+			              : '';
+			          const hasPassword = !!passwd;
+			          return { linkID, pCaID, contentId, passwd, hasPassword };
 			        }
 
 			        void host;
@@ -1173,17 +1178,21 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 				            const req = obj && typeof obj === 'object' ? obj.getOutLinkInfoReq : null;
 				            const linkID = req && typeof req === 'object' ? String(req.linkID || '').trim() : '';
 				            const pCaID = req && typeof req === 'object' ? String(req.pCaID || '').trim() : '';
-				            return { linkID, pCaID };
+				            const passwd =
+				              req && typeof req === 'object'
+				                ? String(req.passwd || req.passwdStr || req.password || req.pwd || '').trim()
+				                : '';
+				            return { linkID, pCaID, passwd };
 				          } catch (_) {
-				            return { linkID: '', pCaID: '' };
+				            return { linkID: '', pCaID: '', passwd: '' };
 				          }
 				        };
 
 				        if (isOutLinkInfo) {
-				          const { linkID, pCaID } = parseOutlinkReq();
+				          const { linkID, pCaID, passwd } = parseOutlinkReq();
 				          try {
 				            const k = String(linkID || '').trim();
-				            if (k) __placeholderCache['139'].set(k, { shareCode: k, password: '' });
+				            if (k) __placeholderCache['139'].set(k, { shareCode: k, password: String(passwd || '').trim() });
 				          } catch (_) {}
 				          const mkId = (salt) => {
 				            try {
@@ -1204,7 +1213,7 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 				              coLst: [
 				                {
 				                  coType: 3,
-				                  coName: __mkPlaceholderFileName('139', linkID || 'link', ''),
+				                  coName: __mkPlaceholderFileName('139', linkID || 'link', String(passwd || '').trim()),
 				                  coID,
 				                  coSize: 874 * 1024 * 1024,
 				                },
