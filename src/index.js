@@ -289,7 +289,7 @@ export async function start(config) {
             if (res && res.skipped) {
                 // Config does not manage online scripts; keep legacy behavior (run whatever exists in custom_spider/).
                 const p = await findAvailablePortInRange(30000, 39999);
-                const started = await startOnlineRuntime({id: 'default', port: p});
+                const started = await startOnlineRuntime({ id: 'default', port: p });
                 if (started && started.port) onlineRuntimePorts.set('default', started.port);
                 else onlineRuntimePorts.delete('default');
                 onlineLastEntry = started && started.entry ? started.entry : onlineLastEntry;
@@ -327,12 +327,12 @@ export async function start(config) {
                     try {
                         stopOnlineRuntime(id);
                     } catch (_) {}
-                    const started = await startOnlineRuntime({id, port, entry: r.destPath});
+                    const started = await startOnlineRuntime({ id, port, entry: r.destPath, entryFn: r.entryFn || '' });
                     if (started && started.port) onlineRuntimePorts.set(id, started.port);
                     else onlineRuntimePorts.delete(id);
                 } else {
                     // Ensure it is running (best-effort).
-                    const started = await startOnlineRuntime({id, port, entry: r.destPath});
+                    const started = await startOnlineRuntime({ id, port, entry: r.destPath, entryFn: r.entryFn || '' });
                     if (started && started.port) onlineRuntimePorts.set(id, started.port);
                     else onlineRuntimePorts.delete(id);
                 }
