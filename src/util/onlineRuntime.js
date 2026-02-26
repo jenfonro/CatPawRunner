@@ -87,7 +87,13 @@ export function broadcastOnlineRuntimeMockConfig({ rootDir } = {}) {
     } catch (_) {}
 }
 
-export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[online]', entry: entryOverride = '' } = {}) {
+export async function startOnlineRuntime({
+    id = 'default',
+    port,
+    logPrefix = '[online]',
+    entry: entryOverride = '',
+    entryFn = '',
+} = {}) {
     const rootDir = getRootDir();
     const onlineDir = path.resolve(rootDir, 'custom_spider');
     const entry =
@@ -373,6 +379,7 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 				      srv.on('listening', () => {
 				        try {
 				          const a = srv.address && typeof srv.address === 'function' ? srv.address() : null;
+				          try { globalThis.__catpaw_online_listen_port = a && a.port ? a.port : 0; } catch (_) {}
 				          __log('listening', a);
 				          __send({ type: 'listening', port: a && a.port ? a.port : 0 });
 				        } catch (_) {}
@@ -2458,6 +2465,9 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 		    patch(https);
 	  } catch (_) {}
 
+	  const __beforeKeys = (() => {
+	    try { return new Set(Object.getOwnPropertyNames(globalThis)); } catch (_) { return new Set(); }
+	  })();
 	  __stage('vm_eval_start');
 	  try {
 	    vm.runInThisContext(fs.readFileSync(entry, 'utf8'), { filename: entry });
@@ -2465,6 +2475,14 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 	    __log('vm_eval_failed', e && e.stack ? e.stack : String(e));
 	    __send({ type: 'fatal', kind: 'vm_eval', message: e && e.message ? String(e.message) : String(e), stack: e && e.stack ? String(e.stack) : '' });
 	    throw e;
+	  }
+	  try {
+	    const after = Object.getOwnPropertyNames(globalThis);
+	    const added = [];
+	    for (const k of after) if (!__beforeKeys.has(k)) added.push(k);
+	    globalThis.__catpaw_online_entry_added_keys = added;
+	  } catch (_) {
+	    try { globalThis.__catpaw_online_entry_added_keys = []; } catch (_) {}
 	  }
 	  __stage('vm_eval_done');
 	})();
@@ -2588,37 +2606,227 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
     } catch (_) {
       // ignore if server is already ready/started
     }
+		  };
+
+	  const pickServerRef = () => {
+	    try {
+	      const candidates = [
+	        globalThis.xn,
+	        globalThis.un,
+	        globalThis.srv,
+	        globalThis.server,
+	        globalThis.app,
+	        globalThis.fastify,
+	      ];
+	      for (const c of candidates) if (c && typeof c === 'object') return c;
+	    } catch (_) {}
+	    return null;
 	  };
 
-	  if (typeof globalThis.Ndr === 'function') {
-		    __stage('ndr_found');
-		    // Some handlers expect request.body.data.cookie; normalize body shape up-front.
-		    patchBodyShape(globalThis.xn);
-		    const baseCfg = (() => {
-		      return { sites: { list: [] }, pans: { list: [] }, color: [] };
-		    })();
-		    // Let the script's own JsonDB load persisted data from db.json.
-		    const startedAt = Date.now();
-		    const warnT = setInterval(() => {
+	  const resolveEntryCandidates = () => {
+	    const envName = (() => {
+	      try {
+	        return (
+	          String(process.env.ONLINE_ENTRY_FN || '').trim() ||
+	          String(process.env.CATPAW_ONLINE_ENTRY_FN || '').trim() ||
+	          String(process.env.CATPAW_ENTRY_FN || '').trim()
+	        );
+	      } catch (_) {
+	        return '';
+	      }
+	    })();
+
+	    const candidates = [];
+	    const seen = new Set();
+
+	    const pushCandidate = (name, via) => {
+	      try {
+	        const n = String(name || '').trim();
+	        if (!n || seen.has(n)) return;
+	        const f = globalThis ? globalThis[n] : null;
+	        if (typeof f !== 'function') return;
+	        seen.add(n);
+	        candidates.push({ fn: f, name: n, via: String(via || '') });
+	      } catch (_) {}
+	    };
+
+	    if (envName) pushCandidate(envName, 'env');
+	    if (typeof globalThis.Ndr === 'function') pushCandidate('Ndr', 'default');
+
+		    const addedKeys = (() => {
 		      try {
-		        const ms = Date.now() - startedAt;
-			        if (ms >= 5000) __log('ndr still running', String(ms) + 'ms');
+		        return Array.isArray(globalThis.__catpaw_online_entry_added_keys) ? globalThis.__catpaw_online_entry_added_keys : [];
+		      } catch (_) {
+		        return [];
+	      }
+	    })();
+
+	    const addedFns = [];
+	    for (const k of addedKeys) {
+	      try {
+	        if (typeof globalThis[k] === 'function') addedFns.push(k);
+	      } catch (_) {}
+	    }
+
+	    const scoreFn = (name) => {
+	      let score = 0;
+	      try {
+	        const fn = globalThis[name];
+	        if (typeof fn !== 'function') return -1;
+	        if (/^nd[rR]$/i.test(name)) score += 100;
+	        if (/^(start|main|run|bootstrap|init)$/i.test(name)) score += 40;
+	        if (fn.length >= 1) score += 20;
+	        const src = (() => {
+	          try { return Function.prototype.toString.call(fn); } catch (_) { return ''; }
+	        })();
+	        if (src.includes('serverFactory:catServerFactory')) score += 60;
+	        if (src.includes('catServerFactory')) score += 25;
+	        if (src.includes('DEV_HTTP_PORT') || src.includes('HTTP_PORT') || src.includes('PORT')) score += 10;
+	        if (src.includes('.listen(') || src.includes('listen({')) score += 10;
+	        if (src.includes('.register(')) score += 6;
+	        if (src.includes('messageToDart')) score += 6;
+	        if (src.includes('JsonDB') || src.includes('db.json')) score += 4;
+	        if (/^(stop|close|dispose|destroy|shutdown|teardown)$/i.test(name)) score -= 100;
+	      } catch (_) {}
+	      return score;
+	    };
+
+	    let best = '';
+	    let bestScore = -1;
+	    for (const n of addedFns) {
+	      const sc = scoreFn(n);
+	      if (sc > bestScore) {
+	        bestScore = sc;
+	        best = n;
+	      }
+		    }
+
+		    if (best && bestScore >= 30) pushCandidate(best, 'auto');
+
+		    try {
+		      const ranked = addedFns
+		        .map((n) => ({ n, sc: scoreFn(n) }))
+		        .sort((a, b) => b.sc - a.sc)
+	        .map((x) => x.n);
+	      for (const n of ranked) pushCandidate(n, 'auto_rank');
+	    } catch (_) {}
+
+	    return { candidates, envName, addedFns };
+	  };
+
+		  const waitForListening = async (timeoutMs) => {
+		    const t0 = Date.now();
+		    const lim = Math.max(250, Math.trunc(Number(timeoutMs || 0)) || 0) || 6000;
+		    while (Date.now() - t0 < lim) {
+		      try {
+	        const p = Number(globalThis.__catpaw_online_listen_port || 0);
+	        if (Number.isFinite(p) && p > 0) return true;
+	      } catch (_) {}
+	      try {
+	        const srv = pickServerRef();
+	        const addr = srv && typeof srv.address === 'function' ? srv.address() : null;
+	        const p = addr && addr.port ? Number(addr.port) : 0;
+	        if (Number.isFinite(p) && p > 0) return true;
+	      } catch (_) {}
+	      await new Promise((r) => setTimeout(r, 50));
+	    }
+		    return false;
+		  };
+
+		  try {
+		    const ok = await waitForListening(250);
+		    if (ok) {
+		      __log('entry already listening');
+		      __stage('ndr_done');
+		      patchBodyShape(pickServerRef());
+		      ensureConfigDefaults(pickServerRef());
+		      try {
+		        const srv = pickServerRef();
+		        if (srv && srv.db && typeof srv.db.push === 'function' && typeof srv.db.getData === 'function') {
+		          const origPush = srv.db.push.bind(srv.db);
+		          srv.db.push = async (...args) => {
+		            try {
+		              const p = args[0];
+		              const v = args[1];
+		              if (typeof p === 'string') {
+		                if (/^\\/uc\\/[0-9a-f]{32}$/i.test(p) && typeof v === 'string' && v === '') {
+		                  try {
+		                    const cur = await srv.db.getData(p);
+		                    if (typeof cur === 'string' && cur.trim()) return cur;
+		                  } catch (_) {}
+		                }
+		                if (p === '/uc' && v && typeof v === 'object' && !Array.isArray(v)) {
+		                  let out = null;
+		                  for (const k of Object.keys(v)) {
+		                    if (!/^[0-9a-f]{32}$/i.test(k)) continue;
+		                    const vv = v[k];
+		                    if (typeof vv !== 'string' || vv !== '') continue;
+		                    try {
+		                      const cur = await srv.db.getData('/uc/' + k);
+		                      if (typeof cur === 'string' && cur.trim()) {
+		                        if (!out) out = Object.assign({}, v);
+		                        out[k] = cur;
+		                      }
+		                    } catch (_) {}
+		                  }
+		                  if (out) args[1] = out;
+		                }
+		              }
+		            } catch (_) {}
+		            return origPush(...args);
+		          };
+		        }
 		      } catch (_) {}
-		    }, 1000);
+		      return;
+		    }
+		  } catch (_) {}
+
+		  const { candidates, envName, addedFns } = resolveEntryCandidates();
+		  if (candidates && candidates.length) {
+			    __stage('ndr_found');
+			    const baseCfg = (() => {
+			      return { sites: { list: [] }, pans: { list: [] }, color: [] };
+		    })();
 		    try {
 		      __stage('ndr_call');
-		      await globalThis.Ndr(baseCfg);
+		      let started = false;
+		      let lastErr = null;
+			      for (const c of candidates.slice(0, 12)) {
+			        try {
+			          __log('entryFn_try', c.name, 'via', c.via);
+			          try { globalThis.__catpaw_online_listen_port = 0; } catch (_) {}
+			          patchBodyShape(pickServerRef());
+			          await c.fn(baseCfg);
+			          const ok = await waitForListening(7000);
+			          if (ok) {
+		            __log('entryFn_ok', c.name, 'via', c.via);
+		            started = true;
+		            break;
+		          }
+		          __log('entryFn_no_listen', c.name);
+		        } catch (e) {
+		          lastErr = e;
+		          __log('entryFn_failed', c.name, e && e.message ? String(e.message) : String(e));
+		        }
+		      }
+		      if (!started) {
+		        const detail = addedFns && addedFns.length ? 'addedFns=' + JSON.stringify(addedFns.slice(0, 50)) : 'addedFns=[]';
+		        const hint = envName ? " (ONLINE_ENTRY_FN='" + envName + "')" : '';
+		        const msg = 'no entry function could start listening' + hint + ' ' + detail;
+		        const err = lastErr instanceof Error ? lastErr : new Error(msg);
+		        if (!err.message || err.message === String(lastErr || '')) err.message = msg;
+		        throw err;
+		      }
 		      __stage('ndr_done');
 		    } finally {
-		      try { clearInterval(warnT); } catch (_) {}
 		    }
-		    patchBodyShape(globalThis.xn);
-		    ensureConfigDefaults(globalThis.xn);
+		    patchBodyShape(pickServerRef());
+		    ensureConfigDefaults(pickServerRef());
 	    // Guard against accidental credential wipe:
 	    // Some bundled scripts may push('/uc/<hash>', '') during unrelated flows (e.g. category probe),
 	    // which overwrites a previously saved UC cookie with empty string.
 	    try {
-	      const srv = globalThis.xn;
+	      const srv = pickServerRef();
 
 	      if (srv && srv.db && typeof srv.db.push === 'function' && typeof srv.db.getData === 'function') {
 	        const origPush = srv.db.push.bind(srv.db);
@@ -2661,8 +2869,8 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 
 	    return;
 	  }
-	  __log('Ndr() not found on globalThis');
-	  throw new Error('Ndr() not found on globalThis');
+	  __log('entry start function not found');
+	  throw new Error('entry start function not found');
 	})().catch((e) => { console.error(e && e.stack ? e.stack : e); process.exit(1); });
 	`.trim();
 
@@ -2819,6 +3027,7 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 				    for (let attempt = 0; attempt < 6; attempt += 1) {
 				        const baseEnv = { ...process.env };
 				        const panMockCfg = readPanMockConfigFromRuntimeRoot(rootDir);
+				        const resolvedEntryFn = typeof entryFn === 'string' ? entryFn.trim() : '';
 				        const child = spawn(process.execPath, [bootstrapPath], {
 				            stdio,
 				            cwd: rootDir,
@@ -2829,6 +3038,7 @@ export async function startOnlineRuntime({ id = 'default', port, logPrefix = '[o
 			                HTTP_PORT: String(chosenPort),
 			                ONLINE_ID: String(key),
 			                ONLINE_ENTRY: entry,
+			                ONLINE_ENTRY_FN: resolvedEntryFn,
 			                ONLINE_CWD: rootDir,
 				                CATPAW_DEBUG_LOG: onlineLogPath,
 				                NODE_PATH: rootDir,

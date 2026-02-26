@@ -111,7 +111,13 @@ function normalizeOnlineConfigs(list) {
             const name = typeof it.name === 'string' ? it.name.trim() : '';
             const idRaw = typeof it.id === 'string' && it.id.trim() ? it.id.trim() : '';
             const fileNameRaw = typeof it.fileName === 'string' ? it.fileName.trim() : '';
-            return { url, name, idRaw, fileNameRaw };
+            const entryFn =
+                typeof it.entryFn === 'string'
+                    ? it.entryFn.trim()
+                    : typeof it.entry_fn === 'string'
+                      ? it.entry_fn.trim()
+                      : '';
+            return { url, name, idRaw, fileNameRaw, entryFn };
         })
         .filter((it) => it.url);
 }
@@ -234,10 +240,28 @@ export async function applyOnlineConfigs(options = {}) {
                     `${JSON.stringify({ url: parsed.toString(), savedAt: Date.now() }, null, 2)}\n`
                 );
             }
-            resolved.push({ ...it, url: parsed.toString(), fileName, destPath, ok: true, downloaded: !!shouldDownload, id: idEff });
+            resolved.push({
+                ...it,
+                url: parsed.toString(),
+                fileName,
+                destPath,
+                ok: true,
+                downloaded: !!shouldDownload,
+                id: idEff,
+                entryFn: it.entryFn || '',
+            });
         } catch (_) {
             // Keep file name reserved even if download failed.
-            resolved.push({ ...it, url: parsed.toString(), fileName, destPath, ok: false, downloaded: false, id: idEff });
+            resolved.push({
+                ...it,
+                url: parsed.toString(),
+                fileName,
+                destPath,
+                ok: false,
+                downloaded: false,
+                id: idEff,
+                entryFn: it.entryFn || '',
+            });
         }
     }
 

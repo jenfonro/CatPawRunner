@@ -61,6 +61,8 @@ npm run dev
 
 `onlineConfigs` 生效时，会把远程脚本下载到 `custom_spider/` 并自动拉起/重启对应 runtime。
 
+入口函数默认会自动挑选一个全局启动函数并调用（兼容 `Ndr` 及打包压缩后的函数名）。如遇到无法自动识别/启动，可在 `onlineConfigs` 单项里配置 `entryFn`（或设置环境变量 `ONLINE_ENTRY_FN`）指定实际要调用的全局函数名。
+
 ## 内置网盘 API
 
 这些接口主要用于：
