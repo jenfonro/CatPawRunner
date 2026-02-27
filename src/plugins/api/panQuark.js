@@ -998,9 +998,9 @@ async function quarkShareSave({ shareId, stoken, fid, fidToken, toPdirFid, cooki
     share_id: pwdId,
   };
   const saveResp = await fetchJson(saveUrl, { method: 'POST', headers, body: JSON.stringify(saveBody) });
-  const taskId =
-    (saveResp && saveResp.data && (saveResp.data.task_id || saveResp.data.taskId || saveResp.data.taskID)) || '';
-  const taskID = String(taskId || '').trim();
+  const taskIdByPath = saveResp && saveResp.data && (saveResp.data.task_id || saveResp.data.taskId || saveResp.data.taskID);
+  const taskIdByScan = collectFirstStringByKey(saveResp, 'task_id') || collectFirstStringByKey(saveResp, 'taskid');
+  const taskID = String(taskIdByPath || taskIdByScan || '').trim();
   if (!taskID) throw new Error('quark save: task_id not found');
 
   const deadline = Date.now() + 30_000;
