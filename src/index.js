@@ -3,7 +3,13 @@ import router from './router.js';
 import {JsonDB, Config} from 'node-json-db';
 import axios from 'axios';
 import {findAvailablePortInRange} from './util/tool.js';
-import {startOnlineRuntime, stopOnlineRuntime, stopAllOnlineRuntimes, broadcastOnlineRuntimeMockConfig} from './util/onlineRuntime.js';
+import {
+    startOnlineRuntime,
+    stopOnlineRuntime,
+    stopAllOnlineRuntimes,
+    broadcastOnlineRuntimeMockConfig,
+    broadcastOnlineRuntimeProxyConfig,
+} from './util/onlineRuntime.js';
 import path from 'node:path';
 import fs from 'node:fs';
 import {applyOnlineConfigs} from './util/onlineConfigStore.js';
@@ -350,6 +356,9 @@ export async function start(config) {
     try {
         broadcastOnlineRuntimeMockConfig({ rootDir: runtimeRoot });
     } catch (_) {}
+    try {
+        broadcastOnlineRuntimeProxyConfig({ rootDir: runtimeRoot });
+    } catch (_) {}
 
     // Watch config.json for onlineConfigs changes (so manual edits or /api/server/settings take effect).
     const cfgPath = path.resolve(runtimeRoot, 'config.json');
@@ -371,6 +380,9 @@ export async function start(config) {
             await syncAndMaybeRestartOnline('config changed');
             try {
                 broadcastOnlineRuntimeMockConfig({ rootDir: runtimeRoot });
+            } catch (_) {}
+            try {
+                broadcastOnlineRuntimeProxyConfig({ rootDir: runtimeRoot });
             } catch (_) {}
         } catch (_) {}
     }, pollMs);
