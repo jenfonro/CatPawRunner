@@ -4,7 +4,13 @@ import http from 'node:http';
 import https from 'node:https';
 import { findAvailablePortInRange } from '../../util/tool.js';
 import { applyOnlineConfigs } from '../../util/onlineConfigStore.js';
-import { startOnlineRuntime, stopOnlineRuntime, stopAllOnlineRuntimes, broadcastOnlineRuntimeMockConfig } from '../../util/onlineRuntime.js';
+import {
+    startOnlineRuntime,
+    stopOnlineRuntime,
+    stopAllOnlineRuntimes,
+    broadcastOnlineRuntimeMockConfig,
+    broadcastOnlineRuntimeProxyConfig,
+} from '../../util/onlineRuntime.js';
 
 function resolveRuntimeRootDir() {
     try {
@@ -214,10 +220,29 @@ function normalizeOnlineConfigItem(raw) {
     return { url, name };
 }
 
+function parseJsonSafe(text) {
+    try {
+        const t = typeof text === 'string' ? text : '';
+        return t && t.trim() ? JSON.parse(t) : null;
+    } catch (_) {
+        return null;
+    }
+}
+
 function readSettingsFromConfig(root) {
     const cfg = root && typeof root === 'object' ? root : {};
+    const rawSiteProxy = cfg.siteProxy && typeof cfg.siteProxy === 'object' && !Array.isArray(cfg.siteProxy) ? cfg.siteProxy : {};
+    const siteProxy = {};
+    for (const k of Object.keys(rawSiteProxy || {})) {
+        const key = String(k || '').trim();
+        const val = rawSiteProxy[k];
+        if (!key) continue;
+        if (typeof val !== 'string') continue;
+        siteProxy[key] = val;
+    }
     return {
         proxy: typeof cfg.proxy === 'string' ? cfg.proxy : '',
+        siteProxy,
         pan_mock: !!cfg.pan_mock,
         panBuiltinResolverEnabled: !!cfg.panBuiltinResolverEnabled,
         goProxyApi: typeof cfg.goProxyApi === 'string' ? cfg.goProxyApi : '',
@@ -557,6 +582,25 @@ export const apiPlugins = [
                 const next = { ...prev };
 
                 if (Object.prototype.hasOwnProperty.call(body, 'proxy')) next.proxy = typeof body.proxy === 'string' ? body.proxy : '';
+                if (Object.prototype.hasOwnProperty.call(body, 'siteProxy')) {
+                    const raw = body.siteProxy;
+                    let obj = null;
+                    if (raw == null) obj = {};
+                    else if (typeof raw === 'string') obj = parseJsonSafe(raw);
+                    else if (raw && typeof raw === 'object' && !Array.isArray(raw)) obj = raw;
+                    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+                        return reply.code(400).send({ success: false, message: 'siteProxy must be an object or JSON object string' });
+                    }
+                    const out = {};
+                    for (const k of Object.keys(obj)) {
+                        const key = String(k || '').trim();
+                        const val = obj[k];
+                        if (!key) continue;
+                        if (typeof val !== 'string') continue;
+                        out[key] = val;
+                    }
+                    next.siteProxy = out;
+                }
                 if (Object.prototype.hasOwnProperty.call(body, 'pan_mock')) next.pan_mock = !!body.pan_mock;
                 if (Object.prototype.hasOwnProperty.call(body, 'panBuiltinResolverEnabled'))
                     next.panBuiltinResolverEnabled = !!body.panBuiltinResolverEnabled;
@@ -615,6 +659,10 @@ export const apiPlugins = [
                 try {
                     // Allow toggling pan mock without restarting online runtimes.
                     broadcastOnlineRuntimeMockConfig({ rootDir });
+                } catch (_) {}
+                try {
+                    // Allow changing proxy settings without restarting online runtimes.
+                    broadcastOnlineRuntimeProxyConfig({ rootDir });
                 } catch (_) {}
 
                 let onlineResults = null;

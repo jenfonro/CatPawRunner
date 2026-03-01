@@ -87,6 +87,47 @@ export function broadcastOnlineRuntimeMockConfig({ rootDir } = {}) {
     } catch (_) {}
 }
 
+function readProxyConfigFromRuntimeRoot(rootDir) {
+    try {
+        const cfgPath = path.resolve(rootDir, 'config.json');
+        const cfg = readJsonFileSafe(cfgPath);
+        const proxy = typeof cfg.proxy === 'string' ? cfg.proxy.trim() : '';
+        const rawSiteProxy = cfg && cfg.siteProxy && typeof cfg.siteProxy === 'object' && !Array.isArray(cfg.siteProxy) ? cfg.siteProxy : {};
+        const siteProxy = {};
+        for (const k of Object.keys(rawSiteProxy || {})) {
+            try {
+                const key = String(k || '').trim();
+                const val = rawSiteProxy[k];
+                if (!key) continue;
+                if (typeof val !== 'string') continue;
+                siteProxy[key] = val;
+            } catch (_) {}
+        }
+        return { proxy, siteProxy };
+    } catch (_) {
+        return { proxy: '', siteProxy: {} };
+    }
+}
+
+function sendProxyConfigToChild(childProc, proxyCfg) {
+    try {
+        if (!childProc || typeof childProc.send !== 'function') return;
+        if (childProc.killed) return;
+        const cfg = proxyCfg && typeof proxyCfg === 'object' ? proxyCfg : {};
+        childProc.send({ type: 'proxy_config', proxy: typeof cfg.proxy === 'string' ? cfg.proxy : '', siteProxy: cfg.siteProxy || {} });
+    } catch (_) {}
+}
+
+export function broadcastOnlineRuntimeProxyConfig({ rootDir } = {}) {
+    try {
+        const dir = rootDir ? path.resolve(String(rootDir)) : getRootDir();
+        const cfg = readProxyConfigFromRuntimeRoot(dir);
+        for (const { child } of children.values()) {
+            sendProxyConfigToChild(child, cfg);
+        }
+    } catch (_) {}
+}
+
 export async function startOnlineRuntime({
     id = 'default',
     port,
@@ -373,7 +414,16 @@ export async function startOnlineRuntime({
 		    } catch (_) {}
 		  } catch (_) {}
 				  globalThis.catServerFactory = (handle) => {
-				    const srv = http.createServer((req, res) => handle(req, res));
+				    const wrapped = (req, res) => {
+				      try {
+				        const site = __extractSiteFromReqUrl(req && req.url ? req.url : '');
+				        if (__siteAls && typeof __siteAls.run === 'function') {
+				          return __siteAls.run({ site }, () => handle(req, res));
+				        }
+				      } catch (_) {}
+				      return handle(req, res);
+				    };
+				    const srv = http.createServer((req, res) => wrapped(req, res));
 				    __stage('server_factory');
 				    try {
 				      srv.on('listening', () => {
@@ -468,6 +518,208 @@ export async function startOnlineRuntime({
 			      })();
 			      return { enabled, debug, targets };
 			    })();
+
+			    // Per-site proxy support:
+			    // - CATPAW_PROXY: global proxy (applies to all sites by default)
+			    // - CATPAW_SITE_PROXY: JSON object mapping { "<site>": "<proxyUrl|''>", "*": "<proxyUrl|''>" }
+			    // Runtime-toggle support: parent can update this state via IPC message { type: 'proxy_config', proxy, siteProxy }.
+			    const { AsyncLocalStorage } = (() => {
+			      try {
+			        return require('node:async_hooks');
+			      } catch (_) {
+			        return {};
+			      }
+			    })();
+			    const __siteAls = (() => {
+			      try {
+			        return AsyncLocalStorage ? new AsyncLocalStorage() : null;
+			      } catch (_) {
+			        return null;
+			      }
+			    })();
+
+			    const __proxyState = (() => {
+			      const parseJson = (t) => {
+			        try {
+			          const s = typeof t === 'string' ? t.trim() : '';
+			          if (!s) return null;
+			          const obj = JSON.parse(s);
+			          return obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : null;
+			        } catch (_) {
+			          return null;
+			        }
+			      };
+			      const normalizeProxy = (raw) => {
+			        try {
+			          let v = String(raw == null ? '' : raw).trim();
+			          if (!v) return '';
+			          // Allow shorthand "127.0.0.1:7890"
+			          const __schemeIdx = v.indexOf('://');
+			          const __hasScheme =
+			            __schemeIdx > 0 && /^[a-zA-Z][a-zA-Z0-9+.-]*$/.test(v.slice(0, __schemeIdx));
+			          if (!__hasScheme) v = 'http://' + v;
+			          return v;
+			        } catch (_) {
+			          return '';
+			        }
+			      };
+			      const globalProxy = normalizeProxy(process.env.CATPAW_PROXY || '');
+			      const bySiteRaw = parseJson(process.env.CATPAW_SITE_PROXY || '') || {};
+			      const bySite = {};
+			      for (const k of Object.keys(bySiteRaw || {})) {
+			        try {
+			          const key = String(k || '').trim();
+			          if (!key) continue;
+			          const val = bySiteRaw[k];
+			          if (typeof val !== 'string') continue;
+			          bySite[key] = normalizeProxy(val);
+			        } catch (_) {}
+			      }
+			      return { globalProxy, bySite };
+			    })();
+
+			    const __applyProxyConfig = (cfg) => {
+			      try {
+			        if (!cfg || typeof cfg !== 'object') return;
+			        const normalizeProxy = (raw) => {
+			          try {
+			            let v = String(raw == null ? '' : raw).trim();
+			            if (!v) return '';
+			            const __schemeIdx = v.indexOf('://');
+			            const __hasScheme =
+			              __schemeIdx > 0 && /^[a-zA-Z][a-zA-Z0-9+.-]*$/.test(v.slice(0, __schemeIdx));
+			            if (!__hasScheme) v = 'http://' + v;
+			            return v;
+			          } catch (_) {
+			            return '';
+			          }
+			        };
+			        if (Object.prototype.hasOwnProperty.call(cfg, 'proxy')) __proxyState.globalProxy = normalizeProxy(cfg.proxy);
+			        if (Object.prototype.hasOwnProperty.call(cfg, 'siteProxy')) {
+			          const raw = cfg.siteProxy;
+			          const next = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+			          const out = {};
+			          for (const k of Object.keys(next)) {
+			            const key = String(k || '').trim();
+			            if (!key) continue;
+			            const val = next[k];
+			            if (typeof val !== 'string') continue;
+			            out[key] = normalizeProxy(val);
+			          }
+			          __proxyState.bySite = out;
+			        }
+			      } catch (_) {}
+			    };
+
+			    try {
+			      process.on('message', (msg) => {
+			        try {
+			          if (!msg || typeof msg !== 'object') return;
+			          if (msg.type !== 'proxy_config') return;
+			          __applyProxyConfig(msg);
+			        } catch (_) {}
+			      });
+			    } catch (_) {}
+
+			    const __currentSite = () => {
+			      try {
+			        const st = __siteAls && typeof __siteAls.getStore === 'function' ? __siteAls.getStore() : null;
+			        return st && st.site ? String(st.site || '') : '';
+			      } catch (_) {
+			        return '';
+			      }
+			    };
+
+			    const __extractSiteFromReqUrl = (urlLike) => {
+			      try {
+			        const raw = String(urlLike || '');
+			        if (!raw) return '';
+			        const u = (() => {
+			          try {
+			            return new URL(raw, 'http://127.0.0.1');
+			          } catch (_) {
+			            return null;
+			          }
+			        })();
+			        const p = u ? String(u.pathname || '') : raw;
+			        if (!p.startsWith('/spider/')) return '';
+			        const parts = p.split('/');
+			        if (parts.length < 3) return '';
+			        const seg = parts[2] || '';
+			        try {
+			          return decodeURIComponent(seg);
+			        } catch (_) {
+			          return String(seg);
+			        }
+			      } catch (_) {
+			        return '';
+			      }
+			    };
+
+			    const __isLocalHostForProxy = (hostLike) => {
+			      try {
+			        const h = String(hostLike || '').trim().toLowerCase();
+			        return h === '127.0.0.1' || h === 'localhost' || h === '0.0.0.0' || h === '::1';
+			      } catch (_) {
+			        return false;
+			      }
+			    };
+
+			    const __pickProxyForHost = (host) => {
+			      try {
+			        const h = String(host || '').trim().toLowerCase();
+			        if (!h || __isLocalHostForProxy(h)) return '';
+			        const site = __currentSite();
+			        const map = __proxyState && __proxyState.bySite ? __proxyState.bySite : {};
+			        if (site && Object.prototype.hasOwnProperty.call(map, site)) return String(map[site] || '');
+			        if (Object.prototype.hasOwnProperty.call(map, '*')) return String(map['*'] || '');
+			        return __proxyState && typeof __proxyState.globalProxy === 'string' ? __proxyState.globalProxy : '';
+			      } catch (_) {
+			        return '';
+			      }
+			    };
+
+			    const __nodeProxyAgents = new Map();
+			    const __getNodeProxyAgent = (proxyUrl) => {
+			      try {
+			        const p = String(proxyUrl || '').trim();
+			        if (!p) return null;
+			        const cached = __nodeProxyAgents.get(p);
+			        if (cached) return cached;
+			        const mod = require('https-proxy-agent');
+			        const HttpsProxyAgent = mod && (mod.HttpsProxyAgent || mod);
+			        if (typeof HttpsProxyAgent !== 'function') return null;
+			        const agent = new HttpsProxyAgent(p);
+			        __nodeProxyAgents.set(p, agent);
+			        return agent;
+			      } catch (_) {
+			        return null;
+			      }
+			    };
+
+			    const __fetchProxyDispatchers = new Map();
+			    const __getFetchProxyDispatcher = (proxyUrl) => {
+			      try {
+			        const p = String(proxyUrl || '').trim();
+			        if (!p) return null;
+			        const cached = __fetchProxyDispatchers.get(p);
+			        if (cached) return cached;
+			        const undici = (() => {
+			          try {
+			            return require('undici');
+			          } catch (_) {
+			            return null;
+			          }
+			        })();
+			        const ProxyAgent = undici && undici.ProxyAgent ? undici.ProxyAgent : null;
+			        if (typeof ProxyAgent !== 'function') return null;
+			        const dispatcher = new ProxyAgent(p);
+			        __fetchProxyDispatchers.set(p, dispatcher);
+			        return dispatcher;
+			      } catch (_) {
+			        return null;
+			      }
+			    };
 			    const __mockEnabled = () => {
 			      try {
 			        return !!(__mockState && __mockState.enabled);
@@ -1990,6 +2242,43 @@ export async function startOnlineRuntime({
 				        };
 			      }
 				    } catch (_) {}
+
+						    // Best-effort per-site proxy for scripts using fetch (Node 18+ / undici).
+						    // Wrap whatever fetch currently is (may already include CATPAW_MOCK behavior).
+						    try {
+						      if (typeof globalThis.fetch === 'function' && !globalThis.__catpaw_proxy_fetch_patched) {
+						        globalThis.__catpaw_proxy_fetch_patched = true;
+						        const __origFetchProxy = globalThis.fetch.bind(globalThis);
+						        globalThis.fetch = function proxiedFetch(input, init) {
+						          try {
+						            const url =
+						              typeof input === 'string'
+						                ? input
+						                : input && typeof input === 'object' && typeof input.url === 'string'
+						                  ? input.url
+						                  : '';
+						            const host = (() => {
+						              try {
+						                return String(new URL(String(url || '')).hostname || '').toLowerCase();
+						              } catch (_) {
+						                return '';
+						              }
+						            })();
+						            const proxyUrl = __pickProxyForHost(host);
+						            if (proxyUrl) {
+						              const dispatcher = __getFetchProxyDispatcher(proxyUrl);
+						              if (dispatcher) {
+						                const nextInit = init && typeof init === 'object' ? { ...init } : {};
+						                if (!nextInit.dispatcher) nextInit.dispatcher = dispatcher;
+						                return __origFetchProxy(input, nextInit);
+						              }
+						            }
+						          } catch (_) {}
+						          return __origFetchProxy(input, init);
+						        };
+						      }
+						    } catch (_) {}
+
 						    /* Tape (record/replay) for scripts using fetch (undici).
 						    try {
 						      if (__tapeMode !== 'off' && __tapeTargets && __tapeTargets.size && typeof globalThis.fetch === 'function' && !globalThis.__catpaw_tape_fetch_patched) {
@@ -2455,6 +2744,42 @@ export async function startOnlineRuntime({
 		              }
 		            }
 		          }
+	        } catch (_) {}
+
+	        // Per-site proxy: set a proxy agent based on current spider site.
+	        try {
+	          const proxyUrl = __pickProxyForHost(host);
+	          if (proxyUrl) {
+	            const agent = __getNodeProxyAgent(proxyUrl);
+	            if (agent) {
+	              // Prefer not to override a caller-specified agent.
+	              if (options && typeof options === 'object' && !Array.isArray(options) && !(options instanceof URL)) {
+	                if (!options.agent) options.agent = agent;
+	              } else if (typeof options === 'string') {
+	                try {
+	                  const u = new URL(options);
+	                  options = {
+	                    protocol: u.protocol,
+	                    hostname: u.hostname,
+	                    port: u.port || (u.protocol === 'https:' ? 443 : 80),
+	                    path: String(u.pathname || '/') + String(u.search || ''),
+	                    agent,
+	                  };
+	                } catch (_) {}
+	              } else if (options && typeof options === 'object' && options instanceof URL) {
+	                try {
+	                  const u = options;
+	                  options = {
+	                    protocol: u.protocol,
+	                    hostname: u.hostname,
+	                    port: u.port || (u.protocol === 'https:' ? 443 : 80),
+	                    path: String(u.pathname || '/') + String(u.search || ''),
+	                    agent,
+	                  };
+	                } catch (_) {}
+	              }
+	            }
+	          }
 	        } catch (_) {}
 
 	        const req = orig.call(mod, options, cb);
@@ -3027,6 +3352,7 @@ export async function startOnlineRuntime({
 				    for (let attempt = 0; attempt < 6; attempt += 1) {
 				        const baseEnv = { ...process.env };
 				        const panMockCfg = readPanMockConfigFromRuntimeRoot(rootDir);
+                        const proxyCfg = readProxyConfigFromRuntimeRoot(rootDir);
 				        const resolvedEntryFn = typeof entryFn === 'string' ? entryFn.trim() : '';
 				        const child = spawn(process.execPath, [bootstrapPath], {
 				            stdio,
@@ -3041,12 +3367,21 @@ export async function startOnlineRuntime({
 			                ONLINE_ENTRY_FN: resolvedEntryFn,
 			                ONLINE_CWD: rootDir,
 				                CATPAW_DEBUG_LOG: onlineLogPath,
+                                CATPAW_PROXY: typeof proxyCfg.proxy === 'string' ? proxyCfg.proxy : '',
+                                CATPAW_SITE_PROXY: (() => {
+                                    try {
+                                        return JSON.stringify(proxyCfg.siteProxy || {});
+                                    } catch (_) {
+                                        return '{}';
+                                    }
+                                })(),
 				                NODE_PATH: rootDir,
 				            },
 				        });
 				        children.set(key, { child, entry, port: chosenPort });
 				        // Push initial mock config (can be toggled later without restarting via IPC).
 				        sendMockConfigToChild(child, panMockCfg);
+                        sendProxyConfigToChild(child, proxyCfg);
 
 	    // When debugging online runtimes, capture child output:
 	    // - dev: if CATPAW_LOG_FILE is set, forward to parent stdout/stderr (which are already redirected to file in dev.js)

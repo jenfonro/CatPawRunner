@@ -36,6 +36,7 @@ npm run dev
 常用字段：
 
 - `proxy`: 全局代理（字符串，空串表示不启用）
+- `siteProxy`: 按“站点”走代理（对象；key 为站点名，value 为代理地址字符串；空串表示该站点强制不走代理）
 - `pan_mock`: 是否开启“网盘 mock/拦截”（布尔；启动时若缺失会自动写回 `false`；支持运行中切换）
 - `panBuiltinResolverEnabled`: 是否启用内置网盘解析 API
 - `onlineConfigs`: 在线脚本配置（会下载到 `custom_spider/` 并启动子进程 runtime）
@@ -44,6 +45,27 @@ npm run dev
 
 - `GET /admin/settings`
 - `PUT /admin/settings`
+
+#### `siteProxy` 示例
+
+```json
+{
+  "proxy": "http://127.0.0.1:7890",
+  "siteProxy": {
+    "*": "http://127.0.0.1:7890",
+    "某个站点": "",
+    "另一个站点": "http://127.0.0.1:7891"
+  }
+}
+```
+
+优先级（从高到低）：
+
+1. `siteProxy[站点名]`（存在即生效；空串表示禁用代理）
+2. `siteProxy["*"]`
+3. `proxy`（全局）
+
+> 站点名来自请求路径 `/spider/<site>/...` 中的 `<site>`。
 
 > `pan_mock`：可通过 `PUT /admin/settings` 在不重启 online runtime 子进程的情况下切换 mock 拦截开关（通过 IPC 下发配置，通常秒级生效）。
 
