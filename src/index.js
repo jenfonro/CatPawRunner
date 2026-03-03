@@ -9,6 +9,7 @@ import {
     stopAllOnlineRuntimes,
     broadcastOnlineRuntimeMockConfig,
     broadcastOnlineRuntimeProxyConfig,
+    withOnlineRuntimeOpsLock,
 } from './util/onlineRuntime.js';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -33,7 +34,7 @@ function installShutdownHooks() {
         try {
             if (reason) {
                 // eslint-disable-next-line no-console
-                console.log(`[catpawopen] shutting down (${reason})...`);
+                console.log(`[catpawrunner] shutting down (${reason})...`);
             }
         } catch (_) {}
         try {
@@ -92,9 +93,9 @@ function installShutdownHooks() {
     } catch (_) {}
 }
 
-let cachedCatPawOpenVersion = '';
+let cachedcatpawrunnerVersion = '';
 const DEV_BUILD_STAMP = Date.now();
-function resolveCatPawOpenVersion() {
+function resolvecatpawrunnerVersion() {
     // In local dev (`npm run dev`), prefer a beta version so API responses don't look like a release build.
     // Keep it stable per process (not per request).
     try {
@@ -104,21 +105,21 @@ function resolveCatPawOpenVersion() {
         }
     } catch (_) {}
     // Prefer build-time injected version (set by the build pipeline).
-    // See `esbuild.js` which defines `globalThis.__CATPAWOPEN_BUILD_VERSION__`.
+    // See `esbuild.js` which defines `globalThis.__CATPAWRUNNER_BUILD_VERSION__`.
     try {
-        const v = globalThis && typeof globalThis.__CATPAWOPEN_BUILD_VERSION__ === 'string' ? globalThis.__CATPAWOPEN_BUILD_VERSION__ : '';
+        const v = globalThis && typeof globalThis.__CATPAWRUNNER_BUILD_VERSION__ === 'string' ? globalThis.__CATPAWRUNNER_BUILD_VERSION__ : '';
         if (v && String(v).trim()) return String(v).trim();
     } catch (_) {}
-    if (cachedCatPawOpenVersion) return cachedCatPawOpenVersion;
+    if (cachedcatpawrunnerVersion) return cachedcatpawrunnerVersion;
     try {
         const here = path.dirname(fileURLToPath(import.meta.url));
         const pkgPath = path.resolve(here, '..', 'package.json');
         const raw = fs.readFileSync(pkgPath, 'utf8');
         const parsed = raw && raw.trim() ? JSON.parse(raw) : null;
         const v = parsed && typeof parsed.version === 'string' ? parsed.version.trim() : '';
-        if (v) cachedCatPawOpenVersion = v;
+        if (v) cachedcatpawrunnerVersion = v;
     } catch (_) {}
-    return cachedCatPawOpenVersion || '';
+    return cachedcatpawrunnerVersion || '';
 }
 
 /**
@@ -179,7 +180,7 @@ export async function start(config) {
     // - Arrays: wrap as `{ version, data: [...] }`
     server.addHook('preSerialization', async (_request, _reply, payload) => {
         try {
-            const version = resolveCatPawOpenVersion();
+            const version = resolvecatpawrunnerVersion();
             if (!version) return payload;
             if (payload == null) return payload;
             if (Buffer.isBuffer(payload) || payload instanceof Uint8Array) return payload;
@@ -290,65 +291,56 @@ export async function start(config) {
     server.register(router);
 
     const syncAndMaybeRestartOnline = async (reason) => {
-        try {
-            const res = await applyOnlineConfigs({rootDir: runtimeRoot});
-            if (res && res.skipped) {
-                // Config does not manage online scripts; keep legacy behavior (run whatever exists in custom_spider/).
-                const p = await findAvailablePortInRange(30000, 39999);
-                const started = await startOnlineRuntime({ id: 'default', port: p });
-                if (started && started.port) onlineRuntimePorts.set('default', started.port);
-                else onlineRuntimePorts.delete('default');
-                onlineLastEntry = started && started.entry ? started.entry : onlineLastEntry;
-                return;
-            }
-            const nextEntry = res && typeof res.entry === 'string' ? res.entry : '';
-
-            // Stop runtime when no configs remain.
-            if (!nextEntry) {
-                stopAllOnlineRuntimes();
-                onlineRuntimePorts.clear();
-                onlineLastEntry = '';
-                return;
-            }
-
-            const desired = Array.isArray(res.resolved) ? res.resolved.filter((r) => r && r.ok && r.id && r.destPath) : [];
-            const desiredIds = new Set(desired.map((r) => String(r.id)));
-
-            // Stop removed runtimes.
-            for (const [id] of onlineRuntimePorts.entries()) {
-                if (!desiredIds.has(id)) {
-                    stopOnlineRuntime(id);
-                    onlineRuntimePorts.delete(id);
+        return withOnlineRuntimeOpsLock(async () => {
+            try {
+                const res = await applyOnlineConfigs({rootDir: runtimeRoot});
+                if (res && res.skipped) {
+                    // Config does not manage online scripts; keep legacy behavior (run whatever exists in custom_spider/).
+                    const p = await findAvailablePortInRange(30000, 39999);
+                    const started = await startOnlineRuntime({ id: 'default', port: p });
+                    if (started && started.port) onlineRuntimePorts.set('default', started.port);
+                    else onlineRuntimePorts.delete('default');
+                    onlineLastEntry = started && started.entry ? started.entry : onlineLastEntry;
+                    return;
                 }
-            }
+                const nextEntry = res && typeof res.entry === 'string' ? res.entry : '';
 
-            // Start/restart desired runtimes.
-            for (const r of desired) {
-                const id = String(r.id);
-                const curPort = onlineRuntimePorts.get(id);
-                const needPort = !curPort;
-                const port = needPort ? await findAvailablePortInRange(30000, 39999) : curPort;
-                const shouldRestart = needPort || !!r.downloaded;
-                if (shouldRestart) {
-                    try {
+                // Stop runtime when no configs remain.
+                if (!nextEntry) {
+                    stopAllOnlineRuntimes();
+                    onlineRuntimePorts.clear();
+                    onlineLastEntry = '';
+                    return;
+                }
+
+                const desired = Array.isArray(res.resolved) ? res.resolved.filter((r) => r && r.ok && r.id && r.destPath) : [];
+                const desiredIds = new Set(desired.map((r) => String(r.id)));
+
+                // Stop removed runtimes.
+                for (const [id] of onlineRuntimePorts.entries()) {
+                    if (!desiredIds.has(id)) {
                         stopOnlineRuntime(id);
-                    } catch (_) {}
-                    const started = await startOnlineRuntime({ id, port, entry: r.destPath, entryFn: r.entryFn || '' });
-                    if (started && started.port) onlineRuntimePorts.set(id, started.port);
-                    else onlineRuntimePorts.delete(id);
-                } else {
-                    // Ensure it is running (best-effort).
+                        onlineRuntimePorts.delete(id);
+                    }
+                }
+
+                // Start/restart desired runtimes.
+                for (const r of desired) {
+                    const id = String(r.id);
+                    const curPort = onlineRuntimePorts.get(id);
+                    const needPort = !curPort;
+                    const port = needPort ? await findAvailablePortInRange(30000, 39999) : curPort;
                     const started = await startOnlineRuntime({ id, port, entry: r.destPath, entryFn: r.entryFn || '' });
                     if (started && started.port) onlineRuntimePorts.set(id, started.port);
                     else onlineRuntimePorts.delete(id);
                 }
-            }
 
-            onlineLastEntry = nextEntry;
-        } catch (e) {
-            const msg = e && e.message ? String(e.message) : String(e);
-            console.log(`[online] sync failed${reason ? ` (${reason})` : ''}: ${msg}`);
-        }
+                onlineLastEntry = nextEntry;
+            } catch (e) {
+                const msg = e && e.message ? String(e.message) : String(e);
+                console.log(`[online] sync failed${reason ? ` (${reason})` : ''}: ${msg}`);
+            }
+        });
     };
 
     // Apply once on startup.

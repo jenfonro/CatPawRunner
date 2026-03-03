@@ -39,7 +39,7 @@ fi
 TARGET="node18-linuxstatic-arm64"
 
 echo "[build] packaging single-file binary via pkg (${TARGET})..."
-OUT_NAME="catpawopen_linux-musl_arm64"
+OUT_NAME="catpawrunner_linux-musl_arm64"
 OUT_PATH="$OUT_DIR/$OUT_NAME"
 rm -f "$OUT_PATH" "$OUT_PATH.exe"
 

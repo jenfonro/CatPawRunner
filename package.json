@@ -6,19 +6,19 @@
     "scripts": {
         "dev": "cross-env nodemon --config nodemon.json src/dev.js",
         "_build": "rimraf dist && node esbuild.js && node esbuild-config.js",
-        "build": "cross-env NODE_ENV=production npm run _build && node copyDist.js D:\\soft\\CatPawOpen\\data\\flutter_assets\\asset\\js",
-        "build:copy": "cross-env NODE_ENV=production npm run _build && node copyDist.js D:\\soft\\CatPawOpen\\data\\flutter_assets\\asset\\js",
-        "build:dbg:copy": "cross-env NODE_ENV=development npm run _build && node copyDist.js D:\\soft\\CatPawOpen\\data\\flutter_assets\\asset\\js",
+        "build": "cross-env NODE_ENV=production npm run _build && node copyDist.js D:\\soft\\catpawrunner\\data\\flutter_assets\\asset\\js",
+        "build:copy": "cross-env NODE_ENV=production npm run _build && node copyDist.js D:\\soft\\catpawrunner\\data\\flutter_assets\\asset\\js",
+        "build:dbg:copy": "cross-env NODE_ENV=development npm run _build && node copyDist.js D:\\soft\\catpawrunner\\data\\flutter_assets\\asset\\js",
         "build:dbg": "cross-env NODE_ENV=development npm run _build",
         "build:config": "cross-env NODE_ENV=production node esbuild-config.js",
         "build:rollup(obsolete)": "rimraf dist && cross-env NODE_ENV=production node rollup.js && cross-env NODE_ENV=production node rollup-config.js",
         "build:rollup:config(obsolete)": "cross-env NODE_ENV=production node rollup-config.js",
-        "build-old:dbg:copy": "rimraf dist && cross-env NODE_ENV=development node esbuild.js && cross-env NODE_ENV=development node esbuild-config.js && node copyDist.js D:\\soft\\CatPawOpen\\data\\flutter_assets\\asset\\js"
+        "build-old:dbg:copy": "rimraf dist && cross-env NODE_ENV=development node esbuild.js && cross-env NODE_ENV=development node esbuild-config.js && node copyDist.js D:\\soft\\catpawrunner\\data\\flutter_assets\\asset\\js"
     },
     "engines": {
         "node": ">17 <23"
     },
-    "repository": "https://github.com/hjdhnx/CatPawOpen/tree/ds-cat",
+    "repository": "https://github.com/hjdhnx/catpawrunner/tree/ds-cat",
     "author": "道长",
     "description": "道长修仙，法力无边。一统江湖，只需半年。\n君子袒蛋蛋，小人藏鸡鸡。",
     "license": "MIT",

@@ -696,7 +696,7 @@ export default async function router(fastify) {
         }
     );
 
-    // If a route is not handled by CatPawOpen, proxy it to the online runtime (default: 9988).
+    // If a route is not handled by catpawrunner, proxy it to the online runtime (default: 9988).
     // This allows downloaded scripts in `custom_spider/` to expose their own routes while still being accessed from this port.
     const proxyToPort = async function (request, reply, targetPort, urlPath) {
         const pathToUse = typeof urlPath === 'string' && urlPath ? urlPath : '/';
