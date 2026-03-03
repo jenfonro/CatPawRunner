@@ -595,7 +595,7 @@ const apiPlugins = [
       });
 
       // Return "original sources" playlist (not proxied), but normalize all URIs to absolute
-      // so hls.js can resolve segments correctly even when this playlist is served from CatPawOpen.
+      // so hls.js can resolve segments correctly even when this playlist is served from catpawrunner.
       fastify.get('/:token/index.m3u8', async function (request, reply) {
         const token = safeTrim(request && request.params ? request.params.token : '');
         if (!token) return apiError(reply, 404, 'not found');
@@ -610,7 +610,7 @@ const apiPlugins = [
         return normalized;
       });
 
-      // Return proxied playlist (segments/key/child playlists are rewritten to CatPawOpen proxy endpoints).
+      // Return proxied playlist (segments/key/child playlists are rewritten to catpawrunner proxy endpoints).
       fastify.get('/:token/proxy.m3u8', async function (request, reply) {
         const token = safeTrim(request && request.params ? request.params.token : '');
         if (!token) return apiError(reply, 404, 'not found');

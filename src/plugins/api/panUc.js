@@ -1885,7 +1885,7 @@ const apiPlugins = [
             : (playUrl ? playSource : downloadSource);
           const chosenHeader = preferDownload ? (downloadUrl ? downloadHeader : playHeader) : (playUrl ? playHeader : downloadHeader);
 
-          // `version` is injected globally by CatPawOpen server preSerialization hook (see `src/index.js`).
+          // `version` is injected globally by catpawrunner server preSerialization hook (see `src/index.js`).
           const resp = { ok: true, url: chosenUrl };
           if (chosenSource === 'cookie' && chosenHeader) resp.header = chosenHeader;
           return resp;

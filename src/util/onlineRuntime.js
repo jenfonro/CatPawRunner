@@ -6,6 +6,7 @@ import { findAvailablePortInRange } from './tool.js';
 
 const children = new Map(); // id -> { child, entry, port }
 const starting = new Map(); // id -> Promise<startResult>
+let runtimeOpsQueue = Promise.resolve();
 
 function getRootDir() {
     // Prefer the executable directory for pkg builds so `db.json` can sit next to the exe.
@@ -3348,6 +3349,8 @@ export async function startOnlineRuntime({
 
 		    const onlineLogPath = wantDebug ? path.resolve(rootDir, `online-runtime.${key}.log`) : '';
 		    let chosenPort = p;
+            let lastFailureReason = '';
+            let lastFailureStage = '';
 
 				    for (let attempt = 0; attempt < 6; attempt += 1) {
 				        const baseEnv = { ...process.env };
@@ -3475,7 +3478,7 @@ export async function startOnlineRuntime({
 		                    ? `spawn_error:${String(ready.spawnError.code)}`
 		                    : ready && ready.spawnError && ready.spawnError.message
 		                      ? 'spawn_error'
-		                      : 
+		                      :
 		                ready && ready.listenError && ready.listenError.code
 		                    ? `listen_error:${String(ready.listenError.code)}`
 		                    : ready && ready.timeout
@@ -3485,6 +3488,8 @@ export async function startOnlineRuntime({
 		                        : ready && ready.signal
 		                          ? `signal:${String(ready.signal)}`
 		                        : 'unknown';
+                    lastFailureReason = reason;
+                    lastFailureStage = ready && ready.lastStage ? String(ready.lastStage) : '';
 	            // eslint-disable-next-line no-console
 	            console.error(
 	                `${logPrefix} runtime not ready: id=${key} entry=${path.basename(entry)} port=${chosenPort} reason=${reason}` +
@@ -3517,17 +3522,41 @@ export async function startOnlineRuntime({
         if (cur && cur.child === child) children.delete(key);
 
         const code = ready && ready.listenError && ready.listenError.code ? String(ready.listenError.code) : '';
-        if (code === 'EADDRINUSE') {
-            // Retry with a different port.
+        const signal = ready && ready.signal ? String(ready.signal) : '';
+        const canRetryTransient = code === 'EADDRINUSE' || signal === 'SIGTERM';
+        if (canRetryTransient && attempt < 5) {
+            // Retry transient startup interruptions:
+            // - EADDRINUSE: pick another port
+            // - SIGTERM: startup was interrupted by external lifecycle events
+            try {
+                // eslint-disable-next-line no-console
+                console.warn(
+                    `${logPrefix} runtime retry: id=${key} entry=${path.basename(entry)} reason=${code || signal || 'transient'} attempt=${attempt + 1}`
+                );
+            } catch (_) {}
             // eslint-disable-next-line no-await-in-loop
             chosenPort = await findAvailablePortInRange(30000, 39999);
             continue;
         }
 
-        return { started: false, port: 0, entry: '' };
+        return {
+            started: false,
+            port: 0,
+            entry: '',
+            id: key,
+            reason: lastFailureReason || 'runtime_not_ready',
+            lastStage: lastFailureStage || '',
+        };
     }
 
-    return { started: false, port: 0, entry: '' };
+    return {
+        started: false,
+        port: 0,
+        entry: '',
+        id: key,
+        reason: lastFailureReason || 'runtime_not_ready',
+        lastStage: lastFailureStage || '',
+    };
     })();
 
     starting.set(key, startPromise);
@@ -3560,4 +3589,12 @@ export function stopAllOnlineRuntimes() {
         } catch (_) {}
     });
     return true;
+}
+
+export async function withOnlineRuntimeOpsLock(task) {
+    const fn = typeof task === 'function' ? task : async () => null;
+    const run = runtimeOpsQueue.then(() => fn());
+    // Keep queue alive even if a task fails.
+    runtimeOpsQueue = run.catch(() => {});
+    return run;
 }

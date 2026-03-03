@@ -10,6 +10,7 @@ import {
     stopAllOnlineRuntimes,
     broadcastOnlineRuntimeMockConfig,
     broadcastOnlineRuntimeProxyConfig,
+    withOnlineRuntimeOpsLock,
 } from '../../util/onlineRuntime.js';
 
 function resolveRuntimeRootDir() {
@@ -275,6 +276,73 @@ function readOnlineConfigsFromConfig(root) {
         .filter((it) => it.url);
 }
 
+async function readRuntimeHealthById(fastify, items = []) {
+    const out = new Map();
+    try {
+        const list = Array.isArray(items) ? items : [];
+        const portsMap =
+            fastify && fastify.onlineRuntimePorts && typeof fastify.onlineRuntimePorts.get === 'function'
+                ? fastify.onlineRuntimePorts
+                : null;
+        if (!portsMap) return out;
+
+        const ids = Array.from(
+            new Set(
+                list
+                    .map((it) => (it && typeof it.id === 'string' ? it.id.trim() : ''))
+                    .filter(Boolean)
+            )
+        );
+        for (const id of ids) {
+            const port = Number(portsMap.get(id) || 0);
+            if (!Number.isFinite(port) || port <= 0) continue;
+            try {
+                // Keep this short; this endpoint is used by dashboard refresh.
+                // eslint-disable-next-line no-await-in-loop
+                const cfg = await httpGetJson(`http://127.0.0.1:${port}/full-config`, { timeoutMs: 1500 });
+                if (cfg && typeof cfg === 'object') out.set(id, true);
+            } catch (_) {}
+        }
+    } catch (_) {}
+    return out;
+}
+
+async function waitRuntimeReadyById(fastify, runtimeId, options = {}) {
+    const id = typeof runtimeId === 'string' ? runtimeId.trim() : '';
+    if (!id) return { ok: false, message: 'invalid runtime id', port: 0 };
+    const portsMap =
+        fastify && fastify.onlineRuntimePorts && typeof fastify.onlineRuntimePorts.get === 'function'
+            ? fastify.onlineRuntimePorts
+            : null;
+    if (!portsMap) return { ok: false, message: 'onlineRuntimePorts not available', port: 0 };
+
+    const timeoutMs = Number.isFinite(Number(options.timeoutMs)) ? Math.max(500, Math.trunc(Number(options.timeoutMs))) : 30000;
+    const probeTimeoutMs = Number.isFinite(Number(options.probeTimeoutMs))
+        ? Math.max(200, Math.trunc(Number(options.probeTimeoutMs)))
+        : 2000;
+    const intervalMs = Number.isFinite(Number(options.intervalMs)) ? Math.max(100, Math.trunc(Number(options.intervalMs))) : 500;
+
+    const deadline = Date.now() + timeoutMs;
+    let lastErr = 'unreachable';
+    while (Date.now() < deadline) {
+        const port = Number(portsMap.get(id) || 0);
+        if (Number.isFinite(port) && port > 0) {
+            try {
+                // eslint-disable-next-line no-await-in-loop
+                const cfg = await httpGetJson(`http://127.0.0.1:${port}/full-config`, { timeoutMs: probeTimeoutMs });
+                if (cfg && typeof cfg === 'object') return { ok: true, message: '', port };
+                lastErr = 'invalid full-config';
+            } catch (e) {
+                lastErr = e && e.message ? String(e.message) : 'unreachable';
+            }
+        }
+        // eslint-disable-next-line no-await-in-loop
+        await sleep(intervalMs);
+    }
+    const finalPort = Number(portsMap.get(id) || 0);
+    return { ok: false, message: lastErr || 'timeout', port: Number.isFinite(finalPort) ? finalPort : 0 };
+}
+
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.trunc(Number(ms) || 0))));
 }
@@ -409,46 +477,8 @@ function unwrapWebsiteResp(raw) {
     return { ok: true, data: obj, message: '' };
 }
 
-async function checkRuntimeHealthy(port, runtimeId, entryBaseName) {
-    const p = Number.isFinite(Number(port)) ? Math.max(1, Math.trunc(Number(port))) : 0;
-    if (!p) return { ok: false, message: 'invalid port' };
-
-    const totalTimeoutMs = 30000;
-    const perTryTimeoutMs = 2500;
-    const retryDelayMs = 500;
-
-    // Wait for the child server to start accepting connections.
-    // Keep total wait bounded to avoid blocking the dashboard too long.
-    const deadline = Date.now() + totalTimeoutMs;
-    let lastErrMsg = 'unreachable';
-    while (true) {
-        const remainingMs = deadline - Date.now();
-        if (remainingMs <= 0) {
-            return {
-                ok: false,
-                message: lastErrMsg || 'timeout',
-                runtime: { id: runtimeId, port: p, entry: entryBaseName },
-            };
-        }
-
-        const tryTimeoutMs = Math.max(100, Math.min(perTryTimeoutMs, remainingMs - 100));
-        try {
-            // eslint-disable-next-line no-await-in-loop
-            const cfg = await httpGetJson(`http://127.0.0.1:${p}/full-config`, { timeoutMs: tryTimeoutMs });
-            if (cfg && typeof cfg === 'object') {
-                return { ok: true, message: '', runtime: { id: runtimeId, port: p, entry: entryBaseName } };
-            }
-        } catch (e) {
-            lastErrMsg = e && e.message ? String(e.message) : 'unreachable';
-        }
-
-        const sleepMs = Math.min(retryDelayMs, Math.max(0, deadline - Date.now()));
-        // eslint-disable-next-line no-await-in-loop
-        await sleep(sleepMs);
-    }
-}
-
 async function syncOnlineRuntimesNow(fastify, rootDir) {
+    return withOnlineRuntimeOpsLock(async () => {
     const res = await applyOnlineConfigs({ rootDir });
 
     const desired = Array.isArray(res && res.resolved) ? res.resolved.filter((r) => r && r.id) : [];
@@ -480,18 +510,24 @@ async function syncOnlineRuntimesNow(fastify, rootDir) {
         const needPort = !curPort;
         const port = needPort ? await findAvailablePortInRange(30000, 39999) : curPort;
         const shouldRestart = needPort || !!r.downloaded;
-        if (shouldRestart) {
-            try {
-                stopOnlineRuntime(id);
-            } catch (_) {}
-        }
+        // Let startOnlineRuntime own restart sequencing (including replacing old child).
         const started = await startOnlineRuntime({ id, port, entry: r.destPath, entryFn: r.entryFn || '' });
         if (started && started.port) portsMap.set(id, started.port);
         else portsMap.delete(id);
-        runtimes.push({ id, port: started && started.port ? started.port : port, entry: r.destPath, ok: !!(started && started.port) });
+        runtimes.push({
+            id,
+            port: started && started.port ? started.port : port,
+            entry: r.destPath,
+            ok: !!(started && started.port),
+            restarted: shouldRestart,
+            updated: !!r.downloaded,
+            message: started && started.reason ? String(started.reason) : '',
+            lastStage: started && started.lastStage ? String(started.lastStage) : '',
+        });
     }
 
     return { ok: true, applied: res, runtimes };
+    });
 }
 
 async function handleAdminFullConfig(fastify, reply) {
@@ -566,10 +602,23 @@ export const apiPlugins = [
                 const rootDir = resolveRuntimeRootDir();
                 const cfgPath = path.resolve(rootDir, 'config.json');
                 const cfg = readJsonFileSafe(cfgPath) || {};
+                const onlineConfigsRaw = readOnlineConfigsFromConfig(cfg);
+                const runtimeHealth = await readRuntimeHealthById(fastify, onlineConfigsRaw);
+                const onlineConfigs = onlineConfigsRaw.map((it) => {
+                    if (!it || typeof it !== 'object') return it;
+                    const id = typeof it.id === 'string' ? it.id.trim() : '';
+                    if (!id || !runtimeHealth.get(id)) return it;
+                    // If runtime is currently reachable, avoid stale persisted "runtime failed".
+                    const next = { ...it, status: 'pass' };
+                    try {
+                        delete next.message;
+                    } catch (_) {}
+                    return next;
+                });
                 return reply.send({
                     success: true,
                     settings: readSettingsFromConfig(cfg),
-                    onlineConfigs: readOnlineConfigsFromConfig(cfg),
+                    onlineConfigs,
                 });
             });
 
@@ -628,23 +677,11 @@ export const apiPlugins = [
                         if (!norm || !norm.url) continue;
                         const prevMatch = prevByUrl.get(norm.url);
                         const prevId = prevMatch && typeof prevMatch.id === 'string' && prevMatch.id.trim() ? prevMatch.id.trim() : '';
-                        const prevStatus =
-                            prevMatch && typeof prevMatch.status === 'string' && prevMatch.status.trim()
-                                ? prevMatch.status.trim()
-                                : '';
-                        const prevMessage =
-                            prevMatch && typeof prevMatch.message === 'string' && prevMatch.message.trim()
-                                ? prevMatch.message.trim()
-                                : '';
-                        const prevCheckedAt =
-                            prevMatch && Number.isFinite(Number(prevMatch.checkedAt)) ? Math.trunc(Number(prevMatch.checkedAt)) : 0;
                         out.push({
                             url: norm.url,
                             name: norm.name || '',
                             ...(prevId ? { id: prevId } : {}),
-                            ...(prevStatus ? { status: prevStatus } : { status: 'unchecked' }),
-                            ...(prevMessage ? { message: prevMessage } : {}),
-                            ...(prevCheckedAt > 0 ? { checkedAt: prevCheckedAt } : {}),
+                            status: 'unchecked',
                         });
                     }
                     next.onlineConfigs = out;
@@ -671,6 +708,12 @@ export const apiPlugins = [
                         const sync = await syncOnlineRuntimesNow(fastify, rootDir);
                         const applied = sync && sync.applied ? sync.applied : null;
                         const resolved = applied && Array.isArray(applied.resolved) ? applied.resolved : [];
+                        const runtimes = sync && Array.isArray(sync.runtimes) ? sync.runtimes : [];
+                        const runtimeById = new Map(
+                            runtimes
+                                .filter((r) => r && typeof r === 'object' && typeof r.id === 'string' && r.id.trim())
+                                .map((r) => [r.id.trim(), r])
+                        );
 
                         onlineResults = [];
                         for (const it of resolved) {
@@ -691,52 +734,53 @@ export const apiPlugins = [
                                 continue;
                             }
 
-                            const port =
-                                fastify && fastify.onlineRuntimePorts && typeof fastify.onlineRuntimePorts.get === 'function'
-                                    ? fastify.onlineRuntimePorts.get(id)
-                                    : null;
+                            const rt = id ? runtimeById.get(id) : null;
+                            let rtOk = !!(rt && rt.ok);
+                            let rtPort = rt && Number.isFinite(Number(rt.port)) ? Math.max(1, Math.trunc(Number(rt.port))) : 0;
                             const entryBase = it.destPath ? path.basename(String(it.destPath)) : '';
-                            const health = await checkRuntimeHealthy(port, id, entryBase);
+                            let rtMessage =
+                                rt && typeof rt.message === 'string' && rt.message.trim()
+                                    ? rt.message.trim()
+                                    : rt && typeof rt.lastStage === 'string' && rt.lastStage.trim()
+                                      ? `runtime not ready (stage=${rt.lastStage.trim()})`
+                                      : 'runtime_not_ready';
+
+                            // Restart handoff may report transient SIGTERM on the old child.
+                            // Wait for the runtime to settle before declaring failure.
+                            const mayBeTransientRestart =
+                                !rtOk &&
+                                !!id &&
+                                !!rt &&
+                                (rt.restarted ||
+                                    rt.updated ||
+                                    rtMessage === 'signal:SIGTERM' ||
+                                    rtMessage === 'exit:null' ||
+                                    rtMessage === 'runtime_not_ready');
+                            if (mayBeTransientRestart) {
+                                // eslint-disable-next-line no-await-in-loop
+                                const settled = await waitRuntimeReadyById(fastify, id, {
+                                    timeoutMs: 30000,
+                                    probeTimeoutMs: 2500,
+                                    intervalMs: 500,
+                                });
+                                if (settled.ok) {
+                                    rtOk = true;
+                                    rtPort = settled.port;
+                                    rtMessage = '';
+                                } else if (settled.message) {
+                                    rtMessage = settled.message;
+                                }
+                            }
+
                             onlineResults.push({
                                 url,
                                 name,
                                 ...(id ? { id } : {}),
-                                status: health.ok ? 'pass' : 'error',
-                                ...(health.ok ? {} : { phase: 'runtime', message: 'runtime failed' }),
-                                ...(health.runtime ? { runtime: health.runtime } : {}),
+                                status: rtOk ? 'pass' : 'error',
+                                ...(rtOk ? {} : { phase: 'runtime', message: rtMessage }),
+                                runtime: { id, port: rtPort, entry: entryBase },
                             });
                         }
-
-                        // Persist validation status so UIs keep the last result across refresh.
-                        try {
-                            const after = readJsonFileSafe(cfgPath) || {};
-                            const list = Array.isArray(after.onlineConfigs) ? after.onlineConfigs : [];
-                            const byUrl = new Map(
-                                (onlineResults || [])
-                                    .filter((r) => r && typeof r === 'object' && typeof r.url === 'string' && r.url.trim())
-                                    .map((r) => [r.url.trim(), r])
-                            );
-                            const nextList = list.map((it) => {
-                                if (!it || typeof it !== 'object' || Array.isArray(it)) return it;
-                                const url = typeof it.url === 'string' ? it.url.trim() : '';
-                                if (!url) return it;
-                                const r = byUrl.get(url);
-                                if (!r) return it;
-                                const status = typeof r.status === 'string' && r.status.trim() ? r.status.trim() : 'unchecked';
-                                const message = typeof r.message === 'string' && r.message.trim() ? r.message.trim() : '';
-                                const id = typeof r.id === 'string' && r.id.trim() ? r.id.trim() : '';
-                                const merged = { ...it, status, checkedAt: Date.now() };
-                                if (message) merged.message = message;
-                                else {
-                                    try {
-                                        delete merged.message;
-                                    } catch (_) {}
-                                }
-                                if (id && (!merged.id || String(merged.id).trim() !== id)) merged.id = id;
-                                return merged;
-                            });
-                            writeJsonFileAtomic(cfgPath, { ...after, onlineConfigs: nextList });
-                        } catch (_) {}
                     } catch (e) {
                         const msg = e && e.message ? String(e.message) : 'online sync failed';
                         onlineResults = [{ url: '', name: '', status: 'error', message: msg }];

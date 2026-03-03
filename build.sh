@@ -54,7 +54,7 @@ case "${PLATFORM}-${ARCH}" in
 esac
 
 echo "[build] packaging single-file binary via pkg (${TARGET})..."
-OUT_NAME="catpawopen"
+OUT_NAME="catpawrunner"
 OUT_PATH="$OUT_DIR/$OUT_NAME"
 rm -f "$OUT_PATH" "$OUT_PATH.exe"
 

@@ -1092,7 +1092,7 @@ export const apiPlugins = [
 	            if (!isFolder) {
 	              const name = toStr(info.fileName || info.name).trim() || 'file';
 	              const fileId = toStr(info.fileId || info.file_id).trim();
-	              // CatPawOpen legacy format: "<fileId>*<shareId>*<fileName?>"
+	              // catpawrunner legacy format: "<fileId>*<shareId>*<fileName?>"
 	              const id = fileId && shareId ? `${fileId}*${shareId}*${name}` : '';
 	              return {
 	                ok: true,

@@ -1,4 +1,4 @@
-# CatPawOpen
+# catpawrunner
 
 一个基于 Fastify 的 Node.js 服务，用于：
 
@@ -6,7 +6,7 @@
 - 提供内置网盘解析 API（Quark / UC / 139 / Baidu / Tianyi-189）
 - 提供 mock 拦截 + 记录日志（用于适配网盘解析，不真实发包）
 
-> 说明：本文档以“运行目录（runtime root）”为基准。开发时通常就是你启动 `npm run dev` 的那个目录（例如 `CatPawOpen/` 或你自己的打包 exe 同目录）。
+> 说明：本文档以“运行目录（runtime root）”为基准。开发时通常就是你启动 `npm run dev` 的那个目录（例如 `catpawrunner/` 或你自己的打包 exe 同目录）。
 
 ## 启动
 
@@ -17,7 +17,7 @@
 ### 开发启动
 
 ```bash
-cd CatPawOpen
+cd catpawrunner
 npm i
 npm run dev
 ```

@@ -80,7 +80,7 @@ jobs:
       - name: Build bundle
         shell: bash
         env:
-          CATPAWOPEN_VERSION: ${{ env.BETA_BUILD_VERSION }}
+          CATPAWRUNNER_VERSION: ${{ env.BETA_BUILD_VERSION }}
           NODE_ENV: production
         run: |
           set -euo pipefail
@@ -107,7 +107,7 @@ jobs:
           mkdir -p dist
           ext=""
           if [[ "${GOOS}" == "windows" ]]; then ext=".exe"; fi
-          out="dist/catpawopen_${ASSET_OS}_${GOARCH}${ext}"
+          out="dist/catpawrunner_${ASSET_OS}_${GOARCH}${ext}"
           npx --yes pkg@5.8.1 standalone.cjs \
             --targets "${PKG_TARGET}" \
             --public \
@@ -122,8 +122,8 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: catpawopen_${{ matrix.asset_os }}_${{ matrix.goarch }}
-          path: dist/catpawopen_${{ matrix.asset_os }}_${{ matrix.goarch }}*
+          name: catpawrunner_${{ matrix.asset_os }}_${{ matrix.goarch }}
+          path: dist/catpawrunner_${{ matrix.asset_os }}_${{ matrix.goarch }}*
           if-no-files-found: error
 
   release:
