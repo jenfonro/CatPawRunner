@@ -23,6 +23,36 @@ function getExternalOriginFromRequest(request) {
     return `${scheme}://${host}`;
 }
 
+function parseCookieHeader(cookieHeader) {
+    const out = {};
+    const raw = typeof cookieHeader === 'string' ? cookieHeader : '';
+    if (!raw) return out;
+    raw.split(';').forEach((part) => {
+        const p = String(part || '').trim();
+        if (!p) return;
+        const i = p.indexOf('=');
+        if (i <= 0) return;
+        const k = p.slice(0, i).trim();
+        const v = p.slice(i + 1).trim();
+        if (!k) return;
+        out[k] = v;
+    });
+    return out;
+}
+
+function extractRuntimeIDFromReferer(refererRaw) {
+    const raw = typeof refererRaw === 'string' ? refererRaw.trim() : '';
+    if (!raw) return '';
+    try {
+        const u = new URL(raw);
+        const p = String(u.pathname || '');
+        const m = /^\/([a-f0-9]{10})\/website(?:\/|$)/i.exec(p);
+        return m && m[1] ? String(m[1]).toLowerCase() : '';
+    } catch (_) {
+        return '';
+    }
+}
+
 function rewriteLocalUrlToExternal(url, externalOrigin, idPrefix, allowedPorts) {
     if (!externalOrigin || typeof url !== 'string') return url;
     const raw = url.trim();
@@ -912,6 +942,41 @@ export default async function router(fastify) {
         return await p;
     };
 
+    const setRuntimeHintCookie = (reply, id) => {
+        const rid = String(id || '').trim().toLowerCase();
+        if (!/^[a-f0-9]{10}$/.test(rid)) return;
+        try {
+            reply.header('Set-Cookie', `catpaw_runtime_id=${rid}; Path=/; SameSite=Lax`);
+        } catch (_) {}
+    };
+
+    // Compatibility shim for absolute "/website/*" requests from website bundles.
+    // Resolve runtime by hint cookie first, then by Referer "/<id>/website/...".
+    const proxyWebsiteByRuntimeHint = async function (request, reply) {
+        if (String((request && request.method) || '').toUpperCase() === 'OPTIONS') return reply.code(204).send();
+
+        const headers = (request && request.headers) || {};
+        const cookies = parseCookieHeader(headers.cookie || headers.Cookie || '');
+        const cookieID = String(cookies.catpaw_runtime_id || '').trim().toLowerCase();
+        const refererID = extractRuntimeIDFromReferer(headers.referer || headers.referrer || '');
+        const id = /^[a-f0-9]{10}$/.test(cookieID) ? cookieID : refererID;
+        if (!id) return reply.code(404).send({ error: 'online runtime not found' });
+
+        const port = fastify && fastify.onlineRuntimePorts && typeof fastify.onlineRuntimePorts.get === 'function' ? fastify.onlineRuntimePorts.get(id) : null;
+        const p = Number.isFinite(Number(port)) ? Math.max(1, Math.trunc(Number(port))) : 0;
+        if (!p) return reply.code(404).send({ error: 'online runtime not found', id });
+
+        setRuntimeHintCookie(reply, id);
+        const tail = request && request.params ? String(request.params['*'] || '') : '';
+        const rawUrl = request && request.raw && typeof request.raw.url === 'string' ? request.raw.url : '';
+        const query = rawUrl && rawUrl.includes('?') ? `?${rawUrl.split('?').slice(1).join('?')}` : '';
+        const forwardPath = `/website${tail ? `/${tail}` : ''}${query}`;
+        return proxyToPort(request, reply, p, forwardPath);
+    };
+
+    fastify.all('/website', proxyWebsiteByRuntimeHint);
+    fastify.all('/website/*', proxyWebsiteByRuntimeHint);
+
     // Explicit id-based proxy: /online/:id/* -> the runtime port for that script id.
     fastify.all('/online/:id', async function (request, reply) {
         if (String(request && request.method || '').toUpperCase() === 'OPTIONS') return reply.code(204).send();
@@ -919,6 +984,7 @@ export default async function router(fastify) {
         const port = fastify && fastify.onlineRuntimePorts && typeof fastify.onlineRuntimePorts.get === 'function' ? fastify.onlineRuntimePorts.get(id) : null;
         const p = Number.isFinite(Number(port)) ? Math.max(1, Math.trunc(Number(port))) : 0;
         if (!id || !p) return reply.code(404).send({ error: 'online runtime not found', id });
+        setRuntimeHintCookie(reply, id);
         return proxyToPort(request, reply, p, '/');
     });
     fastify.all('/online/:id/*', async function (request, reply) {
@@ -927,6 +993,7 @@ export default async function router(fastify) {
         const port = fastify && fastify.onlineRuntimePorts && typeof fastify.onlineRuntimePorts.get === 'function' ? fastify.onlineRuntimePorts.get(id) : null;
         const p = Number.isFinite(Number(port)) ? Math.max(1, Math.trunc(Number(port))) : 0;
         if (!id || !p) return reply.code(404).send({ error: 'online runtime not found', id });
+        setRuntimeHintCookie(reply, id);
 
         const tail = request && request.params ? String(request.params['*'] || '') : '';
         const normalizedTail = String(tail || '').replace(/^\/+/, '');
@@ -954,6 +1021,7 @@ export default async function router(fastify) {
         const port = fastify && fastify.onlineRuntimePorts && typeof fastify.onlineRuntimePorts.get === 'function' ? fastify.onlineRuntimePorts.get(id) : null;
         const p = Number.isFinite(Number(port)) ? Math.max(1, Math.trunc(Number(port))) : 0;
         if (!id || !p) return reply.code(404).send({ error: 'online runtime not found', id });
+        setRuntimeHintCookie(reply, id);
         return proxyToPort(request, reply, p, '/');
     });
     fastify.all('/:id([a-f0-9]{10})/*', async function (request, reply) {
@@ -962,6 +1030,7 @@ export default async function router(fastify) {
         const port = fastify && fastify.onlineRuntimePorts && typeof fastify.onlineRuntimePorts.get === 'function' ? fastify.onlineRuntimePorts.get(id) : null;
         const p = Number.isFinite(Number(port)) ? Math.max(1, Math.trunc(Number(port))) : 0;
         if (!id || !p) return reply.code(404).send({ error: 'online runtime not found', id });
+        setRuntimeHintCookie(reply, id);
 
         const tail = request && request.params ? String(request.params['*'] || '') : '';
         const normalizedTail = String(tail || '').replace(/^\/+/, '');
