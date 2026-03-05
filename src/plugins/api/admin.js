@@ -851,6 +851,7 @@ export const apiPlugins = [
                 for (const keyRaw of keys) {
                     const key = String(keyRaw || '').trim();
                     if (!key) continue;
+                    const websiteKey = key === '189' ? 'tianyi' : key;
                     const val = store && typeof store[key] === 'object' && store[key] ? store[key] : {};
                     const cookie = typeof val.cookie === 'string' ? val.cookie : '';
                     const authorization = typeof val.authorization === 'string' ? val.authorization : '';
@@ -942,13 +943,18 @@ export const apiPlugins = [
                         // (Do not early-return here; keep `/website/{key}/{cookie|account}` sync for db.json.)
                     }
 
-                    const type = username && password ? 'account' : cookie ? 'cookie' : '';
+                    const type =
+                        key === '189' ? 'account' : username && password ? 'account' : cookie ? 'cookie' : '';
                     if (!type) {
                         results.push({ key, ok: true, skipped: true, message: 'empty credential' });
                         continue;
                     }
+                    if (key === '189' && !(username && password)) {
+                        results.push({ key, ok: true, skipped: true, message: 'empty credential' });
+                        continue;
+                    }
 
-                    const preferred = panKeyToRuntime.has(key) ? [panKeyToRuntime.get(key)] : [];
+                    const preferred = panKeyToRuntime.has(websiteKey) ? [panKeyToRuntime.get(websiteKey)] : [];
                     const candidates = preferred.length
                         ? preferred
                         : ports
@@ -958,10 +964,10 @@ export const apiPlugins = [
                     let lastErr = '';
                     let saved = false;
 
-                    // For builtin baidu/quark/uc: persist to config.json, but still sync to website for db.json.
+                    // For builtin baidu/quark/uc/189: persist to config.json, but still sync to website for db.json.
                     let configOk = true;
                     let configErr = '';
-                    if (key === 'baidu' || key === 'quark' || key === 'uc') {
+                    if (key === 'baidu' || key === 'quark' || key === 'uc' || key === '189') {
                         try {
                             savePanCredentialToConfig(resolveRuntimeRootDir(), key, { cookie, username, password });
                         } catch (e) {
@@ -971,8 +977,9 @@ export const apiPlugins = [
                     }
 
                     for (const r of candidates) {
-                        const endpoint = `http://127.0.0.1:${r.port}/website/${encodeURIComponent(key)}/${type}`;
-                        const payload = type === 'account' ? { username, password } : { cookie };
+                        const endpoint = `http://127.0.0.1:${r.port}/website/${encodeURIComponent(websiteKey)}/${type}`;
+                        const payload =
+                            key === '189' ? { username, password } : type === 'account' ? { username, password } : { cookie };
                         let out;
                         try {
                             // eslint-disable-next-line no-await-in-loop
