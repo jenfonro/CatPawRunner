@@ -1,0 +1,106 @@
+name: test_build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-check:
+    name: test-build-${{ matrix.asset_os }}-${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            pkg_target: node18-linux-x64
+            asset_os: linux
+          - goos: linux
+            goarch: arm64
+            pkg_target: node18-linux-arm64
+            asset_os: linux
+          - goos: linux
+            goarch: amd64
+            pkg_target: node18-alpine-x64
+            asset_os: linux-musl
+          - goos: linux
+            goarch: arm64
+            pkg_target: node18-alpine-arm64
+            asset_os: linux-musl
+          - goos: windows
+            goarch: amd64
+            pkg_target: node18-win-x64
+            asset_os: windows
+          - goos: windows
+            goarch: arm64
+            pkg_target: node18-win-arm64
+            asset_os: windows
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f package-lock.json ]]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Build bundle
+        shell: bash
+        env:
+          CATPAWRUNNER_VERSION: v0.0.0-test
+          NODE_ENV: production
+        run: |
+          set -euo pipefail
+          npm run _build
+
+      - name: Prepare entrypoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > dist/package.json <<'EOF'
+          { "type": "commonjs" }
+          EOF
+
+      - name: Package check (no artifact upload)
+        shell: bash
+        env:
+          PKG_TARGET: ${{ matrix.pkg_target }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          ASSET_OS: ${{ matrix.asset_os }}
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/catpawrunner-test-out
+          mkdir -p /tmp/catpawrunner-test-out
+          ext=""
+          if [[ "${GOOS}" == "windows" ]]; then ext=".exe"; fi
+          out="/tmp/catpawrunner-test-out/catpawrunner_${ASSET_OS}_${GOARCH}${ext}"
+          npx --yes pkg@5.8.1 standalone.cjs \
+            --targets "${PKG_TARGET}" \
+            --public \
+            --public-packages "*" \
+            --no-bytecode \
+            --output "${out}" \
+            --assets "dist/package.json" \
+            --assets "package.json" \
+            --assets "config.json" \
+            --assets "src/**/*"
+          test -f "${out}"
+          rm -rf /tmp/catpawrunner-test-out
+          echo "compile ok: ${ASSET_OS}/${GOARCH}"

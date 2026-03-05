@@ -11,9 +11,21 @@ permissions:
   contents: write
 
 jobs:
+  prepare_release:
+    name: prepare-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ensure release exists
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: ${{ inputs.version }}
+          body: "Preparing release assets..."
+
   build:
     name: build-${{ matrix.asset_os }}-${{ matrix.goarch }}
     runs-on: ubuntu-latest
+    needs: prepare_release
     strategy:
       fail-fast: false
       matrix:
@@ -127,32 +139,21 @@ jobs:
             --assets "src/**/*"
           echo "built: ${out}"
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload asset to release
+        uses: softprops/action-gh-release@v2
         with:
-          name: catpawrunner_${{ matrix.asset_os }}_${{ matrix.goarch }}
-          path: dist/catpawrunner_${{ matrix.asset_os }}_${{ matrix.goarch }}*
-          if-no-files-found: error
+          tag_name: ${{ inputs.version }}
+          files: dist/catpawrunner_${{ matrix.asset_os }}_${{ matrix.goarch }}*
+          overwrite_files: true
 
   release:
     name: release
     runs-on: ubuntu-latest
-    needs: build
+    needs: [prepare_release, build]
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - uses: actions/download-artifact@v4
-        with:
-          path: release-dist
-
-      - name: Flatten artifacts
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          find release-dist -maxdepth 2 -type f -print0 | xargs -0 -I{} mv {} dist/
-          ls -la dist
 
       - name: Generate release notes
         shell: bash
@@ -190,4 +191,3 @@ jobs:
           tag_name: ${{ inputs.version }}
           name: ${{ inputs.version }}
           body_path: notes.md
-          files: dist/*
