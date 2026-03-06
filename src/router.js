@@ -174,20 +174,22 @@ function parseJsonSafe(text) {
     }
 }
 
+function extractBuiltinPanFlagToken(flag) {
+    const raw = String(flag || '').trim();
+    if (!raw || !raw.includes('-')) return '';
+    return String(raw.split('-')[0] || '').trim().toLowerCase();
+}
+
 function isBaiduFlag(flag) {
-    const s = String(flag || '');
-    return s.includes('百度') || s.toLowerCase().includes('baidu');
+    return extractBuiltinPanFlagToken(flag) === '百度';
 }
 
 function isQuarkFlag(flag) {
-    const s = String(flag || '');
-    return s.includes('夸克') || s.includes('夸父') || s.toLowerCase().includes('quark');
+    return extractBuiltinPanFlagToken(flag) === '夸父';
 }
 
 function isUcFlag(flag) {
-    const s = String(flag || '');
-    const lower = s.toLowerCase();
-    return s.includes('优夕') || lower.includes('uc') || s.includes('drive.uc.cn') || s.includes('uc.cn');
+    return extractBuiltinPanFlagToken(flag) === '优夕';
 }
 
 function looksLikeHexId32(value) {
@@ -195,14 +197,11 @@ function looksLikeHexId32(value) {
 }
 
 function is139Flag(flag) {
-    const s = String(flag || '');
-    return s.includes('逸动') || s.includes('139') || s.includes('和彩云') || s.includes('移动');
+    return extractBuiltinPanFlagToken(flag) === '逸动';
 }
 
 function is189Flag(flag) {
-    const s = String(flag || '');
-    const lower = s.toLowerCase();
-    return s.includes('天意') || s.includes('天翼') || s.includes('189') || lower.includes('cloud.189.cn') || lower.includes('tianyi');
+    return extractBuiltinPanFlagToken(flag) === '天意';
 }
 
 function pickStringField(obj, keys) {
