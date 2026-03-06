@@ -557,8 +557,18 @@ async function handleAdminFullConfig(fastify, reply) {
         let cfg;
         try {
             cfg = await httpGetJson(`http://127.0.0.1:${p}/full-config`, { timeoutMs: 6000 });
-        } catch (_) {
-            continue;
+        } catch (e) {
+            const status = e && Number.isFinite(Number(e.status)) ? Number(e.status) : 0;
+            // Some third-party runtimes expose `/config` but not `/full-config`.
+            if (status === 404) {
+                try {
+                    cfg = await httpGetJson(`http://127.0.0.1:${p}/config`, { timeoutMs: 6000 });
+                } catch (_) {
+                    continue;
+                }
+            } else {
+                continue;
+            }
         }
         if (!cfg || typeof cfg !== 'object') continue;
 
