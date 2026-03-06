@@ -5,6 +5,7 @@ import panBaiduPlugins from './panBaidu.js';
 import panQuarkPlugins from './panQuark.js';
 import panUcPlugins from './panUc.js';
 import m3u8Plugins from './m3u8.js';
+import proxyPlugins from './proxy.js';
 
 export const apiPlugins = [
     ...(Array.isArray(adminPlugins) ? adminPlugins : []),
@@ -14,6 +15,7 @@ export const apiPlugins = [
     ...(Array.isArray(panQuarkPlugins) ? panQuarkPlugins : []),
     ...(Array.isArray(panUcPlugins) ? panUcPlugins : []),
     ...(Array.isArray(m3u8Plugins) ? m3u8Plugins : []),
+    ...(Array.isArray(proxyPlugins) ? proxyPlugins : []),
 ];
 
 export default apiPlugins;
