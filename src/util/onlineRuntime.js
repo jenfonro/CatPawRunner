@@ -59,12 +59,20 @@ function readJsonFileSafe(filePath) {
 
 const DEFAULT_MOCK_PROVIDERS = ['quark', 'uc', '139', 'baidu', 'tianyi'];
 
+function isRuntimeDebugEnabled() {
+    try {
+        return String(process.env.CATPAW_DEBUG || '').trim() === '1';
+    } catch (_) {
+        return false;
+    }
+}
+
 function readPanMockConfigFromRuntimeRoot(rootDir) {
     try {
         const cfgPath = path.resolve(rootDir, 'config.json');
         const cfg = readJsonFileSafe(cfgPath);
         const enabled = !!cfg.pan_mock;
-        return { enabled, debug: enabled, providers: DEFAULT_MOCK_PROVIDERS };
+        return { enabled, debug: enabled && isRuntimeDebugEnabled(), providers: DEFAULT_MOCK_PROVIDERS };
     } catch (_) {
         return { enabled: false, debug: false, providers: DEFAULT_MOCK_PROVIDERS };
     }
