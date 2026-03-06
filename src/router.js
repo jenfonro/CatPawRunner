@@ -53,6 +53,22 @@ function extractRuntimeIDFromReferer(refererRaw) {
     }
 }
 
+function splitRawUrl(rawUrl) {
+    const raw = typeof rawUrl === 'string' && rawUrl ? rawUrl : '/';
+    const idx = raw.indexOf('?');
+    if (idx < 0) return {path: raw, query: ''};
+    return {path: raw.slice(0, idx), query: raw.slice(idx)};
+}
+
+function stripPrefixFromRawPath(rawPath, prefixPath) {
+    const path = typeof rawPath === 'string' && rawPath ? rawPath : '/';
+    const prefix = typeof prefixPath === 'string' ? prefixPath : '';
+    if (!prefix) return '';
+    if (path === prefix) return '';
+    if (path.startsWith(`${prefix}/`)) return path.slice(prefix.length + 1);
+    return '';
+}
+
 function rewriteLocalUrlToExternal(url, externalOrigin, idPrefix, allowedPorts) {
     if (!externalOrigin || typeof url !== 'string') return url;
     const raw = url.trim();
@@ -967,9 +983,10 @@ export default async function router(fastify) {
         if (!p) return reply.code(404).send({ error: 'online runtime not found', id });
 
         setRuntimeHintCookie(reply, id);
-        const tail = request && request.params ? String(request.params['*'] || '') : '';
         const rawUrl = request && request.raw && typeof request.raw.url === 'string' ? request.raw.url : '';
-        const query = rawUrl && rawUrl.includes('?') ? `?${rawUrl.split('?').slice(1).join('?')}` : '';
+        const parts = splitRawUrl(rawUrl);
+        const tail = stripPrefixFromRawPath(parts.path, '/website');
+        const query = parts.query || '';
         const forwardPath = `/website${tail ? `/${tail}` : ''}${query}`;
         return proxyToPort(request, reply, p, forwardPath);
     };
@@ -1009,8 +1026,9 @@ export default async function router(fastify) {
             }
         }
         const rawUrl = request && request.raw && typeof request.raw.url === 'string' ? request.raw.url : '';
-        const query = rawUrl && rawUrl.includes('?') ? `?${rawUrl.split('?').slice(1).join('?')}` : '';
-        const forwardPath = `/${tail || ''}${query}`;
+        const parts = splitRawUrl(rawUrl);
+        const encodedTail = stripPrefixFromRawPath(parts.path, `/online/${id}`);
+        const forwardPath = `/${encodedTail || ''}${parts.query || ''}`;
         return proxyToPort(request, reply, p, forwardPath);
     });
 
@@ -1046,8 +1064,9 @@ export default async function router(fastify) {
             }
         }
         const rawUrl = request && request.raw && typeof request.raw.url === 'string' ? request.raw.url : '';
-        const query = rawUrl && rawUrl.includes('?') ? `?${rawUrl.split('?').slice(1).join('?')}` : '';
-        const forwardPath = `/${tail || ''}${query}`;
+        const parts = splitRawUrl(rawUrl);
+        const encodedTail = stripPrefixFromRawPath(parts.path, `/${id}`);
+        const forwardPath = `/${encodedTail || ''}${parts.query || ''}`;
         return proxyToPort(request, reply, p, forwardPath);
     });
 
