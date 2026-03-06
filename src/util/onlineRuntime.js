@@ -399,12 +399,200 @@ export async function startOnlineRuntime({
 		    }
 
 		    // Ensure any require('crypto') within the online script resolves to our composite.
+		    const axiosCompat = (() => {
+		      const normalizeHeaders = (h) => {
+		        const out = {};
+		        try {
+		          if (!h) return out;
+		          if (typeof h.forEach === 'function') {
+		            h.forEach((v, k) => {
+		              const kk = String(k || '').trim();
+		              const vv = String(v == null ? '' : v).trim();
+		              if (kk && vv) out[kk] = vv;
+		            });
+		            return out;
+		          }
+		          if (typeof h === 'object') {
+		            for (const k of Object.keys(h)) {
+		              const kk = String(k || '').trim();
+		              const vv = String(h[k] == null ? '' : h[k]).trim();
+		              if (kk && vv) out[kk] = vv;
+		            }
+		          }
+		        } catch (_) {}
+		        return out;
+		      };
+		      const buildURL = (baseURL, path, params) => {
+		        try {
+		          const p = String(path == null ? '' : path).trim();
+		          const b = String(baseURL == null ? '' : baseURL).trim();
+		          const full = b ? new URL(p || '', b).toString() : String(new URL(p).toString());
+		          const u = new URL(full);
+		          if (params && typeof params === 'object') {
+		            const usp = new URLSearchParams(u.search || '');
+		            for (const k of Object.keys(params)) {
+		              const v = params[k];
+		              if (v == null) continue;
+		              if (Array.isArray(v)) {
+		                for (const it of v) usp.append(String(k), String(it));
+		              } else {
+		                usp.set(String(k), String(v));
+		              }
+		            }
+		            const s = usp.toString();
+		            u.search = s ? '?' + s : '';
+		          }
+		          return u.toString();
+		        } catch (_) {
+		          return String(path || '');
+		        }
+		      };
+		      const parseData = (txt, responseType, contentType) => {
+		        const rt = String(responseType || '').trim().toLowerCase();
+		        if (rt === 'text') return String(txt || '');
+		        if (rt === 'json' || (!rt && String(contentType || '').toLowerCase().includes('application/json'))) {
+		          try { return txt ? JSON.parse(txt) : null; } catch (_) { return txt; }
+		        }
+		        if (!rt) {
+		          try { return txt ? JSON.parse(txt) : null; } catch (_) { return txt; }
+		        }
+		        return txt;
+		      };
+		      const makeErr = (msg, cfg, code, req, resp) => {
+		        const e = new Error(String(msg || 'axios error'));
+		        e.isAxiosError = true;
+		        e.name = 'AxiosError';
+		        if (code) e.code = String(code);
+		        e.config = cfg || {};
+		        if (req) e.request = req;
+		        if (resp) e.response = resp;
+		        e.toJSON = function () {
+		          return {
+		            message: this.message,
+		            name: this.name,
+		            code: this.code || '',
+		            status: this.response && this.response.status ? this.response.status : null,
+		          };
+		        };
+		        return e;
+		      };
+		      const create = (defaults) => {
+		        const dft = defaults && typeof defaults === 'object' ? { ...defaults } : {};
+		        const reqInts = [];
+		        const resInts = [];
+		        const runRequest = async (cfgIn) => {
+		          let cfg = { ...dft, ...(cfgIn && typeof cfgIn === 'object' ? cfgIn : {}) };
+		          if (cfg.baseURL == null && dft.baseURL != null) cfg.baseURL = dft.baseURL;
+		          if (cfg.headers == null && dft.headers != null) cfg.headers = dft.headers;
+		          for (const fn of reqInts) {
+		            try {
+		              const n = await fn(cfg);
+		              if (n && typeof n === 'object') cfg = n;
+		            } catch (_) {}
+		          }
+		          const method = String((cfg.method || 'get')).toUpperCase();
+		          const timeout = Math.max(0, Math.trunc(Number(cfg.timeout || 0)) || 0);
+		          const url = buildURL(cfg.baseURL, cfg.url, cfg.params);
+		          const headers = normalizeHeaders(cfg.headers);
+		          let body = cfg.data;
+		          if (body != null && typeof body === 'object' && !(body instanceof Buffer) && !(body instanceof Uint8Array)) {
+		            if (!headers['content-type'] && !headers['Content-Type']) headers['content-type'] = 'application/json';
+		            try { body = JSON.stringify(body); } catch (_) {}
+		          }
+		          const reqMeta = { method, url, headers };
+		          let resObj = null;
+		          try {
+		            if (typeof globalThis.fetch !== 'function') throw new Error('fetch unavailable');
+		            const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+		            const timer = ctrl && timeout > 0 ? setTimeout(() => { try { ctrl.abort(); } catch (_) {} }, timeout) : null;
+		            try {
+		              const res = await globalThis.fetch(url, {
+		                method,
+		                headers,
+		                body: method === 'GET' || method === 'HEAD' ? undefined : body,
+		                redirect: 'follow',
+		                signal: ctrl ? ctrl.signal : undefined,
+		              });
+		              const hs = normalizeHeaders(res.headers);
+		              const ct = hs['content-type'] || hs['Content-Type'] || '';
+		              const rt = String(cfg.responseType || '').trim().toLowerCase();
+		              let data;
+		              if (rt === 'arraybuffer') {
+		                const ab = await res.arrayBuffer();
+		                data = Buffer.from(ab);
+		              } else {
+		                const txt = await res.text();
+		                data = parseData(txt, rt, ct);
+		              }
+		              resObj = {
+		                data,
+		                status: Number(res.status || 0),
+		                statusText: String(res.statusText || ''),
+		                headers: hs,
+		                config: cfg,
+		                request: reqMeta,
+		              };
+		            } finally {
+		              if (timer) clearTimeout(timer);
+		            }
+		          } catch (err) {
+		            const em = err && err.message ? String(err.message) : String(err);
+		            const code = String(em || '').toLowerCase().includes('abort') ? 'ECONNABORTED' : 'ERR_NETWORK';
+		            throw makeErr(em || 'network error', cfg, code, reqMeta, resObj);
+		          }
+		          const validateStatus = typeof cfg.validateStatus === 'function' ? cfg.validateStatus : ((s) => s >= 200 && s < 300);
+		          if (!validateStatus(resObj.status)) {
+		            throw makeErr('Request failed with status code ' + String(resObj.status), cfg, 'ERR_BAD_REQUEST', reqMeta, resObj);
+		          }
+		          let out = resObj;
+		          for (const fn of resInts) {
+		            try {
+		              const n = await fn(out);
+		              if (n !== undefined) out = n;
+		            } catch (_) {}
+		          }
+		          return out;
+		        };
+		        const ax = function axiosLike(urlOrCfg, maybeCfg) {
+		          if (typeof urlOrCfg === 'string') {
+		            const cfg = maybeCfg && typeof maybeCfg === 'object' ? { ...maybeCfg } : {};
+		            cfg.url = urlOrCfg;
+		            return runRequest(cfg);
+		          }
+		          return runRequest(urlOrCfg && typeof urlOrCfg === 'object' ? urlOrCfg : {});
+		        };
+		        ax.defaults = dft;
+		        ax.interceptors = {
+		          request: { use(fn) { if (typeof fn === 'function') reqInts.push(fn); return reqInts.length - 1; } },
+		          response: { use(fn) { if (typeof fn === 'function') resInts.push(fn); return resInts.length - 1; } },
+		        };
+		        ax.request = (cfg) => runRequest(cfg || {});
+		        ax.get = (u, cfg) => ax({ ...(cfg || {}), method: 'GET', url: u });
+		        ax.delete = (u, cfg) => ax({ ...(cfg || {}), method: 'DELETE', url: u });
+		        ax.head = (u, cfg) => ax({ ...(cfg || {}), method: 'HEAD', url: u });
+		        ax.options = (u, cfg) => ax({ ...(cfg || {}), method: 'OPTIONS', url: u });
+		        ax.post = (u, data, cfg) => ax({ ...(cfg || {}), method: 'POST', url: u, data });
+		        ax.put = (u, data, cfg) => ax({ ...(cfg || {}), method: 'PUT', url: u, data });
+		        ax.patch = (u, data, cfg) => ax({ ...(cfg || {}), method: 'PATCH', url: u, data });
+		        ax.create = (cfg) => create({ ...dft, ...(cfg || {}) });
+		        ax.isAxiosError = (e) => !!(e && e.isAxiosError);
+		        ax.AxiosError = function AxiosError(message, code, config, request, response) {
+		          return makeErr(message, config, code, request, response);
+		        };
+		        ax.default = ax;
+		        return ax;
+		      };
+		      return create({});
+		    })();
+
+		    // Ensure any require('crypto') / require('axios') within the online script resolves to compat modules.
 		    try {
 		      const origLoad = Module._load;
 		      Module._load = function patchedLoad(request, parent, isMain) {
 		        try {
 		          if (request === 'crypto' || request === 'node:crypto') return composite;
 		          if (request === 'crypto-js') return cryptoCompat;
+		          if (request === 'axios') return axiosCompat;
 		        } catch (_) {}
 		        return origLoad.apply(this, arguments);
 		      };
@@ -417,6 +605,7 @@ export async function startOnlineRuntime({
 		          const mod = String(name || '').trim();
 		          if (mod === 'crypto' || mod === 'node:crypto') return composite;
 		          if (mod === 'crypto-js') return cryptoCompat;
+		          if (mod === 'axios') return axiosCompat;
 		        } catch (_) {}
 		        return origRequire(name);
 		      };
@@ -3123,21 +3312,82 @@ export async function startOnlineRuntime({
 		      }
 		    };
 
+		    const fetchTextWithFallback = async (targetUrl, timeoutMs) => {
+		      const urlStr = String(targetUrl || '').trim();
+		      if (!urlStr) return { status: 0, text: '' };
+		      const to = Math.max(1000, Math.trunc(Number(timeoutMs || 0)) || 0) || 12000;
+
+		      // Prefer built-in fetch in Node 18+ / pkg runtime.
+		      try {
+		        if (typeof globalThis.fetch === 'function') {
+		          const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+		          const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch (_) {} }, to) : null;
+		          try {
+		            const res = await globalThis.fetch(urlStr, {
+		              method: 'GET',
+		              redirect: 'follow',
+		              signal: ctrl ? ctrl.signal : undefined,
+		            });
+		            const txt = await res.text();
+		            return { status: Number(res && res.status ? res.status : 0), text: String(txt || '') };
+		          } finally {
+		            if (timer) clearTimeout(timer);
+		          }
+		        }
+		      } catch (_) {}
+
+		      // Fallback: plain http/https request (avoid axios dependency in pkg mode).
+		      return await new Promise((resolve, reject) => {
+		        try {
+		          const u = new URL(urlStr);
+		          const mod = u.protocol === 'https:' ? require('node:https') : require('node:http');
+		          const req = mod.request(
+		            {
+		              protocol: u.protocol,
+		              hostname: u.hostname,
+		              port: u.port || (u.protocol === 'https:' ? 443 : 80),
+		              path: (u.pathname || '/') + (u.search || ''),
+		              method: 'GET',
+		              timeout: to,
+		              headers: { 'accept': '*/*' },
+		            },
+		            (res) => {
+		              try {
+		                const bufs = [];
+		                res.on('data', (c) => { try { if (c != null) bufs.push(Buffer.from(c)); } catch (_) {} });
+		                res.on('end', () => {
+		                  try {
+		                    const body = Buffer.concat(bufs).toString('utf8');
+		                    resolve({ status: Number(res && res.statusCode ? res.statusCode : 0), text: body });
+		                  } catch (e) {
+		                    reject(e);
+		                  }
+		                });
+		              } catch (e) {
+		                reject(e);
+		              }
+		            }
+		          );
+		          req.on('timeout', () => {
+		            try { req.destroy(new Error('timeout')); } catch (_) {}
+		          });
+		          req.on('error', reject);
+		          req.end();
+		        } catch (e) {
+		          reject(e);
+		        }
+		      });
+		    };
+
 		    try {
 		      const entryRemoteUrl = readEntryRemoteUrlFromMeta();
 		      const cfgUrl = deriveConfigUrl(entryRemoteUrl);
 		      if (cfgUrl) {
 		        try { __log('entryFn_config_url', cfgUrl); } catch (_) {}
-		        const axios2 = require('axios');
-		        const res = await axios2.get(cfgUrl, {
-		          timeout: 12000,
-		          responseType: 'arraybuffer',
-		          maxRedirects: 3,
-		          validateStatus: () => true,
-		        });
+		        const res = await fetchTextWithFallback(cfgUrl, 12000);
 		        const status = Number(res && res.status ? res.status : 0);
 		        if (status >= 200 && status < 300) {
-		          const txt = Buffer.from(res.data || []).toString('utf8');
+		          const txt = String(res && res.text ? res.text : '');
 		          const cfgObj = parseConfigObject(txt);
 		          const s = cfgObj && cfgObj.server && typeof cfgObj.server === 'object' ? cfgObj.server : null;
 		          const url = s && typeof s.url === 'string' ? s.url.trim() : '';
