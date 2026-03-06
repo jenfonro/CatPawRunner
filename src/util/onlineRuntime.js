@@ -2949,7 +2949,7 @@ export async function startOnlineRuntime({
 	    return null;
 	  };
 
-	  const resolveEntryCandidates = () => {
+		  const resolveEntryCandidates = () => {
 	    const envName = (() => {
 	      try {
 	        return (
@@ -3037,8 +3037,117 @@ export async function startOnlineRuntime({
 	      for (const n of ranked) pushCandidate(n, 'auto_rank');
 	    } catch (_) {}
 
-	    return { candidates, envName, addedFns };
-	  };
+		    return { candidates, envName, addedFns };
+		  };
+
+		  const buildCompatStartConfig = async () => {
+		    const out = { sites: { list: [] }, pans: { list: [] }, color: [] };
+		    try {
+		      const fromEnvUrl =
+		        String(process.env.CATPAW_ONLINE_SERVER_URL || '').trim() ||
+		        String(process.env.ONLINE_SERVER_URL || '').trim();
+		      const fromEnvAuth =
+		        String(process.env.CATPAW_ONLINE_SERVER_AUTH || '').trim() ||
+		        String(process.env.ONLINE_SERVER_AUTH || '').trim();
+		      if (fromEnvUrl) {
+		        const server = { url: fromEnvUrl, authorization: fromEnvAuth };
+		        out.server = server;
+		        out.config = { server };
+		        return out;
+		      }
+		    } catch (_) {}
+
+		    const readEntryRemoteUrlFromMeta = () => {
+		      try {
+		        const entryPath = String(process.env.ONLINE_ENTRY || '').trim();
+		        if (!entryPath) return '';
+		        const dir = path.dirname(entryPath);
+		        const base = path.basename(entryPath);
+		        const metaPath = path.resolve(dir, '.' + base + '.remote.json');
+		        if (!fs.existsSync(metaPath)) return '';
+		        const raw = fs.readFileSync(metaPath, 'utf8');
+		        const parsed = raw && raw.trim() ? JSON.parse(raw) : null;
+		        return parsed && typeof parsed.url === 'string' ? parsed.url.trim() : '';
+		      } catch (_) {
+		        return '';
+		      }
+		    };
+
+		    const deriveConfigUrl = (entryUrl) => {
+		      try {
+		        const u = new URL(String(entryUrl || '').trim());
+		        let p = String(u.pathname || '');
+		        if (!p) return '';
+		        if (p.endsWith('.js') || p.endsWith('.mjs') || p.endsWith('.cjs')) {
+		          const i = p.lastIndexOf('.');
+		          p = p.slice(0, i) + '.config.js';
+		        } else {
+		          p = p.replace(/\\/+$/, '') + '.config.js';
+		        }
+		        u.pathname = p;
+		        u.search = '';
+		        u.hash = '';
+		        return u.toString();
+		      } catch (_) {
+		        return '';
+		      }
+		    };
+
+		    const parseConfigObject = (text) => {
+		      const t = String(text || '').trim();
+		      if (!t) return null;
+		      try {
+		        const j = JSON.parse(t);
+		        return j && typeof j === 'object' && !Array.isArray(j) ? j : null;
+		      } catch (_) {}
+		      try {
+		        const vm2 = require('node:vm');
+		        const sandbox = { module: { exports: {} }, exports: {} };
+		        vm2.runInNewContext(t, sandbox, { timeout: 1500, filename: 'remote.index.config.js' });
+		        const cand =
+		          (sandbox.module && sandbox.module.exports) ||
+		          (sandbox.exports && sandbox.exports.default) ||
+		          sandbox.exports ||
+		          null;
+		        return cand && typeof cand === 'object' && !Array.isArray(cand) ? cand : null;
+		      } catch (_) {
+		        return null;
+		      }
+		    };
+
+		    try {
+		      const entryRemoteUrl = readEntryRemoteUrlFromMeta();
+		      const cfgUrl = deriveConfigUrl(entryRemoteUrl);
+		      if (cfgUrl) {
+		        try { __log('entryFn_config_url', cfgUrl); } catch (_) {}
+		        const axios2 = require('axios');
+		        const res = await axios2.get(cfgUrl, {
+		          timeout: 12000,
+		          responseType: 'arraybuffer',
+		          maxRedirects: 3,
+		          validateStatus: () => true,
+		        });
+		        const status = Number(res && res.status ? res.status : 0);
+		        if (status >= 200 && status < 300) {
+		          const txt = Buffer.from(res.data || []).toString('utf8');
+		          const cfgObj = parseConfigObject(txt);
+		          const s = cfgObj && cfgObj.server && typeof cfgObj.server === 'object' ? cfgObj.server : null;
+		          const url = s && typeof s.url === 'string' ? s.url.trim() : '';
+		          const authorization = s && typeof s.authorization === 'string' ? s.authorization.trim() : '';
+		          if (url) {
+		            const server = { url, authorization };
+		            out.server = server;
+		            out.config = { server };
+		            return out;
+		          }
+		        }
+		      }
+		    } catch (e) {
+		      try { __log('entryFn_config_fetch_failed', e && e.message ? String(e.message) : String(e)); } catch (_) {}
+		    }
+
+		    return out;
+		  };
 
 		  const waitForListening = async (timeoutMs) => {
 		    const t0 = Date.now();
@@ -3110,11 +3219,15 @@ export async function startOnlineRuntime({
 		  const { candidates, envName, addedFns } = resolveEntryCandidates();
 		  if (candidates && candidates.length) {
 			    __stage('ndr_found');
-			    const baseCfg = (() => {
-			      return { sites: { list: [] }, pans: { list: [] }, color: [] };
-		    })();
+			    let baseCfg = { sites: { list: [] }, pans: { list: [] }, color: [] };
 		    try {
 		      __stage('ndr_call');
+		      try {
+		        baseCfg = await buildCompatStartConfig();
+		        if (baseCfg && baseCfg.server && baseCfg.server.url) {
+		          __log('entryFn_server_cfg', baseCfg.server.url);
+		        }
+		      } catch (_) {}
 		      let started = false;
 		      let lastErr = null;
 			      for (const c of candidates.slice(0, 12)) {
