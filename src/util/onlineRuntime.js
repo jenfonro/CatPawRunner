@@ -3316,6 +3316,25 @@ export async function startOnlineRuntime({
 		      const urlStr = String(targetUrl || '').trim();
 		      if (!urlStr) return { status: 0, text: '' };
 		      const to = Math.max(1000, Math.trunc(Number(timeoutMs || 0)) || 0) || 12000;
+		      const resolveRequestAuth = (rawUrl) => {
+		        try {
+		          const u = new URL(String(rawUrl || '').trim());
+		          const hasUserInfo = typeof u.username === 'string' && u.username.length > 0;
+		          const requestUrl = hasUserInfo ? (u.protocol + '//' + u.host + u.pathname + u.search + u.hash) : u.toString();
+		          if (!hasUserInfo) return { requestUrl, basicAuth: '' };
+		          const username = decodeURIComponent(u.username || '');
+		          const password = decodeURIComponent(u.password || '');
+		          const basicAuth = 'Basic ' + Buffer.from(String(username || '') + ':' + String(password || ''), 'utf8').toString('base64');
+		          return { requestUrl, basicAuth };
+		        } catch (_) {
+		          return { requestUrl: String(rawUrl || '').trim(), basicAuth: '' };
+		        }
+		      };
+		      const { requestUrl, basicAuth } = resolveRequestAuth(urlStr);
+		      const headers = {
+		        accept: '*/*',
+		        ...(basicAuth ? { authorization: basicAuth } : {}),
+		      };
 
 		      // Prefer built-in fetch in Node 18+ / pkg runtime.
 		      try {
@@ -3323,9 +3342,10 @@ export async function startOnlineRuntime({
 		          const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
 		          const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch (_) {} }, to) : null;
 		          try {
-		            const res = await globalThis.fetch(urlStr, {
+		            const res = await globalThis.fetch(requestUrl, {
 		              method: 'GET',
 		              redirect: 'follow',
+		              headers,
 		              signal: ctrl ? ctrl.signal : undefined,
 		            });
 		            const txt = await res.text();
@@ -3339,7 +3359,7 @@ export async function startOnlineRuntime({
 		      // Fallback: plain http/https request (avoid axios dependency in pkg mode).
 		      return await new Promise((resolve, reject) => {
 		        try {
-		          const u = new URL(urlStr);
+		          const u = new URL(requestUrl);
 		          const mod = u.protocol === 'https:' ? require('node:https') : require('node:http');
 		          const req = mod.request(
 		            {
@@ -3349,7 +3369,7 @@ export async function startOnlineRuntime({
 		              path: (u.pathname || '/') + (u.search || ''),
 		              method: 'GET',
 		              timeout: to,
-		              headers: { 'accept': '*/*' },
+		              headers,
 		            },
 		            (res) => {
 		              try {

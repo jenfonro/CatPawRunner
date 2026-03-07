@@ -86,13 +86,35 @@ function buildOnlineFileName(urlStr, id) {
     return `${name}.${hash}${extFromBase || '.js'}`.replace(/\.{2,}/g, '.');
 }
 
+function resolveAxiosRequestForUrl(urlStr) {
+    const raw = String(urlStr || '').trim();
+    if (!raw) return { requestUrl: raw, auth: null };
+    try {
+        const u = new URL(raw);
+        const hasUserInfo = typeof u.username === 'string' && u.username.length > 0;
+        const requestUrl = hasUserInfo ? `${u.protocol}//${u.host}${u.pathname}${u.search}${u.hash}` : u.toString();
+        if (!hasUserInfo) return { requestUrl, auth: null };
+        return {
+            requestUrl,
+            auth: {
+                username: decodeURIComponent(u.username || ''),
+                password: decodeURIComponent(u.password || ''),
+            },
+        };
+    } catch (_) {
+        return { requestUrl: raw, auth: null };
+    }
+}
+
 async function downloadText(url) {
-    const res = await axios.get(url, {
+    const { requestUrl, auth } = resolveAxiosRequestForUrl(url);
+    const res = await axios.get(requestUrl, {
         timeout: 30000,
         maxRedirects: 5,
         responseType: 'arraybuffer',
         maxContentLength: 10 * 1024 * 1024,
         validateStatus: () => true,
+        ...(auth ? { auth } : {}),
     });
     if (!res || res.status < 200 || res.status >= 300) {
         const code = res ? res.status : 0;
