@@ -5,6 +5,11 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import apiPlugins from './plugins/api/index.js';
+import {
+    buildSpiderCacheKey,
+    getOrCreateSpiderCache,
+    isEligibleSpiderCacheRequest,
+} from './util/runtimeSpiderCache.js';
 
 const spiderPrefix = '/spider';
 
@@ -290,6 +295,169 @@ function encodeB64Json(obj) {
     } catch (_) {
         return '';
     }
+}
+
+function mergeReplyHeaders(reply, outHeaders, hopByHop) {
+    try {
+        const existing = reply && typeof reply.getHeaders === 'function' ? reply.getHeaders() : null;
+        if (!existing || typeof existing !== 'object') return outHeaders;
+        const merged = outHeaders && typeof outHeaders === 'object' ? { ...outHeaders } : {};
+        const outLower = new Set(Object.keys(merged).map((k) => String(k || '').toLowerCase()));
+        Object.keys(existing).forEach((k) => {
+            const key = String(k || '');
+            const lower = key.toLowerCase();
+            if (!lower || hopByHop.has(lower) || outLower.has(lower)) return;
+            merged[key] = existing[k];
+            outLower.add(lower);
+        });
+        return merged;
+    } catch (_) {
+        return outHeaders && typeof outHeaders === 'object' ? outHeaders : {};
+    }
+}
+
+function cloneHeaders(headers, hopByHop) {
+    const outHeaders = {};
+    Object.keys(headers || {}).forEach((k) => {
+        const key = String(k || '').toLowerCase();
+        if (!key || hopByHop.has(key)) return;
+        outHeaders[k] = headers[k];
+    });
+    return outHeaders;
+}
+
+function rewriteSpiderJsonResponse(parsed, { isDetail, cacheHit }) {
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const next = { ...parsed, cache: !!cacheHit };
+    if (isDetail) next.pan_mock = isPanMockEnabled();
+    return next;
+}
+
+function shouldTryRewriteSpiderResponse(forwardPath, responseHeaders) {
+    const pathName = String(forwardPath || '').split('?')[0] || '/';
+    const isSearchOrDetail = /^\/spider\/[^/]+\/\d+\/(?:search|detail)$/i.test(pathName);
+    if (!isSearchOrDetail) return { shouldRewrite: false, isDetail: false };
+    const isDetail = /\/detail$/i.test(pathName);
+    const contentType = String((responseHeaders && (responseHeaders['content-type'] || responseHeaders['Content-Type'])) || '');
+    const shouldRewrite =
+        String(contentType || '').includes('application/json') ||
+        String(contentType || '').includes('text/plain') ||
+        String(contentType || '').includes('text/json') ||
+        !contentType;
+    return { shouldRewrite, isDetail };
+}
+
+async function fetchBufferedProxyResponse({ request, targetPort, pathToUse, headers, limitBytes }) {
+    return await new Promise((resolve, reject) => {
+        const proxyReq = http.request(
+            {
+                hostname: '127.0.0.1',
+                port: targetPort,
+                method: String(request.method || 'GET').toUpperCase(),
+                path: pathToUse,
+                headers,
+            },
+            (proxyRes) => {
+                const responseHeaders = cloneHeaders(proxyRes.headers || {}, new Set([
+                    'connection',
+                    'keep-alive',
+                    'proxy-authenticate',
+                    'proxy-authorization',
+                    'te',
+                    'trailer',
+                    'transfer-encoding',
+                    'upgrade',
+                ]));
+                const chunks = [];
+                let total = 0;
+                proxyRes.on('data', (c) => {
+                    const b = Buffer.isBuffer(c) ? c : Buffer.from(c);
+                    total += b.length;
+                    if (limitBytes > 0 && total > limitBytes) {
+                        chunks.push(b);
+                        return;
+                    }
+                    chunks.push(b);
+                });
+                proxyRes.on('end', () => {
+                    resolve({
+                        statusCode: proxyRes.statusCode || 502,
+                        headers: responseHeaders,
+                        body: Buffer.concat(chunks),
+                    });
+                });
+            }
+        );
+        proxyReq.on('error', reject);
+        try {
+            const method = String(request.method || 'GET').toUpperCase();
+            const body = request && Object.prototype.hasOwnProperty.call(request, 'body') ? request.body : undefined;
+            if (body !== undefined && body !== null && method !== 'GET' && method !== 'HEAD') {
+                let buf = null;
+                if (Buffer.isBuffer(body) || body instanceof Uint8Array) {
+                    buf = Buffer.from(body);
+                } else if (typeof body === 'string') {
+                    buf = Buffer.from(body, 'utf8');
+                } else if (typeof body === 'object') {
+                    buf = Buffer.from(JSON.stringify(body), 'utf8');
+                    if (!headers['content-type']) headers['content-type'] = 'application/json';
+                }
+                if (buf) {
+                    proxyReq.setHeader('content-length', String(buf.length));
+                    proxyReq.end(buf);
+                    return;
+                }
+            }
+            if (request && request.raw) request.raw.pipe(proxyReq);
+            else proxyReq.end();
+        } catch (err) {
+            try {
+                proxyReq.destroy(err);
+            } catch (_) {}
+        }
+    });
+}
+
+function sendBufferedProxyResponse(reply, request, response, { rewriteSpider = false, cacheHit = false, forwardPath = '' } = {}) {
+    const hopByHop = new Set([
+        'connection',
+        'keep-alive',
+        'proxy-authenticate',
+        'proxy-authorization',
+        'te',
+        'trailer',
+        'transfer-encoding',
+        'upgrade',
+    ]);
+    const status = response && Number(response.statusCode) > 0 ? Number(response.statusCode) : 502;
+    let outHeaders = cloneHeaders((response && response.headers) || {}, hopByHop);
+    let outBody = Buffer.isBuffer(response && response.body) ? response.body : Buffer.from(response && response.body ? response.body : '');
+
+    if (rewriteSpider) {
+        const parsed = parseJsonSafe(outBody.toString('utf8'));
+        const rewriteMeta = shouldTryRewriteSpiderResponse(forwardPath, outHeaders);
+        const next = rewriteMeta.shouldRewrite ? rewriteSpiderJsonResponse(parsed, { isDetail: rewriteMeta.isDetail, cacheHit }) : null;
+        if (next) {
+            outBody = Buffer.from(JSON.stringify(next), 'utf8');
+            delete outHeaders['content-length'];
+            delete outHeaders['Content-Length'];
+            outHeaders['content-length'] = String(outBody.length);
+            if (!outHeaders['content-type'] && !outHeaders['Content-Type']) outHeaders['content-type'] = 'application/json; charset=utf-8';
+        }
+    }
+
+    outHeaders = mergeReplyHeaders(reply, outHeaders, hopByHop);
+    try {
+        reply.raw.writeHead(status, outHeaders);
+    } catch (_) {}
+    try {
+        reply.raw.end(outBody);
+    } catch (_) {
+        try {
+            reply.raw.end();
+        } catch (_) {}
+    }
+    return request;
 }
 
 /**
@@ -713,9 +881,10 @@ export default async function router(fastify) {
 
     // If a route is not handled by catpawrunner, proxy it to the online runtime (default: 9988).
     // This allows downloaded scripts in `custom_spider/` to expose their own routes while still being accessed from this port.
-    const proxyToPort = async function (request, reply, targetPort, urlPath) {
+    const proxyToPort = async function (request, reply, targetPort, urlPath, runtimeId = '') {
         const pathToUse = typeof urlPath === 'string' && urlPath ? urlPath : '/';
         const wantInjectPanMock = /\/spider\/[^/]+\/\d+\/detail(?:\?|$)/i.test(pathToUse);
+        const allowSpiderCache = isEligibleSpiderCacheRequest(request && request.method, pathToUse) && /^[a-f0-9]{10}$/i.test(String(runtimeId || '').trim());
 
         const hopByHop = new Set([
             'connection',
@@ -736,7 +905,7 @@ export default async function router(fastify) {
             headers[key] = inHeaders[k];
         });
         // If we plan to parse and rewrite JSON, disable compression from upstream.
-        if (wantInjectPanMock) headers['accept-encoding'] = 'identity';
+        if (wantInjectPanMock || allowSpiderCache) headers['accept-encoding'] = 'identity';
         headers.host = `127.0.0.1:${targetPort}`;
         // Fastify may have already consumed the incoming stream to populate `request.body`.
         // Never forward a stale Content-Length (will hang the upstream waiting for bytes).
@@ -744,6 +913,50 @@ export default async function router(fastify) {
         delete headers['transfer-encoding'];
 
         reply.hijack();
+        if (allowSpiderCache) {
+            const cacheKey = buildSpiderCacheKey({
+                runtimeId,
+                forwardPath: pathToUse,
+                method: request && request.method,
+                body: request && Object.prototype.hasOwnProperty.call(request, 'body') ? request.body : {},
+            });
+            try {
+                const { hit, entry } = await getOrCreateSpiderCache(cacheKey, async () => {
+                    const buffered = await fetchBufferedProxyResponse({
+                        request,
+                        targetPort,
+                        pathToUse,
+                        headers: { ...headers },
+                        limitBytes: 0,
+                    });
+                    if (!buffered) return { entry: null, cacheable: false };
+                    const rewriteMeta = shouldTryRewriteSpiderResponse(pathToUse, buffered.headers);
+                    const bodySize = Buffer.isBuffer(buffered.body) ? buffered.body.length : 0;
+                    const parsed = rewriteMeta.shouldRewrite ? parseJsonSafe(Buffer.from(buffered.body || '').toString('utf8')) : null;
+                    const cacheable =
+                        buffered.statusCode >= 200 &&
+                        buffered.statusCode < 300 &&
+                        rewriteMeta.shouldRewrite &&
+                        parsed &&
+                        typeof parsed === 'object' &&
+                        !Array.isArray(parsed) &&
+                        bodySize <= 8 * 1024 * 1024;
+                    return {
+                        entry: buffered,
+                        cacheable,
+                        ttlMs: 60 * 60 * 1000,
+                    };
+                });
+                if (entry) {
+                    sendBufferedProxyResponse(reply, request, entry, {
+                        rewriteSpider: true,
+                        cacheHit: hit,
+                        forwardPath: pathToUse,
+                    });
+                    return;
+                }
+            } catch (_) {}
+        }
         return await new Promise((resolve) => {
             const proxyReq = http.request(
                 {
@@ -754,28 +967,7 @@ export default async function router(fastify) {
                     headers,
                 },
                 (proxyRes) => {
-                    const outHeaders = {};
-                    Object.keys(proxyRes.headers || {}).forEach((k) => {
-                        const key = String(k || '').toLowerCase();
-                        if (!key || hopByHop.has(key)) return;
-                        outHeaders[k] = proxyRes.headers[k];
-                    });
-
-                    // Preserve any headers already set on the Fastify reply (e.g. CORS from onRequest hook).
-                    try {
-                        const existing = reply && typeof reply.getHeaders === 'function' ? reply.getHeaders() : null;
-                        if (existing && typeof existing === 'object') {
-                            const outLower = new Set(Object.keys(outHeaders).map((k) => String(k || '').toLowerCase()));
-                            Object.keys(existing).forEach((k) => {
-                                const key = String(k || '');
-                                const lower = key.toLowerCase();
-                                if (!lower || hopByHop.has(lower)) return;
-                                if (outLower.has(lower)) return;
-                                outHeaders[key] = existing[k];
-                                outLower.add(lower);
-                            });
-                        }
-                    } catch (_) {}
+                    const outHeaders = mergeReplyHeaders(reply, cloneHeaders(proxyRes.headers || {}, hopByHop), hopByHop);
                     const shouldTryInject =
                         wantInjectPanMock &&
                         (String(outHeaders['content-type'] || '').includes('application/json') ||
@@ -987,7 +1179,7 @@ export default async function router(fastify) {
         const tail = stripPrefixFromRawPath(parts.path, '/website');
         const query = parts.query || '';
         const forwardPath = `/website${tail ? `/${tail}` : ''}${query}`;
-        return proxyToPort(request, reply, p, forwardPath);
+        return proxyToPort(request, reply, p, forwardPath, id);
     };
 
     fastify.all('/website', proxyWebsiteByRuntimeHint);
@@ -1001,7 +1193,7 @@ export default async function router(fastify) {
         const p = Number.isFinite(Number(port)) ? Math.max(1, Math.trunc(Number(port))) : 0;
         if (!id || !p) return reply.code(404).send({ error: 'online runtime not found', id });
         setRuntimeHintCookie(reply, id);
-        return proxyToPort(request, reply, p, '/');
+        return proxyToPort(request, reply, p, '/', id);
     });
     fastify.all('/online/:id/*', async function (request, reply) {
         if (String(request && request.method || '').toUpperCase() === 'OPTIONS') return reply.code(204).send();
@@ -1028,7 +1220,7 @@ export default async function router(fastify) {
         const parts = splitRawUrl(rawUrl);
         const encodedTail = stripPrefixFromRawPath(parts.path, `/online/${id}`);
         const forwardPath = `/${encodedTail || ''}${parts.query || ''}`;
-        return proxyToPort(request, reply, p, forwardPath);
+        return proxyToPort(request, reply, p, forwardPath, id);
     });
 
     // Preferred id-based proxy: /:id/spider/...  (avoid catching /api, /admin, etc by using a strict id pattern).
@@ -1039,7 +1231,7 @@ export default async function router(fastify) {
         const p = Number.isFinite(Number(port)) ? Math.max(1, Math.trunc(Number(port))) : 0;
         if (!id || !p) return reply.code(404).send({ error: 'online runtime not found', id });
         setRuntimeHintCookie(reply, id);
-        return proxyToPort(request, reply, p, '/');
+        return proxyToPort(request, reply, p, '/', id);
     });
     fastify.all('/:id([a-f0-9]{10})/*', async function (request, reply) {
         if (String(request && request.method || '').toUpperCase() === 'OPTIONS') return reply.code(204).send();
@@ -1066,7 +1258,7 @@ export default async function router(fastify) {
         const parts = splitRawUrl(rawUrl);
         const encodedTail = stripPrefixFromRawPath(parts.path, `/${id}`);
         const forwardPath = `/${encodedTail || ''}${parts.query || ''}`;
-        return proxyToPort(request, reply, p, forwardPath);
+        return proxyToPort(request, reply, p, forwardPath, id);
     });
 
     // Online runtime routes must be accessed via an explicit id prefix.
