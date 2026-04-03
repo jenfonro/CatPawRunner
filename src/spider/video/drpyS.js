@@ -149,6 +149,143 @@ async function category(_inReq, _outResp) {
     return result;
 }
 
+function isPanmockDetailSource(label) {
+    const raw = String(label || '').trim();
+    if (!raw) {
+        return false;
+    }
+    return raw.startsWith('夸父-') ||
+        raw.startsWith('优夕-') ||
+        raw.startsWith('逸动-') ||
+        raw.startsWith('天意-') ||
+        raw.startsWith('天翼-') ||
+        raw.startsWith('百度原画-');
+}
+
+function isTianyiDetailSource(label) {
+    const raw = String(label || '').trim();
+    return raw.startsWith('天意-') || raw.startsWith('天翼-');
+}
+
+function sanitizePanmockSourceLabel(label) {
+    const raw = String(label || '').trim();
+    if (!raw) {
+        return '';
+    }
+    if (raw.startsWith('百度原画-')) {
+        return String(raw.split('#')[0] || '').trim();
+    }
+    return raw;
+}
+
+function normalizePanmockDetailText(raw) {
+    try {
+        return decodeURIComponent(String(raw || '').trim());
+    } catch (_) {
+        return String(raw || '').trim();
+    }
+}
+
+function extractPanmockPlaceholderName(title, playURL) {
+    const candidates = [title, playURL];
+    for (const candidate of candidates) {
+        const text = normalizePanmockDetailText(candidate);
+        if (!text) {
+            continue;
+        }
+        const mp4Match = text.match(/([A-Za-z0-9_]+(?:-[A-Za-z0-9_]+)?)\.(?:mp4|MP4)\b/);
+        if (mp4Match && mp4Match[1]) {
+            return String(mp4Match[1]).trim();
+        }
+        const rootMatch = text.match(/\b(root\d*)\b/i);
+        if (rootMatch && rootMatch[1]) {
+            return String(rootMatch[1]).trim();
+        }
+    }
+    return '';
+}
+
+function extractPanmockDisplayPasscode(label, title, playURL) {
+    const placeholder = extractPanmockPlaceholderName(title, playURL);
+    if (!placeholder) {
+        return '';
+    }
+    const lower = placeholder.toLowerCase();
+    if (lower === 'nopass' || lower === 'root' || /^root\d+$/.test(lower)) {
+        return '';
+    }
+    if (isTianyiDetailSource(label)) {
+        if (placeholder.includes('-')) {
+            const seg = placeholder.split('-');
+            return String(seg[seg.length - 1] || '').trim();
+        }
+        return '';
+    }
+    return String(placeholder || '').trim();
+}
+
+function beautifyPanmockSourceEpisodes(label, playURL) {
+    const raw = String(playURL || '');
+    const tabs = raw.split('#');
+    const byDisplay = new Map();
+    for (let idx = 0; idx < tabs.length; idx += 1) {
+        const chunk = String(tabs[idx] || '').trim();
+        if (!chunk) {
+            continue;
+        }
+        const splitIdx = chunk.indexOf('$');
+        if (splitIdx < 0) {
+            continue;
+        }
+        const oldTitle = String(chunk.slice(0, splitIdx) || '').trim();
+        const urlPart = String(chunk.slice(splitIdx + 1) || '').trim();
+        const displayTitle = extractPanmockDisplayPasscode(label, oldTitle, urlPart);
+        const dedupeKey = displayTitle ? displayTitle.trim().toLowerCase() : '__empty__';
+        const next = {
+            raw: displayTitle,
+            title: displayTitle,
+            hasPasscode: !!displayTitle,
+            order: idx,
+        };
+        const prev = byDisplay.get(dedupeKey);
+        if (!prev || (!prev.hasPasscode && next.hasPasscode)) {
+            byDisplay.set(dedupeKey, next);
+        }
+    }
+    return Array.from(byDisplay.values())
+        .sort((a, b) => a.order - b.order)
+        .map(item => item.raw)
+        .join('#');
+}
+
+function beautifyPanmockDetailOutput(vodPlayFrom, vodPlayURL) {
+    const fromRaw = String(vodPlayFrom || '');
+    const urlRaw = String(vodPlayURL || '');
+    if (!fromRaw && !urlRaw) {
+        return {vod_play_from: fromRaw, vod_play_url: urlRaw};
+    }
+    const fromParts = fromRaw.split('$$$');
+    const urlParts = urlRaw.split('$$$');
+    const total = Math.max(fromParts.length, urlParts.length);
+    const nextFroms = [];
+    const nextURLs = [];
+    for (let i = 0; i < total; i += 1) {
+        const rawLabel = i < fromParts.length ? String(fromParts[i] || '') : '';
+        const label = sanitizePanmockSourceLabel(rawLabel);
+        const playURL = i < urlParts.length ? String(urlParts[i] || '') : '';
+        nextFroms.push(label);
+        if (!isPanmockDetailSource(label)) {
+            nextURLs.push(playURL);
+            continue;
+        }
+        nextURLs.push(beautifyPanmockSourceEpisodes(label, playURL));
+    }
+    return {
+        vod_play_from: nextFroms.join('$$$'),
+        vod_play_url: nextURLs.join('$$$'),
+    };
+}
+
 async function detail(_inReq, _outResp) {
     const prefix = _inReq.server.prefix;
     const skey = prefix.slice(prefix.lastIndexOf('/') + 1);
@@ -174,6 +311,9 @@ async function detail(_inReq, _outResp) {
         if (_result && Array.isArray(_result.list)) {
             let _vod_play_url = _result.list[0].vod_play_url;
             _result.list[0].vod_play_url = _vod_play_url.split('#').map(i => i.replace('$', '$push://')).join('#');
+            const beautified = beautifyPanmockDetailOutput(_result.list[0].vod_play_from, _result.list[0].vod_play_url);
+            _result.list[0].vod_play_from = beautified.vod_play_from;
+            _result.list[0].vod_play_url = beautified.vod_play_url;
         }
         return _result
     }
@@ -235,6 +375,9 @@ async function detail(_inReq, _outResp) {
             result.list[0].vod_play_url = vod_play_urls.join('$$$');
             result.list[0].vod_play_from = vod_play_froms.join('$$$');
         }
+        const beautified = beautifyPanmockDetailOutput(result.list[0].vod_play_from, result.list[0].vod_play_url);
+        result.list[0].vod_play_from = beautified.vod_play_from;
+        result.list[0].vod_play_url = beautified.vod_play_url;
     }
     if (stags.includes('画') || stags.includes('书')) {
         result.list = result.list.map((item) => {
