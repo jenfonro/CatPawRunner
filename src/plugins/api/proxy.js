@@ -1,4 +1,6 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { URL } from 'node:url';
 import chunkStream from '../../util/chunk.js';
 import { md5 } from '../../util/crypto-util.js';
@@ -77,6 +79,40 @@ function apiError(reply, status, message) {
   return { ok: false, message: String(message || 'error') };
 }
 
+function resolveRuntimeRootDir() {
+  try {
+    if (process && process.pkg && typeof process.execPath === 'string' && process.execPath) {
+      return path.dirname(process.execPath);
+    }
+  } catch (_) {}
+  try {
+    const envRoot = typeof process.env.NODE_PATH === 'string' ? process.env.NODE_PATH.trim() : '';
+    if (envRoot) return path.resolve(envRoot);
+  } catch (_) {}
+  return process.cwd();
+}
+
+function readJsonFileSafe(filePath) {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return {};
+    const raw = fs.readFileSync(filePath, 'utf8');
+    const parsed = raw && raw.trim() ? JSON.parse(raw) : {};
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function isProxyDisabled() {
+  try {
+    const cfgPath = path.resolve(resolveRuntimeRootDir(), 'config.json');
+    const cfg = readJsonFileSafe(cfgPath);
+    return !!(cfg && cfg.disable_proxy);
+  } catch (_) {
+    return false;
+  }
+}
+
 const apiPlugins = [
   {
     prefix: '/api/proxy',
@@ -84,6 +120,7 @@ const apiPlugins = [
       const store = ensureStore(fastify);
 
       fastify.post('/register', async function registerProxy(request, reply) {
+        if (isProxyDisabled()) return apiError(reply, 403, 'proxy disabled');
         const body = request && request.body && typeof request.body === 'object' ? request.body : {};
         const upstreamUrl = normalizeHttpUrl(body && body.url);
         if (!upstreamUrl) return apiError(reply, 400, 'missing url');
@@ -115,6 +152,7 @@ const apiPlugins = [
       });
 
       fastify.get('/:token', async function proxyByToken(request, reply) {
+        if (isProxyDisabled()) return apiError(reply, 403, 'proxy disabled');
         const token = safeTrim(request && request.params ? request.params.token : '');
         if (!token) return apiError(reply, 404, 'not found');
         const session = getSession(store, token);

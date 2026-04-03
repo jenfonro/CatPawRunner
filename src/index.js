@@ -277,13 +277,23 @@ export async function start(config) {
         };
         try {
             const cur = readJsonSafe();
-            if (!Object.prototype.hasOwnProperty.call(cur, 'pan_mock')) {
-                atomicWrite({ ...cur, pan_mock: false });
+            const next = { ...cur };
+            let changed = false;
+            if (!Object.prototype.hasOwnProperty.call(next, 'pan_mock')) {
+                next.pan_mock = false;
+                changed = true;
+            }
+            if (!Object.prototype.hasOwnProperty.call(next, 'disable_proxy')) {
+                next.disable_proxy = false;
+                changed = true;
+            }
+            if (changed) {
+                atomicWrite(next);
             }
         } catch (_) {}
     };
 
-    // Ensure `pan_mock` exists even if user deleted it (defaults to false).
+    // Ensure required boolean config defaults exist even if user deleted them.
     ensureConfigJsonDefaults();
 
     server.db = new JsonDB(new Config(path.resolve(runtimeRoot, 'db.json'), true, true, '/', true));
