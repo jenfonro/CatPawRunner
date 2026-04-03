@@ -3,6 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { buildPanDisplayName } from './panDisplayMeta.js';
 
 const UC_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) uc-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4-b478491100 Safari/537.36 Channel/pckk_other_ch';
@@ -1638,7 +1639,8 @@ const apiPlugins = [
             const name = String(it.name || '').trim();
             if (!fid || !fidToken || !name) continue;
             const dirPath = Array.isArray(it.path) && it.path.length ? `/${it.path.join('/')}` : '/';
-            const displayName = sanitizeVodPlayName(dirPath) || '/';
+            const baseDisplay = sanitizeVodPlayName(dirPath) || '/';
+            const displayName = buildPanDisplayName(baseDisplay, it, name);
             const suffix = encodeVodIdNameSuffix(name);
             const id = `${shareId}*${stoken}*${fid}*${fidToken}${suffix ? `***${suffix}` : ''}`;
             parts.push(`${displayName}$${id}`);
@@ -1791,10 +1793,6 @@ const apiPlugins = [
             persist: true,
           });
           cookie = dest.cookie || cookie;
-
-          // Clear destination dir first (Quark-style) to avoid picking older files.
-          const cleared = await ucClearDir({ pdirFid: dest.fid, cookie });
-          cookie = (cleared && cleared.cookie) || cookie;
 
           const out = await ucShareSave({
             shareId,

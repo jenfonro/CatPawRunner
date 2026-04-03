@@ -5,6 +5,7 @@ import path from 'node:path';
 import http from 'node:http';
 import https from 'node:https';
 import zlib from 'node:zlib';
+import { buildPanDisplayNameFromMeta, inferPanFPSLabel, inferPanQualityLabelFromFilename, detectPanQualityFromM3U8 } from './panDisplayMeta.js';
 
 const OUTLINK_API_BASE = 'https://share-kd-njs.yun.139.com/yun-share/richlifeApp/devapp/IOutLink/';
 
@@ -804,16 +805,36 @@ export const apiPlugins = [
                               pCaID: toStr(c && c.pCaID),
                               dirPath: toStr(c && c.dirPath),
                               fileName: toStr(c && c.name),
+                              presentURL: toStr(c && c.presentURL),
                           }))
                         : [];
-                    const parts = [];
-                    for (const it of list) {
-                        const n = toStr(it && it.vod_name).trim();
-                        const vid = toStr(it && it.vod_id).trim();
-                        if (!n || !vid) continue;
-                        parts.push(`${n}$${vid}`);
+                    const parts = new Array(list.length).fill('');
+                    await Promise.all(
+                        list.map(async (it, idx) => {
+                            const baseName = toStr(it && it.vod_name).trim();
+                            const vid = toStr(it && it.vod_id).trim();
+                            if (!baseName || !vid) return;
+                            const fileName = toStr(it && it.fileName).trim();
+                            const fps = inferPanFPSLabel(null, fileName);
+                            let quality = inferPanQualityLabelFromFilename(fileName);
+                            let displayName = buildPanDisplayNameFromMeta(baseName, { quality, fps });
+                            if (!quality) {
+                                const presentURL = toStr(it && it.presentURL).trim();
+                                if (presentURL) {
+                                    try {
+                                        quality = await detectPanQualityFromM3U8(presentURL, { userAgent: DEFAULT_UA });
+                                    } catch (_) {}
+                                    displayName = buildPanDisplayNameFromMeta(baseName, { quality, fps });
+                                }
+                            }
+                            parts[idx] = `${displayName}$${vid}`;
+                        })
+                    );
+                    const outParts = [];
+                    for (const it of parts) {
+                        if (it) outParts.push(it);
                     }
-                    return { ok: true, vod_play_url: parts.join('#') };
+                    return { ok: true, vod_play_url: outParts.join('#') };
                 } catch (e) {
                     reply.code(502);
                     return { ok: false, message: (e && e.message) || String(e) };

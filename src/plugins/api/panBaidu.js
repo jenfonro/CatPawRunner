@@ -1094,6 +1094,31 @@ async function baiduMediaInfoScript({ cookie, path }) {
       'Content-Type': 'application/x-www-form-urlencoded',
     },
   });
+  const dlink =
+    data &&
+    typeof data === 'object' &&
+    data.info &&
+    typeof data.info === 'object' &&
+    typeof data.info.dlink === 'string'
+      ? String(data.info.dlink || '').trim()
+      : '';
+  if (dlink) {
+    const errno = data && Object.prototype.hasOwnProperty.call(data, 'errno') ? Number(data.errno) : 0;
+    if (Number.isFinite(errno) && errno !== 0) {
+      panLog('baidu mediainfo warn', {
+        errno,
+        path: p,
+        dlinkHost: (() => {
+          try {
+            return new URL(dlink).host;
+          } catch {
+            return '';
+          }
+        })(),
+      });
+    }
+    return data;
+  }
   assertBaiduErrnoOk(data);
   return data;
 }

@@ -3,6 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { buildPanDisplayName } from './panDisplayMeta.js';
 
 const QUARK_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4-b478491100 Safari/537.36 Channel/pckk_other_ch';
@@ -933,6 +934,21 @@ async function quarkClearDir({ pdirFid, cookie }) {
   return { ok: true, cleared: fids.length, delete: del };
 }
 
+function pickFirstQuarkFileInList(list, expectedName = '') {
+  const arr = Array.isArray(list) ? list : [];
+  const want = String(expectedName || '').trim();
+  const isDir = (it) => it && (it.dir === true || it.file_type === 0 || it.type === 'folder' || it.kind === 'folder');
+  let first = null;
+  for (const it of arr) {
+    if (!it || typeof it !== 'object' || isDir(it)) continue;
+    if (!first) first = it;
+    if (!want) continue;
+    const name = String(it.file_name || it.fileName || it.name || '').trim();
+    if (name && name === want) return it;
+  }
+  return first;
+}
+
 async function tryGetShareStoken({ shareId, passcode, cookie }) {
   const pwdId = String(shareId || '').trim();
   if (!pwdId) throw new Error('missing shareId');
@@ -1480,8 +1496,9 @@ const apiPlugins = [
               const name = getQuarkItemName(it);
               if (!fid || !fidToken || !name) continue;
 
-              const displayName = formatDisplayName(pathSegs);
+              const baseDisplay = formatDisplayName(pathSegs);
               const rawName = String(name || '').trim();
+              const displayName = buildPanDisplayName(baseDisplay, it, rawName);
               const id = `${shareId}*${stoken}*${fid}*${fidToken}${rawName ? `***${rawName}` : ''}`;
               parts.push(`${displayName}$${id}`);
 
@@ -1856,25 +1873,8 @@ const apiPlugins = [
             (sortResp && sortResp.data && (sortResp.data.list || sortResp.data.items || sortResp.data.files)) ||
             (sortResp && sortResp.list) ||
             [];
-          if (!Array.isArray(list)) return null;
-          for (const it of list) {
-            if (!it || typeof it !== 'object') continue;
-            const isDir = it.dir === true || it.file_type === 0 || it.type === 'folder' || it.kind === 'folder';
-            if (isDir) continue;
-            return it;
-          }
-          return null;
+          return pickFirstQuarkFileInList(list, parsed.name);
         };
-
-        try {
-          stage = 'clear';
-          await quarkClearDir({ pdirFid: toPdirFid, cookie });
-        } catch (e) {
-          const msg = ((e && e.message) || String(e)).slice(0, 400);
-          panLog(`quark play failed id=${reqId}`, { stage, ms: Date.now() - tStart, message: msg });
-          reply.code(502);
-          return { ok: false, message: msg };
-        }
 
         let savedFid = '';
         try {
