@@ -521,7 +521,7 @@ function normalizeBody(body) {
 function parse189ShareCodeLike(str) {
   const s = toStr(str).trim();
   if (!s) return { shareCode: '', accessCode: '' };
-  const mFlag = s.match(/^(?:天翼|天意)-([A-Za-z0-9]{6,64})$/);
+  const mFlag = s.match(/^天意-([A-Za-z0-9]{6,64})$/);
   if (mFlag && mFlag[1]) return { shareCode: toStr(mFlag[1]).trim(), accessCode: '' };
 
   // cloud.189.cn short share url
@@ -1031,7 +1031,7 @@ export const apiPlugins = [
         if (!shareCodeFinal) {
           return reply.code(400).send({
             ok: false,
-            message: 'missing/invalid shareCode (flag supports: 天翼-<shareCode> / https://cloud.189.cn/t/<shareCode>)',
+            message: 'missing/invalid shareCode (flag supports: 天意-<shareCode> / https://cloud.189.cn/t/<shareCode>)',
           });
         }
 
