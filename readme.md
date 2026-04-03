@@ -115,7 +115,7 @@ npm run dev
 
 ### Tianyi 189（天翼云盘 / cloud.189.cn）
 
-- `POST /api/189/list`：`{ "flag": "天翼-<shareCode>", "shareCode"?: "<shareCode>", "accessCode"?: "" }` → `{ ok, vod_play_url, shareId }`
+- `POST /api/189/list`：`{ "flag": "天意-<shareCode>", "shareCode"?: "<shareCode>", "accessCode"?: "" }` → `{ ok, vod_play_url, shareId }`
   - `vod_play_url` 的 `id` 为 `<fileId>*<shareId>*<fileName?>`
 - `POST /api/189/play`：`{ "id": "<fileId>*<shareId>*<fileName?>", "accessCode"?: "" }` → `{ ok, url }`
 

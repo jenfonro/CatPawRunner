@@ -10,6 +10,7 @@ import {
     getOrCreateSpiderCache,
     isEligibleSpiderCacheRequest,
 } from './util/runtimeSpiderCache.js';
+import { rewritePanmockDetailPayloadFields } from './util/panmockDetailCodec.js';
 
 const spiderPrefix = '/spider';
 
@@ -337,10 +338,25 @@ function cloneHeaders(headers, hopByHop) {
     return outHeaders;
 }
 
+function rewritePanmockDetailPayload(parsed) {
+    if (!parsed || typeof parsed !== 'object') return parsed;
+    if (!parsed.pan_mock) return parsed;
+    const list = Array.isArray(parsed.list) ? parsed.list : null;
+    if (!list || !list.length || !list[0] || typeof list[0] !== 'object') return parsed;
+    const first = { ...list[0] };
+    const rewritten = rewritePanmockDetailPayloadFields(first.vod_play_from, first.vod_play_url);
+    first.vod_play_from = rewritten.vod_play_from;
+    first.vod_play_url = rewritten.vod_play_url;
+    return { ...parsed, list: [first, ...list.slice(1)] };
+}
+
 function rewriteSpiderJsonResponse(parsed, { isDetail, cacheHit }) {
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
-    const next = { ...parsed, cache: !!cacheHit };
-    if (isDetail) next.pan_mock = isPanMockEnabled();
+    let next = { ...parsed, cache: !!cacheHit };
+    if (isDetail) {
+        next.pan_mock = isPanMockEnabled();
+        next = rewritePanmockDetailPayload(next);
+    }
     return next;
 }
 
@@ -1038,6 +1054,15 @@ export default async function router(fastify) {
                             const parsed = raw && raw.trim() ? JSON.parse(raw) : null;
                             if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
                                 parsed.pan_mock = isPanMockEnabled();
+                                if (parsed.pan_mock) {
+                                    const rewritten = rewritePanmockDetailPayload(parsed);
+                                    if (rewritten && typeof rewritten === 'object') {
+                                        Object.keys(parsed).forEach((k) => {
+                                            delete parsed[k];
+                                        });
+                                        Object.assign(parsed, rewritten);
+                                    }
+                                }
                                 const out = Buffer.from(JSON.stringify(parsed), 'utf8');
                                 delete outHeaders['content-length'];
                                 outHeaders['content-length'] = String(out.length);
