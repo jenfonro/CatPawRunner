@@ -151,6 +151,17 @@ function isPanMockEnabled() {
     }
 }
 
+function isProxyDisabled() {
+    try {
+        const runtimeRoot = resolveRuntimeRootDir();
+        const cfgPath = path.resolve(runtimeRoot, 'config.json');
+        const cfgRoot = readConfigJsonSafe(cfgPath);
+        return !!(cfgRoot && cfgRoot.disable_proxy);
+    } catch (_) {
+        return false;
+    }
+}
+
 function readPanBuiltinResolverEnabledFromConfigRoot(root) {
     const cfgRoot = root && typeof root === 'object' && !Array.isArray(root) ? root : {};
     if (Object.prototype.hasOwnProperty.call(cfgRoot, 'panResolver') && typeof cfgRoot.panResolver === 'boolean') return cfgRoot.panResolver;
@@ -800,6 +811,10 @@ export default async function router(fastify) {
             );
 
             fastify.all('/proxy', async (request, reply) => {
+                if (isProxyDisabled()) {
+                    reply.code(403).send({error: 'proxy disabled'});
+                    return;
+                }
                 try {
                     const {thread, chunkSize, url, header} = request.query;
 

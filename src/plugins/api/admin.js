@@ -244,6 +244,7 @@ function readSettingsFromConfig(root) {
     return {
         proxy: typeof cfg.proxy === 'string' ? cfg.proxy : '',
         siteProxy,
+        disable_proxy: !!cfg.disable_proxy,
         pan_mock: !!cfg.pan_mock,
         panBuiltinResolverEnabled: !!cfg.panBuiltinResolverEnabled,
         goProxyApi: typeof cfg.goProxyApi === 'string' ? cfg.goProxyApi : '',
@@ -660,6 +661,7 @@ export const apiPlugins = [
                     }
                     next.siteProxy = out;
                 }
+                if (Object.prototype.hasOwnProperty.call(body, 'disable_proxy')) next.disable_proxy = !!body.disable_proxy;
                 if (Object.prototype.hasOwnProperty.call(body, 'pan_mock')) next.pan_mock = !!body.pan_mock;
                 if (Object.prototype.hasOwnProperty.call(body, 'panBuiltinResolverEnabled'))
                     next.panBuiltinResolverEnabled = !!body.panBuiltinResolverEnabled;
