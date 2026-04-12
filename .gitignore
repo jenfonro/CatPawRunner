@@ -2,10 +2,12 @@ dist
 generated
 node_modules
 build/
+net/
 config.json
 db.json
 runtime.log
 error.log
+package-lock.json
 debug_log/
 .catpaw_online_runtime_bootstrap.cjs
 custom_spider/*.js
