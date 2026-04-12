@@ -38,6 +38,7 @@ npm run dev
 - `proxy`: 全局代理（字符串，空串表示不启用）
 - `siteProxy`: 按“站点”走代理（对象；key 为站点名，value 为代理地址字符串；空串表示该站点强制不走代理）
 - `pan_mock`: 是否开启“网盘 mock/拦截”（布尔；启动时若缺失会自动写回 `false`；支持运行中切换）
+- `packet_capture`: 是否开启“在线脚本出站抓包”（布尔；仅抓子进程脚本发出的 `fetch/http/https` 请求，不含客户端入站请求）
 - `panBuiltinResolverEnabled`: 是否启用内置网盘解析 API
 - `onlineConfigs`: 在线脚本配置（会下载到 `custom_spider/` 并启动子进程 runtime）
 
@@ -168,6 +169,27 @@ CATPAW_MOCK=1 CATPAW_MOCK_DEBUG=1 CATPAW_MOCK_PROVIDERS=quark,uc,139,baidu,tiany
 
 - `http` / `fetch`：脚本尝试访问网盘 API 的请求信息
 - `mock`：返回了哪类 mock 响应（例如 token / detail_placeholder）
+
+## 在线脚本抓包（出站流量）
+
+用途：排查自定义脚本实际发了哪些网络请求（包括请求头/请求体、响应状态/响应体摘要）。
+
+开启方式：
+
+- `PUT /admin/settings` 设置 `packet_capture: true`
+- 或在 `config.json` 中手动设置 `"packet_capture": true`
+
+抓包日志默认写入：
+
+- `net/<domain>.net`（按域名分文件，例如 `net/pan.baidu.com.net`）
+
+说明：
+
+- 仅记录 online runtime 子进程发起的出站请求（`fetch/http/https`）。
+- 不记录客户端打到 catpawrunner 的入站请求及其回包。
+- 记录格式为类 Fiddler 文本块，包含：请求方法、请求路径、请求 payload、响应内容（含状态与头）。
+- `pan_mock` 与抓包开关独立：当 `pan_mock` 命中拦截时，抓包记录会标注 `PanMockIntercepted: true`。
+- 为避免日志过大，请求/响应体会截断（默认最多 16KB，文本中会标出 `truncated=true`）。
 
 ### 占位文件名（用于把“分享码/提取码”带回脚本侧）
 

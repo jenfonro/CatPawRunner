@@ -58,6 +58,8 @@ function readJsonFileSafe(filePath) {
 }
 
 const DEFAULT_MOCK_PROVIDERS = ['quark', 'uc', '139', 'baidu', 'tianyi'];
+const DEFAULT_PACKET_CAPTURE_BODY_LIMIT = 16 * 1024;
+const MAX_PACKET_CAPTURE_BODY_LIMIT = 1024 * 1024;
 
 function isRuntimeDebugEnabled() {
     try {
@@ -133,6 +135,55 @@ export function broadcastOnlineRuntimeProxyConfig({ rootDir } = {}) {
         const cfg = readProxyConfigFromRuntimeRoot(dir);
         for (const { child } of children.values()) {
             sendProxyConfigToChild(child, cfg);
+        }
+    } catch (_) {}
+}
+
+function normalizePacketCaptureBodyLimit(raw) {
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return DEFAULT_PACKET_CAPTURE_BODY_LIMIT;
+    const i = Math.trunc(n);
+    if (i <= 0) return 0;
+    return Math.min(i, MAX_PACKET_CAPTURE_BODY_LIMIT);
+}
+
+function readPacketCaptureConfigFromRuntimeRoot(rootDir) {
+    try {
+        const cfgPath = path.resolve(rootDir, 'config.json');
+        const cfg = readJsonFileSafe(cfgPath);
+        const enabled = !!(cfg && cfg.packet_capture);
+        const bodyLimit = normalizePacketCaptureBodyLimit(
+            cfg && Object.prototype.hasOwnProperty.call(cfg, 'packet_capture_body_limit')
+                ? cfg.packet_capture_body_limit
+                : DEFAULT_PACKET_CAPTURE_BODY_LIMIT
+        );
+        const dir = typeof (cfg && cfg.packet_capture_dir) === 'string' ? cfg.packet_capture_dir.trim() : '';
+        return { enabled, bodyLimit, dir };
+    } catch (_) {
+        return { enabled: false, bodyLimit: DEFAULT_PACKET_CAPTURE_BODY_LIMIT, dir: '' };
+    }
+}
+
+function sendPacketCaptureConfigToChild(childProc, captureCfg) {
+    try {
+        if (!childProc || typeof childProc.send !== 'function') return;
+        if (childProc.killed) return;
+        const cfg = captureCfg && typeof captureCfg === 'object' ? captureCfg : {};
+        childProc.send({
+            type: 'packet_capture_config',
+            enabled: !!cfg.enabled,
+            bodyLimit: normalizePacketCaptureBodyLimit(cfg.bodyLimit),
+            dir: typeof cfg.dir === 'string' ? cfg.dir : '',
+        });
+    } catch (_) {}
+}
+
+export function broadcastOnlineRuntimePacketCaptureConfig({ rootDir } = {}) {
+    try {
+        const dir = rootDir ? path.resolve(String(rootDir)) : getRootDir();
+        const cfg = readPacketCaptureConfigFromRuntimeRoot(dir);
+        for (const { child } of children.values()) {
+            sendPacketCaptureConfigToChild(child, cfg);
         }
     } catch (_) {}
 }
@@ -1087,6 +1138,394 @@ export async function startOnlineRuntime({
 			        return '';
 			      }
 			    };
+
+			    const __packetCaptureState = (() => {
+			      const parseBool = (v) => {
+			        try {
+			          const s = String(v == null ? '' : v).trim().toLowerCase();
+			          return s === '1' || s === 'true' || s === 'yes' || s === 'on';
+			        } catch (_) {
+			          return false;
+			        }
+			      };
+			      const parseLimit = (v) => {
+			        try {
+			          const n = Number(v);
+			          if (!Number.isFinite(n)) return 16 * 1024;
+			          const i = Math.trunc(n);
+			          if (i <= 0) return 0;
+			          return Math.min(i, 1024 * 1024);
+			        } catch (_) {
+			          return 16 * 1024;
+			        }
+			      };
+			      return {
+			        enabled: parseBool(process.env.CATPAW_PACKET_CAPTURE || ''),
+			        bodyLimit: parseLimit(process.env.CATPAW_PACKET_CAPTURE_BODY_LIMIT || ''),
+			        dir: String(process.env.CATPAW_PACKET_CAPTURE_DIR || '').trim(),
+			        seq: 0,
+			      };
+			    })();
+
+			    const __packetCaptureEnabled = () => {
+			      try {
+			        return !!(__packetCaptureState && __packetCaptureState.enabled);
+			      } catch (_) {
+			        return false;
+			      }
+			    };
+
+			    const __packetCaptureBodyLimit = () => {
+			      try {
+			        const n = Number(__packetCaptureState && __packetCaptureState.bodyLimit);
+			        if (!Number.isFinite(n)) return 16 * 1024;
+			        const i = Math.trunc(n);
+			        if (i <= 0) return 0;
+			        return Math.min(i, 1024 * 1024);
+			      } catch (_) {
+			        return 16 * 1024;
+			      }
+			    };
+
+			    const __applyPacketCaptureConfig = (cfg) => {
+			      try {
+			        if (!cfg || typeof cfg !== 'object') return;
+			        if (Object.prototype.hasOwnProperty.call(cfg, 'enabled')) {
+			          __packetCaptureState.enabled = !!cfg.enabled;
+			        }
+			        if (Object.prototype.hasOwnProperty.call(cfg, 'bodyLimit')) {
+			          const n = Number(cfg.bodyLimit);
+			          if (Number.isFinite(n)) {
+			            const i = Math.trunc(n);
+			            __packetCaptureState.bodyLimit = i <= 0 ? 0 : Math.min(i, 1024 * 1024);
+			          }
+			        }
+			        if (Object.prototype.hasOwnProperty.call(cfg, 'dir')) {
+			          __packetCaptureState.dir = typeof cfg.dir === 'string' ? cfg.dir.trim() : '';
+			        }
+			      } catch (_) {}
+			    };
+
+			    const __sanitizeFileSeg = (raw) => {
+			      try {
+			        let s = String(raw == null ? '' : raw).trim().toLowerCase();
+			        if (!s) return 'unknown';
+			        s = s.replace(/[^a-z0-9._-]+/g, '_');
+			        s = s.replace(/^_+|_+$/g, '');
+			        return s || 'unknown';
+			      } catch (_) {
+			        return 'unknown';
+			      }
+			    };
+
+			    const __mkPacketCaptureLogPath = (hostLike) => {
+			      try {
+			        const host = __normalizeHost(hostLike) || 'unknown';
+			        const file = __sanitizeFileSeg(host) + '.net';
+			        const dirRaw =
+			          (__packetCaptureState && typeof __packetCaptureState.dir === 'string' && __packetCaptureState.dir.trim())
+			            ? __packetCaptureState.dir.trim()
+			            : 'net';
+			        const dir = path.isAbsolute(dirRaw) ? dirRaw : path.resolve(__logRoot, dirRaw);
+			        return path.resolve(dir, file);
+			      } catch (_) {
+			        return '';
+			      }
+			    };
+
+			    const __nextPacketCaptureId = () => {
+			      try {
+			        if (!__packetCaptureState || typeof __packetCaptureState !== 'object') return '';
+			        __packetCaptureState.seq = (Number(__packetCaptureState.seq || 0) + 1) % 1000000000;
+			        const seq = Math.max(1, Math.trunc(Number(__packetCaptureState.seq || 1)));
+			        return String(Date.now()) + '-' + String(seq);
+			      } catch (_) {
+			        return String(Date.now());
+			      }
+			    };
+
+			    const __normalizeCaptureHeaders = (headersLike) => {
+			      const out = {};
+			      try {
+			        if (!headersLike) return out;
+			        if (typeof headersLike.forEach === 'function') {
+			          headersLike.forEach((v, k) => {
+			            try {
+			              const key = String(k == null ? '' : k).trim().toLowerCase();
+			              if (!key) return;
+			              if (Array.isArray(v)) out[key] = v.map((it) => String(it == null ? '' : it)).join(', ');
+			              else out[key] = String(v == null ? '' : v);
+			            } catch (_) {}
+			          });
+			          return out;
+			        }
+			        if (Array.isArray(headersLike)) {
+			          for (const pair of headersLike) {
+			            if (!Array.isArray(pair) || pair.length < 2) continue;
+			            const key = String(pair[0] == null ? '' : pair[0]).trim().toLowerCase();
+			            if (!key) continue;
+			            out[key] = String(pair[1] == null ? '' : pair[1]);
+			          }
+			          return out;
+			        }
+			        if (typeof headersLike === 'object') {
+			          for (const k of Object.keys(headersLike)) {
+			            const key = String(k == null ? '' : k).trim().toLowerCase();
+			            if (!key) continue;
+			            const v = headersLike[k];
+			            if (v == null) continue;
+			            if (Array.isArray(v)) out[key] = v.map((it) => String(it == null ? '' : it)).join(', ');
+			            else out[key] = String(v);
+			          }
+			        }
+			      } catch (_) {}
+			      return out;
+			    };
+
+			    const __toCaptureBuffer = (value, encoding) => {
+			      try {
+			        if (value == null) return Buffer.alloc(0);
+			        if (Buffer.isBuffer(value)) return value;
+			        if (value instanceof Uint8Array) return Buffer.from(value);
+			        if (typeof value === 'string') return Buffer.from(value, typeof encoding === 'string' ? encoding : 'utf8');
+			        if (typeof value === 'object') {
+			          try {
+			            return Buffer.from(JSON.stringify(value), 'utf8');
+			          } catch (_) {
+			            return Buffer.from(String(value), 'utf8');
+			          }
+			        }
+			        return Buffer.from(String(value), 'utf8');
+			      } catch (_) {
+			        return Buffer.alloc(0);
+			      }
+			    };
+
+			    const __captureBodyPreview = (value, maxBytes) => {
+			      try {
+			        const limitRaw = Number.isFinite(Number(maxBytes)) ? Math.trunc(Number(maxBytes)) : __packetCaptureBodyLimit();
+			        const limit = limitRaw <= 0 ? 0 : limitRaw;
+			        const buf = __toCaptureBuffer(value);
+			        const bytes = buf.length;
+			        if (limit <= 0 || !bytes) return { text: '', bytes, truncated: false };
+			        const clipped = bytes > limit ? buf.subarray(0, limit) : buf;
+			        let text = '';
+			        try {
+			          text = clipped.toString('utf8');
+			        } catch (_) {
+			          text = '';
+			        }
+			        return {
+			          text: __safeSlice(text, Math.max(0, limit * 2)),
+			          bytes,
+			          truncated: bytes > limit,
+			        };
+			      } catch (_) {
+			        return { text: '', bytes: 0, truncated: false };
+			      }
+			    };
+
+			    const __captureFetchResponseBody = async (responseLike, maxBytes) => {
+			      try {
+			        const limitRaw = Number.isFinite(Number(maxBytes)) ? Math.trunc(Number(maxBytes)) : __packetCaptureBodyLimit();
+			        const limit = limitRaw <= 0 ? 0 : limitRaw;
+			        if (limit <= 0) return { text: '', bytes: 0, truncated: false };
+			        const cloned = responseLike && typeof responseLike.clone === 'function' ? responseLike.clone() : null;
+			        if (!cloned) return { text: '', bytes: 0, truncated: false };
+			        if (cloned.body && typeof cloned.body.getReader === 'function') {
+			          const reader = cloned.body.getReader();
+			          const chunks = [];
+			          let total = 0;
+			          let stored = 0;
+			          let truncated = false;
+			          while (true) {
+			            const step = await reader.read();
+			            if (!step || step.done) break;
+			            const chunk = __toCaptureBuffer(step.value);
+			            if (!chunk.length) continue;
+			            total += chunk.length;
+			            if (stored < limit) {
+			              const remain = Math.max(0, limit - stored);
+			              const take = Math.min(remain, chunk.length);
+			              if (take > 0) {
+			                chunks.push(chunk.subarray(0, take));
+			                stored += take;
+			              }
+			            }
+			            if (total > limit) {
+			              truncated = true;
+			              try {
+			                await reader.cancel();
+			              } catch (_) {}
+			              break;
+			            }
+			          }
+			          const previewBuf = chunks.length ? Buffer.concat(chunks) : Buffer.alloc(0);
+			          let text = '';
+			          try {
+			            text = previewBuf.toString('utf8');
+			          } catch (_) {
+			            text = '';
+			          }
+			          return {
+			            text: __safeSlice(text, Math.max(0, limit * 2)),
+			            bytes: total,
+			            truncated,
+			          };
+			        }
+			        if (typeof cloned.arrayBuffer === 'function') {
+			          const ab = await cloned.arrayBuffer();
+			          return __captureBodyPreview(Buffer.from(ab), limit);
+			        }
+			      } catch (_) {}
+			      return { text: '', bytes: 0, truncated: false };
+			    };
+
+			    const __pathFromUrl = (rawUrl) => {
+			      try {
+			        const u = new URL(String(rawUrl || ''));
+			        return String(u.pathname || '') + String(u.search || '');
+			      } catch (_) {
+			        return '';
+			      }
+			    };
+
+			    const __composeUrl = (protocolLike, hostLike, portLike, pathLike) => {
+			      try {
+			        const protocol = String(protocolLike || '').trim() || 'http:';
+			        const host = __normalizeHost(hostLike);
+			        if (!host) return '';
+			        const p = Number(portLike || 0);
+			        const defaultPort =
+			          protocol === 'https:' ? 443 : protocol === 'http:' ? 80 : 0;
+			        const suffix = p > 0 && p !== defaultPort ? ':' + String(p) : '';
+			        const pth = String(pathLike || '').trim() || '/';
+			        const normalizedPath = pth.startsWith('/') ? pth : '/' + pth;
+			        return protocol + '//' + host + suffix + normalizedPath;
+			      } catch (_) {
+			        return '';
+			      }
+			    };
+
+			    const __formatCaptureHeadersText = (headersObj) => {
+			      try {
+			        const h = headersObj && typeof headersObj === 'object' ? headersObj : {};
+			        const keys = Object.keys(h);
+			        if (!keys.length) return '(empty)';
+			        return keys
+			          .sort((a, b) => String(a).localeCompare(String(b), 'en'))
+			          .map((k) => String(k) + ': ' + String(h[k] == null ? '' : h[k]))
+			          .join(String.fromCharCode(10));
+			      } catch (_) {
+			        return '(empty)';
+			      }
+			    };
+
+			    const __fmtCaptureBodyText = (text, bytes, truncated) => {
+			      try {
+			        const s = typeof text === 'string' ? text : text == null ? '' : String(text);
+			        const b = Number.isFinite(Number(bytes)) ? Math.max(0, Math.trunc(Number(bytes))) : s.length;
+			        const t = !!truncated;
+			        const head = '[bytes=' + String(b) + (t ? ', truncated=true' : '') + ']';
+			        if (!s) return head + String.fromCharCode(10) + '(empty)';
+			        return head + String.fromCharCode(10) + s;
+			      } catch (_) {
+			        return '[bytes=0]' + String.fromCharCode(10) + '(empty)';
+			      }
+			    };
+
+			    const __toCaptureTextBlock = (record) => {
+			      try {
+			        const r = record && typeof record === 'object' ? record : {};
+			        const req = r.request && typeof r.request === 'object' ? r.request : {};
+			        const resp = r.response && typeof r.response === 'object' ? r.response : null;
+			        const err = r.error && typeof r.error === 'object' ? r.error : null;
+			        const nowIso = (() => {
+			          try {
+			            return new Date(Number.isFinite(Number(r.at)) ? Number(r.at) : Date.now()).toISOString();
+			          } catch (_) {
+			            return new Date().toISOString();
+			          }
+			        })();
+			        const id = r.id ? String(r.id) : '';
+			        const runtimeId = String(process.env.ONLINE_ID || '').trim() || 'online';
+			        const reqMethod = String(req.method || '').trim().toUpperCase() || 'GET';
+			        const reqUrl = String(req.url || '').trim();
+			        const reqPath = String(req.path || '').trim();
+			        const reqHost = __normalizeHost(req.host || reqUrl) || 'unknown';
+			        const reqPayload = __fmtCaptureBodyText(req.body, req.body_bytes, req.body_truncated);
+			        const reqHeaders = __formatCaptureHeadersText(req.headers);
+			        const lines = [];
+			        lines.push('='.repeat(78));
+			        lines.push('Time: ' + nowIso + '  ID: ' + id + '  Runtime: ' + runtimeId);
+			        lines.push('Type: ' + String(r.type || '') + '  DurationMs: ' + String(Number.isFinite(Number(r.duration_ms)) ? Math.max(0, Math.trunc(Number(r.duration_ms))) : 0));
+			        lines.push('PanMockIntercepted: ' + String(!!r.pan_mock_intercepted));
+			        lines.push('');
+			        lines.push('[Request]');
+			        lines.push('Method: ' + reqMethod);
+			        lines.push('Host: ' + reqHost);
+			        lines.push('Path: ' + reqPath);
+			        lines.push('URL: ' + reqUrl);
+			        lines.push('Headers:');
+			        lines.push(reqHeaders);
+			        lines.push('Payload:');
+			        lines.push(reqPayload);
+			        lines.push('');
+			        if (resp) {
+			          const respHeaders = __formatCaptureHeadersText(resp.headers);
+			          const respBody = __fmtCaptureBodyText(resp.body, resp.body_bytes, resp.body_truncated);
+			          lines.push('[Response]');
+			          lines.push('Status: ' + String(Number.isFinite(Number(resp.status)) ? Math.max(0, Math.trunc(Number(resp.status))) : 0));
+			          lines.push('Headers:');
+			          lines.push(respHeaders);
+			          lines.push('Content:');
+			          lines.push(respBody);
+			          lines.push('');
+			        }
+			        if (err) {
+			          lines.push('[Error]');
+			          lines.push('Name: ' + String(err.name || ''));
+			          lines.push('Code: ' + String(err.code || ''));
+			          lines.push('Message: ' + String(err.message || ''));
+			          lines.push('');
+			        }
+			        if (r.aborted) lines.push('[Lifecycle] aborted=true');
+			        if (r.closed) lines.push('[Lifecycle] closed=true');
+			        lines.push('');
+			        return lines.join(String.fromCharCode(10));
+			      } catch (_) {
+			        return '';
+			      }
+			    };
+
+			    const __appendPacketCaptureLog = (obj) => {
+			      try {
+			        if (!__packetCaptureEnabled()) return;
+			        const o = obj && typeof obj === 'object' && !Array.isArray(obj) ? { ...obj } : { value: obj };
+			        const req = o && o.request && typeof o.request === 'object' ? o.request : {};
+			        const host = __normalizeHost(req.host || req.url || '') || 'unknown';
+			        const p = __mkPacketCaptureLogPath(host);
+			        if (!p) return;
+			        try {
+			          const dir = path.dirname(p);
+			          if (dir && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+			        } catch (_) {}
+			        if (!Object.prototype.hasOwnProperty.call(o, 't')) o.t = Date.now();
+			        const block = __toCaptureTextBlock(o);
+			        if (!block) return;
+			        fs.appendFileSync(p, block, 'utf8');
+			      } catch (_) {}
+			    };
+
+			    try {
+			      process.on('message', (msg) => {
+			        try {
+			          if (!msg || typeof msg !== 'object') return;
+			          if (msg.type !== 'packet_capture_config') return;
+			          __applyPacketCaptureConfig(msg);
+			        } catch (_) {}
+			      });
+			    } catch (_) {}
 
 			    const __parseUrlEncoded = (raw) => {
 			      try {
@@ -2477,6 +2916,113 @@ export async function startOnlineRuntime({
 						      }
 						    } catch (_) {}
 
+						    // Packet capture for script outbound fetch traffic.
+						    try {
+						      if (typeof globalThis.fetch === 'function' && !globalThis.__catpaw_capture_fetch_patched) {
+						        globalThis.__catpaw_capture_fetch_patched = true;
+						        const __origFetchCapture = globalThis.fetch.bind(globalThis);
+						        globalThis.fetch = async function capturedFetch(input, init) {
+						          const enabled = __packetCaptureEnabled();
+						          const startedAt = Date.now();
+						          const requestId = enabled ? __nextPacketCaptureId() : '';
+						          let method = 'GET';
+						          let url = '';
+						          let panMockIntercepted = false;
+						          let reqHeaders = {};
+						          let reqBody = { text: '', bytes: 0, truncated: false };
+						          try {
+						            method =
+						              init && typeof init === 'object' && init.method
+						                ? String(init.method).toUpperCase()
+						                : input && typeof input === 'object' && input.method
+						                  ? String(input.method).toUpperCase()
+						                  : 'GET';
+						            url =
+						              typeof input === 'string'
+						                ? input
+						                : input && typeof input === 'object' && typeof input.url === 'string'
+						                  ? input.url
+						                  : '';
+						            const headerSource =
+						              init && typeof init === 'object' && Object.prototype.hasOwnProperty.call(init, 'headers')
+						                ? init.headers
+						                : input && typeof input === 'object' && input.headers
+						                  ? input.headers
+						                  : null;
+						            reqHeaders = __normalizeCaptureHeaders(headerSource);
+						            const bodySource =
+						              init && typeof init === 'object' && Object.prototype.hasOwnProperty.call(init, 'body') ? init.body : null;
+						            reqBody = __captureBodyPreview(bodySource, __packetCaptureBodyLimit());
+						            panMockIntercepted = !!__pickInterceptor(url);
+						          } catch (_) {}
+						          try {
+						            const res = await __origFetchCapture(input, init);
+						            if (enabled) {
+						              let resHeaders = {};
+						              let resBody = { text: '', bytes: 0, truncated: false };
+						              try {
+						                resHeaders = __normalizeCaptureHeaders(res && res.headers ? res.headers : null);
+						              } catch (_) {}
+						              try {
+						                resBody = await __captureFetchResponseBody(res, __packetCaptureBodyLimit());
+						              } catch (_) {}
+						              __appendPacketCaptureLog({
+						                type: 'fetch',
+						                id: requestId,
+						                at: startedAt,
+						                duration_ms: Date.now() - startedAt,
+						                pan_mock_intercepted: panMockIntercepted,
+						                request: {
+						                  method,
+						                  url,
+						                  host: __normalizeHost(url),
+						                  path: __pathFromUrl(url),
+						                  headers: reqHeaders,
+						                  body: reqBody.text,
+						                  body_bytes: reqBody.bytes,
+						                  body_truncated: reqBody.truncated,
+						                },
+						                response: {
+						                  status: res && Number.isFinite(Number(res.status)) ? Math.max(0, Math.trunc(Number(res.status))) : 0,
+						                  headers: resHeaders,
+						                  body: resBody.text,
+						                  body_bytes: resBody.bytes,
+						                  body_truncated: resBody.truncated,
+						                },
+						              });
+						            }
+						            return res;
+						          } catch (e) {
+						            if (enabled) {
+						              __appendPacketCaptureLog({
+						                type: 'fetch',
+						                id: requestId,
+						                at: startedAt,
+						                duration_ms: Date.now() - startedAt,
+						                pan_mock_intercepted: panMockIntercepted,
+						                request: {
+						                  method,
+						                  url,
+						                  host: __normalizeHost(url),
+						                  path: __pathFromUrl(url),
+						                  headers: reqHeaders,
+						                  body: reqBody.text,
+						                  body_bytes: reqBody.bytes,
+						                  body_truncated: reqBody.truncated,
+						                },
+						                error: {
+						                  message: e && e.message ? String(e.message) : String(e),
+						                  code: e && e.code ? String(e.code) : '',
+						                  name: e && e.name ? String(e.name) : '',
+						                },
+						              });
+						            }
+						            throw e;
+						          }
+						        };
+						      }
+						    } catch (_) {}
+
 						    /* Tape (record/replay) for scripts using fetch (undici).
 						    try {
 						      if (__tapeMode !== 'off' && __tapeTargets && __tapeTargets.size && typeof globalThis.fetch === 'function' && !globalThis.__catpaw_tape_fetch_patched) {
@@ -2782,11 +3328,12 @@ export async function startOnlineRuntime({
 		              const { Readable } = require('stream');
 		              const interceptor = it;
 		              class __CatPawBlockedRequest extends EventEmitter {
-		                constructor(err, meta) {
-		                  super();
+	                constructor(err, meta) {
+	                  super();
 	                  this._err = err;
 	                  this._meta = meta || {};
 	                  this._chunks = [];
+	                  this._startedAt = Date.now();
 	                  this.aborted = false;
 	                  this.destroyed = false;
 	                  this.writable = true;
@@ -2798,7 +3345,8 @@ export async function startOnlineRuntime({
 	                      if (this.destroyed) return;
 			                      try {
 			                        const buf = this._chunks && this._chunks.length ? Buffer.concat(this._chunks) : Buffer.alloc(0);
-			                        const body = buf.length ? buf.toString('utf8').slice(0, 4096) : '';
+			                        const reqBodyCap = __captureBodyPreview(buf, __packetCaptureBodyLimit());
+			                        const body = reqBodyCap && typeof reqBodyCap.text === 'string' ? reqBodyCap.text : '';
 			                        try { this._meta.body = body; } catch (_) {}
 				                        try {
 				                          const creds = __extractInterceptCreds(interceptor && interceptor.name ? interceptor.name : '', this._meta.host || '', this._meta.path || '', this._meta.headers || {}, body);
@@ -2840,6 +3388,7 @@ export async function startOnlineRuntime({
 					                        }
 					                      })();
 					                      const payload = payloadBuf.toString('utf8');
+					                      const resBodyCap = __captureBodyPreview(payloadBuf, __packetCaptureBodyLimit());
 					                      const res = Readable.from([payloadBuf]);
 				                      const statusCode = mocked && Number.isFinite(mocked.statusCode) ? mocked.statusCode : 200;
 				                      const headersRaw = mocked && mocked.headers && typeof mocked.headers === 'object' ? mocked.headers : null;
@@ -2863,6 +3412,34 @@ export async function startOnlineRuntime({
 			                            total: meta && meta._total != null ? meta._total : null,
 			                          });
 			                        }
+			                      } catch (_) {}
+			                      try {
+			                        __appendPacketCaptureLog({
+			                          type: 'http',
+			                          id: __nextPacketCaptureId(),
+			                          at: this._startedAt || Date.now(),
+			                          duration_ms: Date.now() - (this._startedAt || Date.now()),
+			                          pan_mock_intercepted: true,
+			                          request: {
+			                            method: this._meta.method || '',
+			                            protocol: '',
+			                            url: __composeUrl('', this._meta.host || '', 0, this._meta.path || ''),
+			                            host: this._meta.host || '',
+			                            port: 0,
+			                            path: this._meta.path || '',
+			                            headers: __normalizeCaptureHeaders(this._meta.headers || {}),
+			                            body: body,
+			                            body_bytes: reqBodyCap && Number.isFinite(Number(reqBodyCap.bytes)) ? Math.max(0, Math.trunc(Number(reqBodyCap.bytes))) : 0,
+			                            body_truncated: !!(reqBodyCap && reqBodyCap.truncated),
+			                          },
+			                          response: {
+			                            status: statusCode,
+			                            headers: __normalizeCaptureHeaders(headers || {}),
+			                            body: resBodyCap && typeof resBodyCap.text === 'string' ? resBodyCap.text : payload,
+			                            body_bytes: resBodyCap && Number.isFinite(Number(resBodyCap.bytes)) ? Math.max(0, Math.trunc(Number(resBodyCap.bytes))) : 0,
+			                            body_truncated: !!(resBodyCap && resBodyCap.truncated),
+			                          },
+			                        });
 			                      } catch (_) {}
 			                      try { if (cb2) cb2(res); } catch (_) {}
 			                      this.emit('response', res);
@@ -2981,6 +3558,244 @@ export async function startOnlineRuntime({
 	        } catch (_) {}
 
 	        const req = orig.call(mod, options, cb);
+	        try {
+	          if (__packetCaptureEnabled() && req) {
+	            const startedAt = Date.now();
+	            const requestId = __nextPacketCaptureId();
+	            const limit = __packetCaptureBodyLimit();
+	            const meta = (() => {
+	              try {
+	                const isUrl2 = options && typeof options === 'object' && options instanceof URL;
+	                const isObj = options && typeof options === 'object' && !Array.isArray(options) && !isUrl2;
+	                let protocol = mod === https ? 'https:' : 'http:';
+	                if (isUrl2 && options.protocol) protocol = String(options.protocol || protocol);
+	                else if (isObj && typeof options.protocol === 'string' && options.protocol) protocol = String(options.protocol);
+	                let hostRaw = '';
+	                if (isUrl2) hostRaw = String(options.hostname || '');
+	                else if (typeof options === 'string') {
+	                  try {
+	                    hostRaw = String(new URL(options).hostname || '');
+	                  } catch (_) {}
+	                } else if (isObj) {
+	                  hostRaw = String(options.hostname || options.host || '');
+	                }
+	                const host = __normalizeHost(hostRaw);
+	                let pathLike = '/';
+	                if (isUrl2) {
+	                  pathLike = String(options.pathname || '') + String(options.search || '');
+	                } else if (typeof options === 'string') {
+	                  try {
+	                    const u = new URL(options);
+	                    pathLike = String(u.pathname || '') + String(u.search || '') || '/';
+	                  } catch (_) {}
+	                } else if (isObj && typeof options.path === 'string' && options.path) {
+	                  pathLike = String(options.path);
+	                }
+	                if (!pathLike) pathLike = '/';
+	                let port = 0;
+	                if (isUrl2) {
+	                  const p = Number(options.port || 0);
+	                  port = Number.isFinite(p) && p > 0 ? Math.trunc(p) : protocol === 'https:' ? 443 : 80;
+	                } else if (typeof options === 'string') {
+	                  try {
+	                    const u = new URL(options);
+	                    const p = Number(u.port || 0);
+	                    const up = String(u.protocol || '').trim();
+	                    port = Number.isFinite(p) && p > 0 ? Math.trunc(p) : up === 'https:' ? 443 : 80;
+	                  } catch (_) {
+	                    port = protocol === 'https:' ? 443 : 80;
+	                  }
+	                } else if (isObj) {
+	                  const p = Number(options.port || 0);
+	                  if (Number.isFinite(p) && p > 0) port = Math.trunc(p);
+	                  if (!port && typeof options.host === 'string') {
+	                    const m = /:(\d+)$/.exec(String(options.host || '').trim());
+	                    if (m && m[1]) {
+	                      const p2 = Number(m[1]);
+	                      if (Number.isFinite(p2) && p2 > 0) port = Math.trunc(p2);
+	                    }
+	                  }
+	                  if (!port) port = protocol === 'https:' ? 443 : 80;
+	                }
+	                const method =
+	                  isObj && options.method ? String(options.method).toUpperCase() : 'GET';
+	                const headers = __normalizeCaptureHeaders(isObj && options.headers ? options.headers : null);
+	                let url = host ? __composeUrl(protocol, host, port, pathLike) : '';
+	                if (!url && typeof options === 'string') url = String(options || '');
+	                return { protocol, method, host, port, path: pathLike, url, headers };
+	              } catch (_) {
+	                return {
+	                  protocol: mod === https ? 'https:' : 'http:',
+	                  method: 'GET',
+	                  host: '',
+	                  port: 0,
+	                  path: '',
+	                  url: '',
+	                  headers: {},
+	                };
+	              }
+	            })();
+
+	            const reqState = { chunks: [], total: 0, stored: 0 };
+	            const resState = { chunks: [], total: 0, stored: 0 };
+	            const pushChunk = (state, data, enc) => {
+	              try {
+	                const buf = __toCaptureBuffer(data, enc);
+	                if (!buf || !buf.length) return;
+	                state.total += buf.length;
+	                if (limit <= 0) return;
+	                if (state.stored >= limit) return;
+	                const remain = Math.max(0, limit - state.stored);
+	                if (!remain) return;
+	                const take = Math.min(buf.length, remain);
+	                if (take <= 0) return;
+	                state.chunks.push(buf.subarray(0, take));
+	                state.stored += take;
+	              } catch (_) {}
+	            };
+	            const packBody = (state) => {
+	              try {
+	                const bodyBuf = state && state.chunks && state.chunks.length ? Buffer.concat(state.chunks) : Buffer.alloc(0);
+	                let text = '';
+	                try {
+	                  text = bodyBuf.toString('utf8');
+	                } catch (_) {
+	                  text = '';
+	                }
+	                const bytes = Number.isFinite(Number(state && state.total)) ? Math.max(0, Math.trunc(Number(state.total))) : bodyBuf.length;
+	                return {
+	                  body: text,
+	                  body_bytes: bytes,
+	                  body_truncated: limit > 0 && bytes > limit,
+	                };
+	              } catch (_) {
+	                return { body: '', body_bytes: 0, body_truncated: false };
+	              }
+	            };
+	            let done = false;
+	            const finish = (payload) => {
+	              try {
+	                if (done) return;
+	                done = true;
+	                const reqBodyOut = packBody(reqState);
+	                const resBodyOut = packBody(resState);
+	                const out = {
+	                  type: 'http',
+	                  id: requestId,
+	                  at: startedAt,
+	                  duration_ms: Date.now() - startedAt,
+	                  pan_mock_intercepted: false,
+	                  request: {
+	                    method: meta.method,
+	                    protocol: meta.protocol,
+	                    url: meta.url,
+	                    host: meta.host,
+	                    port: meta.port,
+	                    path: meta.path,
+	                    headers: meta.headers,
+	                    body: reqBodyOut.body,
+	                    body_bytes: reqBodyOut.body_bytes,
+	                    body_truncated: reqBodyOut.body_truncated,
+	                  },
+	                };
+	                const p = payload && typeof payload === 'object' ? payload : {};
+	                if (p.response && typeof p.response === 'object') {
+	                  out.response = {
+	                    status:
+	                      Number.isFinite(Number(p.response.status)) && Number(p.response.status) > 0
+	                        ? Math.trunc(Number(p.response.status))
+	                        : 0,
+	                    headers:
+	                      p.response.headers && typeof p.response.headers === 'object' ? p.response.headers : {},
+	                    body: resBodyOut.body,
+	                    body_bytes: resBodyOut.body_bytes,
+	                    body_truncated: resBodyOut.body_truncated,
+	                  };
+	                }
+	                if (p.error && typeof p.error === 'object') out.error = p.error;
+	                if (p.aborted) out.aborted = true;
+	                if (p.closed) out.closed = true;
+	                __appendPacketCaptureLog(out);
+	              } catch (_) {}
+	            };
+
+	            try {
+	              if (typeof req.write === 'function') {
+	                const ow = req.write.bind(req);
+	                req.write = function patchedWrite(d, enc, cb2) {
+	                  try {
+	                    pushChunk(reqState, d, enc);
+	                  } catch (_) {}
+	                  return ow(d, enc, cb2);
+	                };
+	              }
+	            } catch (_) {}
+
+	            try {
+	              if (typeof req.end === 'function') {
+	                const oe = req.end.bind(req);
+	                req.end = function patchedEnd(d, enc, cb2) {
+	                  try {
+	                    if (d != null && typeof d !== 'function') pushChunk(reqState, d, enc);
+	                  } catch (_) {}
+	                  return oe(d, enc, cb2);
+	                };
+	              }
+	            } catch (_) {}
+
+	            try {
+	              req.once('response', (res) => {
+	                const resHeaders = __normalizeCaptureHeaders(res && res.headers ? res.headers : null);
+	                try {
+	                  if (res && typeof res.on === 'function') {
+	                    res.on('data', (chunk) => {
+	                      try {
+	                        pushChunk(resState, chunk);
+	                      } catch (_) {}
+	                    });
+	                    res.on('end', () => {
+	                      finish({
+	                        response: {
+	                          status: res && Number.isFinite(Number(res.statusCode)) ? Math.max(0, Math.trunc(Number(res.statusCode))) : 0,
+	                          headers: resHeaders,
+	                        },
+	                      });
+	                    });
+	                    res.on('error', (e) => {
+	                      finish({
+	                        error: {
+	                          message: e && e.message ? String(e.message) : String(e),
+	                          code: e && e.code ? String(e.code) : '',
+	                          name: e && e.name ? String(e.name) : '',
+	                        },
+	                      });
+	                    });
+	                  }
+	                } catch (_) {}
+	              });
+	            } catch (_) {}
+
+	            try {
+	              req.once('error', (e) => {
+	                finish({
+	                  error: {
+	                    message: e && e.message ? String(e.message) : String(e),
+	                    code: e && e.code ? String(e.code) : '',
+	                    name: e && e.name ? String(e.name) : '',
+	                  },
+	                });
+	              });
+	            } catch (_) {}
+
+	            try {
+	              req.once('abort', () => finish({ aborted: true }));
+	            } catch (_) {}
+
+	            try {
+	              req.once('close', () => finish({ closed: true }));
+	            } catch (_) {}
+	          }
+	        } catch (_) {}
 	        return req;
 	      };
 	    };
@@ -3747,6 +4562,7 @@ export async function startOnlineRuntime({
 				        const baseEnv = { ...process.env };
 				        const panMockCfg = readPanMockConfigFromRuntimeRoot(rootDir);
                         const proxyCfg = readProxyConfigFromRuntimeRoot(rootDir);
+                        const packetCaptureCfg = readPacketCaptureConfigFromRuntimeRoot(rootDir);
 				        const resolvedEntryFn = typeof entryFn === 'string' ? entryFn.trim() : '';
 				        const child = spawn(process.execPath, [bootstrapPath], {
 				            stdio,
@@ -3769,6 +4585,14 @@ export async function startOnlineRuntime({
                                         return '{}';
                                     }
                                 })(),
+                                CATPAW_PACKET_CAPTURE: packetCaptureCfg && packetCaptureCfg.enabled ? '1' : '0',
+                                CATPAW_PACKET_CAPTURE_BODY_LIMIT: String(
+                                    packetCaptureCfg && Number.isFinite(Number(packetCaptureCfg.bodyLimit))
+                                        ? Math.max(0, Math.trunc(Number(packetCaptureCfg.bodyLimit)))
+                                        : DEFAULT_PACKET_CAPTURE_BODY_LIMIT
+                                ),
+                                CATPAW_PACKET_CAPTURE_DIR:
+                                    packetCaptureCfg && typeof packetCaptureCfg.dir === 'string' ? packetCaptureCfg.dir : '',
 				                NODE_PATH: rootDir,
 				            },
 				        });
@@ -3776,6 +4600,7 @@ export async function startOnlineRuntime({
 				        // Push initial mock config (can be toggled later without restarting via IPC).
 				        sendMockConfigToChild(child, panMockCfg);
                         sendProxyConfigToChild(child, proxyCfg);
+                        sendPacketCaptureConfigToChild(child, packetCaptureCfg);
 
 	    // When debugging online runtimes, capture child output:
 	    // - dev: if CATPAW_LOG_FILE is set, forward to parent stdout/stderr (which are already redirected to file in dev.js)

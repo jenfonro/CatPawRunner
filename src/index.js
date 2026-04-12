@@ -9,6 +9,7 @@ import {
     stopAllOnlineRuntimes,
     broadcastOnlineRuntimeMockConfig,
     broadcastOnlineRuntimeProxyConfig,
+    broadcastOnlineRuntimePacketCaptureConfig,
     withOnlineRuntimeOpsLock,
 } from './util/onlineRuntime.js';
 import path from 'node:path';
@@ -287,6 +288,10 @@ export async function start(config) {
                 next.disable_proxy = false;
                 changed = true;
             }
+            if (!Object.prototype.hasOwnProperty.call(next, 'packet_capture')) {
+                next.packet_capture = false;
+                changed = true;
+            }
             if (changed) {
                 atomicWrite(next);
             }
@@ -361,6 +366,9 @@ export async function start(config) {
     try {
         broadcastOnlineRuntimeProxyConfig({ rootDir: runtimeRoot });
     } catch (_) {}
+    try {
+        broadcastOnlineRuntimePacketCaptureConfig({ rootDir: runtimeRoot });
+    } catch (_) {}
 
     // Watch config.json for onlineConfigs changes (so manual edits or /api/server/settings take effect).
     const cfgPath = path.resolve(runtimeRoot, 'config.json');
@@ -385,6 +393,9 @@ export async function start(config) {
             } catch (_) {}
             try {
                 broadcastOnlineRuntimeProxyConfig({ rootDir: runtimeRoot });
+            } catch (_) {}
+            try {
+                broadcastOnlineRuntimePacketCaptureConfig({ rootDir: runtimeRoot });
             } catch (_) {}
         } catch (_) {}
     }, pollMs);
