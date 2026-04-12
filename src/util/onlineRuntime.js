@@ -1322,41 +1322,71 @@ export async function startOnlineRuntime({
 			      let ok = false;
 			      try {
 			        const list = Array.isArray(encodingsLike) ? encodingsLike : [];
-			        if (!list.length) {
-			          return { buffer: rawBuf, used: false, decoded: false };
-			        }
 			        const zlib = require('node:zlib');
+			        const decodeOne = (input, enc) => {
+			          const name = String(enc || '').trim().toLowerCase();
+			          if (!name || name === 'identity') return null;
+			          if (name === 'gzip' || name === 'x-gzip') return zlib.gunzipSync(input);
+			          if (name === 'deflate') {
+			            try {
+			              return zlib.inflateSync(input);
+			            } catch (_) {
+			              return zlib.inflateRawSync(input);
+			            }
+			          }
+			          if (name === 'br') {
+			            if (typeof zlib.brotliDecompressSync === 'function') {
+			              return zlib.brotliDecompressSync(input);
+			            }
+			            return null;
+			          }
+			          return null;
+			        };
 			        for (let i = list.length - 1; i >= 0; i -= 1) {
 			          const enc = String(list[i] || '').trim().toLowerCase();
 			          if (!enc || enc === 'identity') continue;
 			          used = true;
-			          if (enc === 'gzip' || enc === 'x-gzip') {
-			            out = zlib.gunzipSync(out);
-			            ok = true;
-			            continue;
-			          }
-			          if (enc === 'deflate') {
-			            try {
-			              out = zlib.inflateSync(out);
-			            } catch (_) {
-			              out = zlib.inflateRawSync(out);
-			            }
-			            ok = true;
-			            continue;
-			          }
-			          if (enc === 'br') {
-			            if (typeof zlib.brotliDecompressSync === 'function') {
-			              out = zlib.brotliDecompressSync(out);
+			          try {
+			            const next = decodeOne(out, enc);
+			            if (next) {
+			              out = next;
 			              ok = true;
-			              continue;
 			            }
-			            continue;
+			          } catch (_) {
+			            out = rawBuf;
+			            ok = false;
+			            break;
+			          }
+			        }
+			        if (!ok && rawBuf && rawBuf.length) {
+			          // Some servers return compressed bytes but omit content-encoding.
+			          if (rawBuf.length >= 2 && rawBuf[0] === 0x1f && rawBuf[1] === 0x8b) {
+			            try {
+			              out = zlib.gunzipSync(rawBuf);
+			              ok = true;
+			            } catch (_) {}
+			          }
+			          if (!ok && rawBuf.length >= 2) {
+			            const cmf = rawBuf[0];
+			            const flg = rawBuf[1];
+			            const isZlibDeflate = (cmf & 0x0f) === 8 && (((cmf << 8) + flg) % 31 === 0);
+			            if (isZlibDeflate) {
+			              try {
+			                out = zlib.inflateSync(rawBuf);
+			                ok = true;
+			              } catch (_) {
+			                try {
+			                  out = zlib.inflateRawSync(rawBuf);
+			                  ok = true;
+			                } catch (_) {}
+			              }
+			            }
 			          }
 			        }
 			      } catch (_) {
 			        return { buffer: rawBuf, used, decoded: false };
 			      }
-			      return { buffer: out, used, decoded: ok };
+			      return { buffer: ok ? out : rawBuf, used: used || ok, decoded: ok };
 			    };
 
 			    const __captureBodyPreview = (value, maxBytes, headersLike) => {
