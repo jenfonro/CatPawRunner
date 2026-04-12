@@ -189,6 +189,7 @@ CATPAW_MOCK=1 CATPAW_MOCK_DEBUG=1 CATPAW_MOCK_PROVIDERS=quark,uc,139,baidu,tiany
 - 不记录客户端打到 catpawrunner 的入站请求及其回包。
 - 记录格式为类 Fiddler 文本块，包含：请求方法、请求路径、请求 payload、响应内容（含状态与头）。
 - `pan_mock` 与抓包开关独立：当 `pan_mock` 命中拦截时，抓包记录会标注 `PanMockIntercepted: true`。
+- 若请求或响应带 `content-encoding`（如 `gzip/deflate/br`），抓包会自动尝试解码后再写入。
 - 为避免日志过大，请求/响应体会截断（默认最多 16KB，文本中会标出 `truncated=true`）。
 
 ### 占位文件名（用于把“分享码/提取码”带回脚本侧）

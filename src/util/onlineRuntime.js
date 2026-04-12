@@ -1301,7 +1301,65 @@ export async function startOnlineRuntime({
 			      }
 			    };
 
-			    const __captureBodyPreview = (value, maxBytes) => {
+			    const __parseContentEncodings = (headersLike) => {
+			      try {
+			        const headers = __normalizeCaptureHeaders(headersLike);
+			        const raw = String((headers && headers['content-encoding']) || '').trim().toLowerCase();
+			        if (!raw) return [];
+			        return raw
+			          .split(',')
+			          .map((s) => String(s || '').trim().toLowerCase())
+			          .filter((s) => s && s !== 'identity');
+			      } catch (_) {
+			        return [];
+			      }
+			    };
+
+			    const __decodeBufferByEncodings = (bufLike, encodingsLike) => {
+			      const rawBuf = __toCaptureBuffer(bufLike);
+			      let out = rawBuf;
+			      let used = false;
+			      let ok = false;
+			      try {
+			        const list = Array.isArray(encodingsLike) ? encodingsLike : [];
+			        if (!list.length) {
+			          return { buffer: rawBuf, used: false, decoded: false };
+			        }
+			        const zlib = require('node:zlib');
+			        for (let i = list.length - 1; i >= 0; i -= 1) {
+			          const enc = String(list[i] || '').trim().toLowerCase();
+			          if (!enc || enc === 'identity') continue;
+			          used = true;
+			          if (enc === 'gzip' || enc === 'x-gzip') {
+			            out = zlib.gunzipSync(out);
+			            ok = true;
+			            continue;
+			          }
+			          if (enc === 'deflate') {
+			            try {
+			              out = zlib.inflateSync(out);
+			            } catch (_) {
+			              out = zlib.inflateRawSync(out);
+			            }
+			            ok = true;
+			            continue;
+			          }
+			          if (enc === 'br') {
+			            if (typeof zlib.brotliDecompressSync === 'function') {
+			              out = zlib.brotliDecompressSync(out);
+			              ok = true;
+			              continue;
+			            }
+			            continue;
+			          }
+			        }
+			      } catch (_) {
+			        return { buffer: rawBuf, used, decoded: false };
+			      }
+			      return { buffer: out, used, decoded: ok };
+			    };
+
+			    const __captureBodyPreview = (value, maxBytes, headersLike) => {
 			      try {
 			        const limitRaw = Number.isFinite(Number(maxBytes)) ? Math.trunc(Number(maxBytes)) : __packetCaptureBodyLimit();
 			        const limit = limitRaw <= 0 ? 0 : limitRaw;
@@ -1309,9 +1367,12 @@ export async function startOnlineRuntime({
 			        const bytes = buf.length;
 			        if (limit <= 0 || !bytes) return { text: '', bytes, truncated: false };
 			        const clipped = bytes > limit ? buf.subarray(0, limit) : buf;
+			        const encodings = __parseContentEncodings(headersLike);
+			        const decoded = __decodeBufferByEncodings(clipped, encodings);
+			        const printable = decoded && decoded.buffer ? decoded.buffer : clipped;
 			        let text = '';
 			        try {
-			          text = clipped.toString('utf8');
+			          text = printable.toString('utf8');
 			        } catch (_) {
 			          text = '';
 			        }
@@ -1319,17 +1380,20 @@ export async function startOnlineRuntime({
 			          text: __safeSlice(text, Math.max(0, limit * 2)),
 			          bytes,
 			          truncated: bytes > limit,
+			          encoding: encodings.join(','),
+			          decoded: !!(decoded && decoded.decoded),
 			        };
 			      } catch (_) {
 			        return { text: '', bytes: 0, truncated: false };
 			      }
 			    };
 
-			    const __captureFetchResponseBody = async (responseLike, maxBytes) => {
+			    const __captureFetchResponseBody = async (responseLike, maxBytes, headersLike) => {
 			      try {
 			        const limitRaw = Number.isFinite(Number(maxBytes)) ? Math.trunc(Number(maxBytes)) : __packetCaptureBodyLimit();
 			        const limit = limitRaw <= 0 ? 0 : limitRaw;
 			        if (limit <= 0) return { text: '', bytes: 0, truncated: false };
+			        const encodings = __parseContentEncodings(headersLike);
 			        const cloned = responseLike && typeof responseLike.clone === 'function' ? responseLike.clone() : null;
 			        if (!cloned) return { text: '', bytes: 0, truncated: false };
 			        if (cloned.body && typeof cloned.body.getReader === 'function') {
@@ -1361,9 +1425,11 @@ export async function startOnlineRuntime({
 			            }
 			          }
 			          const previewBuf = chunks.length ? Buffer.concat(chunks) : Buffer.alloc(0);
+			          const decoded = __decodeBufferByEncodings(previewBuf, encodings);
+			          const printable = decoded && decoded.buffer ? decoded.buffer : previewBuf;
 			          let text = '';
 			          try {
-			            text = previewBuf.toString('utf8');
+			            text = printable.toString('utf8');
 			          } catch (_) {
 			            text = '';
 			          }
@@ -1371,11 +1437,13 @@ export async function startOnlineRuntime({
 			            text: __safeSlice(text, Math.max(0, limit * 2)),
 			            bytes: total,
 			            truncated,
+			            encoding: encodings.join(','),
+			            decoded: !!(decoded && decoded.decoded),
 			          };
 			        }
 			        if (typeof cloned.arrayBuffer === 'function') {
 			          const ab = await cloned.arrayBuffer();
-			          return __captureBodyPreview(Buffer.from(ab), limit);
+			          return __captureBodyPreview(Buffer.from(ab), limit, headersLike);
 			        }
 			      } catch (_) {}
 			      return { text: '', bytes: 0, truncated: false };
@@ -1421,12 +1489,19 @@ export async function startOnlineRuntime({
 			      }
 			    };
 
-			    const __fmtCaptureBodyText = (text, bytes, truncated) => {
+			    const __fmtCaptureBodyText = (text, bytes, truncated, encoding, decoded) => {
 			      try {
 			        const s = typeof text === 'string' ? text : text == null ? '' : String(text);
 			        const b = Number.isFinite(Number(bytes)) ? Math.max(0, Math.trunc(Number(bytes))) : s.length;
 			        const t = !!truncated;
-			        const head = '[bytes=' + String(b) + (t ? ', truncated=true' : '') + ']';
+			        const enc = String(encoding || '').trim();
+			        const head =
+			          '[bytes=' +
+			          String(b) +
+			          (enc ? ', encoding=' + enc : '') +
+			          (enc ? ', decoded=' + String(!!decoded) : '') +
+			          (t ? ', truncated=true' : '') +
+			          ']';
 			        if (!s) return head + String.fromCharCode(10) + '(empty)';
 			        return head + String.fromCharCode(10) + s;
 			      } catch (_) {
@@ -1453,7 +1528,13 @@ export async function startOnlineRuntime({
 			        const reqUrl = String(req.url || '').trim();
 			        const reqPath = String(req.path || '').trim();
 			        const reqHost = __normalizeHost(req.host || reqUrl) || 'unknown';
-			        const reqPayload = __fmtCaptureBodyText(req.body, req.body_bytes, req.body_truncated);
+			        const reqPayload = __fmtCaptureBodyText(
+			          req.body,
+			          req.body_bytes,
+			          req.body_truncated,
+			          req.body_encoding,
+			          req.body_decoded
+			        );
 			        const reqHeaders = __formatCaptureHeadersText(req.headers);
 			        const lines = [];
 			        lines.push('='.repeat(78));
@@ -1473,7 +1554,13 @@ export async function startOnlineRuntime({
 			        lines.push('');
 			        if (resp) {
 			          const respHeaders = __formatCaptureHeadersText(resp.headers);
-			          const respBody = __fmtCaptureBodyText(resp.body, resp.body_bytes, resp.body_truncated);
+			          const respBody = __fmtCaptureBodyText(
+			            resp.body,
+			            resp.body_bytes,
+			            resp.body_truncated,
+			            resp.body_encoding,
+			            resp.body_decoded
+			          );
 			          lines.push('[Response]');
 			          lines.push('Status: ' + String(Number.isFinite(Number(resp.status)) ? Math.max(0, Math.trunc(Number(resp.status))) : 0));
 			          lines.push('Headers:');
@@ -2952,7 +3039,7 @@ export async function startOnlineRuntime({
 						            reqHeaders = __normalizeCaptureHeaders(headerSource);
 						            const bodySource =
 						              init && typeof init === 'object' && Object.prototype.hasOwnProperty.call(init, 'body') ? init.body : null;
-						            reqBody = __captureBodyPreview(bodySource, __packetCaptureBodyLimit());
+						            reqBody = __captureBodyPreview(bodySource, __packetCaptureBodyLimit(), reqHeaders);
 						            panMockIntercepted = !!__pickInterceptor(url);
 						          } catch (_) {}
 						          try {
@@ -2964,7 +3051,7 @@ export async function startOnlineRuntime({
 						                resHeaders = __normalizeCaptureHeaders(res && res.headers ? res.headers : null);
 						              } catch (_) {}
 						              try {
-						                resBody = await __captureFetchResponseBody(res, __packetCaptureBodyLimit());
+						                resBody = await __captureFetchResponseBody(res, __packetCaptureBodyLimit(), resHeaders);
 						              } catch (_) {}
 						              __appendPacketCaptureLog({
 						                type: 'fetch',
@@ -2981,6 +3068,8 @@ export async function startOnlineRuntime({
 						                  body: reqBody.text,
 						                  body_bytes: reqBody.bytes,
 						                  body_truncated: reqBody.truncated,
+						                  body_encoding: reqBody.encoding || '',
+						                  body_decoded: !!reqBody.decoded,
 						                },
 						                response: {
 						                  status: res && Number.isFinite(Number(res.status)) ? Math.max(0, Math.trunc(Number(res.status))) : 0,
@@ -2988,6 +3077,8 @@ export async function startOnlineRuntime({
 						                  body: resBody.text,
 						                  body_bytes: resBody.bytes,
 						                  body_truncated: resBody.truncated,
+						                  body_encoding: resBody.encoding || '',
+						                  body_decoded: !!resBody.decoded,
 						                },
 						              });
 						            }
@@ -3009,6 +3100,8 @@ export async function startOnlineRuntime({
 						                  body: reqBody.text,
 						                  body_bytes: reqBody.bytes,
 						                  body_truncated: reqBody.truncated,
+						                  body_encoding: reqBody.encoding || '',
+						                  body_decoded: !!reqBody.decoded,
 						                },
 						                error: {
 						                  message: e && e.message ? String(e.message) : String(e),
@@ -3345,7 +3438,7 @@ export async function startOnlineRuntime({
 	                      if (this.destroyed) return;
 			                      try {
 			                        const buf = this._chunks && this._chunks.length ? Buffer.concat(this._chunks) : Buffer.alloc(0);
-			                        const reqBodyCap = __captureBodyPreview(buf, __packetCaptureBodyLimit());
+			                        const reqBodyCap = __captureBodyPreview(buf, __packetCaptureBodyLimit(), this._meta.headers || {});
 			                        const body = reqBodyCap && typeof reqBodyCap.text === 'string' ? reqBodyCap.text : '';
 			                        try { this._meta.body = body; } catch (_) {}
 				                        try {
@@ -3388,11 +3481,11 @@ export async function startOnlineRuntime({
 					                        }
 					                      })();
 					                      const payload = payloadBuf.toString('utf8');
-					                      const resBodyCap = __captureBodyPreview(payloadBuf, __packetCaptureBodyLimit());
-					                      const res = Readable.from([payloadBuf]);
 				                      const statusCode = mocked && Number.isFinite(mocked.statusCode) ? mocked.statusCode : 200;
 				                      const headersRaw = mocked && mocked.headers && typeof mocked.headers === 'object' ? mocked.headers : null;
 				                      const headers = headersRaw || { 'content-type': 'application/json; charset=utf-8', 'set-cookie': [] };
+					                      const resBodyCap = __captureBodyPreview(payloadBuf, __packetCaptureBodyLimit(), headers || {});
+					                      const res = Readable.from([payloadBuf]);
 				                      if (!('set-cookie' in headers)) headers['set-cookie'] = [];
 				                      res.statusCode = statusCode;
 			                      res.headers = headers;
@@ -3431,6 +3524,8 @@ export async function startOnlineRuntime({
 			                            body: body,
 			                            body_bytes: reqBodyCap && Number.isFinite(Number(reqBodyCap.bytes)) ? Math.max(0, Math.trunc(Number(reqBodyCap.bytes))) : 0,
 			                            body_truncated: !!(reqBodyCap && reqBodyCap.truncated),
+			                            body_encoding: reqBodyCap && reqBodyCap.encoding ? String(reqBodyCap.encoding) : '',
+			                            body_decoded: !!(reqBodyCap && reqBodyCap.decoded),
 			                          },
 			                          response: {
 			                            status: statusCode,
@@ -3438,6 +3533,8 @@ export async function startOnlineRuntime({
 			                            body: resBodyCap && typeof resBodyCap.text === 'string' ? resBodyCap.text : payload,
 			                            body_bytes: resBodyCap && Number.isFinite(Number(resBodyCap.bytes)) ? Math.max(0, Math.trunc(Number(resBodyCap.bytes))) : 0,
 			                            body_truncated: !!(resBodyCap && resBodyCap.truncated),
+			                            body_encoding: resBodyCap && resBodyCap.encoding ? String(resBodyCap.encoding) : '',
+			                            body_decoded: !!(resBodyCap && resBodyCap.decoded),
 			                          },
 			                        });
 			                      } catch (_) {}
@@ -3653,12 +3750,15 @@ export async function startOnlineRuntime({
 	                state.stored += take;
 	              } catch (_) {}
 	            };
-	            const packBody = (state) => {
+	            const packBody = (state, headersLike) => {
 	              try {
 	                const bodyBuf = state && state.chunks && state.chunks.length ? Buffer.concat(state.chunks) : Buffer.alloc(0);
+	                const encodings = __parseContentEncodings(headersLike);
+	                const decoded = __decodeBufferByEncodings(bodyBuf, encodings);
+	                const printable = decoded && decoded.buffer ? decoded.buffer : bodyBuf;
 	                let text = '';
 	                try {
-	                  text = bodyBuf.toString('utf8');
+	                  text = printable.toString('utf8');
 	                } catch (_) {
 	                  text = '';
 	                }
@@ -3667,6 +3767,8 @@ export async function startOnlineRuntime({
 	                  body: text,
 	                  body_bytes: bytes,
 	                  body_truncated: limit > 0 && bytes > limit,
+	                  body_encoding: encodings.join(','),
+	                  body_decoded: !!(decoded && decoded.decoded),
 	                };
 	              } catch (_) {
 	                return { body: '', body_bytes: 0, body_truncated: false };
@@ -3677,8 +3779,7 @@ export async function startOnlineRuntime({
 	              try {
 	                if (done) return;
 	                done = true;
-	                const reqBodyOut = packBody(reqState);
-	                const resBodyOut = packBody(resState);
+	                const reqBodyOut = packBody(reqState, meta.headers || {});
 	                const out = {
 	                  type: 'http',
 	                  id: requestId,
@@ -3696,10 +3797,14 @@ export async function startOnlineRuntime({
 	                    body: reqBodyOut.body,
 	                    body_bytes: reqBodyOut.body_bytes,
 	                    body_truncated: reqBodyOut.body_truncated,
+	                    body_encoding: reqBodyOut.body_encoding || '',
+	                    body_decoded: !!reqBodyOut.body_decoded,
 	                  },
 	                };
 	                const p = payload && typeof payload === 'object' ? payload : {};
 	                if (p.response && typeof p.response === 'object') {
+	                  const resHeadersLike = p.response.headers && typeof p.response.headers === 'object' ? p.response.headers : {};
+	                  const resBodyOut = packBody(resState, resHeadersLike);
 	                  out.response = {
 	                    status:
 	                      Number.isFinite(Number(p.response.status)) && Number(p.response.status) > 0
@@ -3710,6 +3815,8 @@ export async function startOnlineRuntime({
 	                    body: resBodyOut.body,
 	                    body_bytes: resBodyOut.body_bytes,
 	                    body_truncated: resBodyOut.body_truncated,
+	                    body_encoding: resBodyOut.body_encoding || '',
+	                    body_decoded: !!resBodyOut.body_decoded,
 	                  };
 	                }
 	                if (p.error && typeof p.error === 'object') out.error = p.error;
