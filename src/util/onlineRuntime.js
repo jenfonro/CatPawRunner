@@ -3993,9 +3993,12 @@ export async function startOnlineRuntime({
         'leijing',
         'wogg',
         'livetovod',
+        'server',
       ].forEach(ensureObj);
       if (!Array.isArray(srv.config.pans.list)) srv.config.pans.list = [];
       if (!Array.isArray(srv.config.sites.list)) srv.config.sites.list = [];
+      if (typeof srv.config.server.url !== 'string') srv.config.server.url = '';
+      if (typeof srv.config.server.authorization !== 'string') srv.config.server.authorization = '';
 	    } catch (_) {}
 	  };
 
