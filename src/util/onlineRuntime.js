@@ -4086,17 +4086,75 @@ export async function startOnlineRuntime({
     }
 		  };
 
+	  const isServerLike = (obj) => {
+	    try {
+	      if (!obj || (typeof obj !== 'object' && typeof obj !== 'function')) return false;
+	      const hasFn = (k) => typeof obj[k] === 'function';
+	      if (hasFn('route') && hasFn('addHook') && hasFn('listen')) return true;
+	      if (hasFn('register') && hasFn('addHook') && hasFn('listen')) return true;
+	      if (hasFn('route') && hasFn('post') && hasFn('get')) return true;
+	      if (hasFn('address') && obj.server && typeof obj.server === 'object' && hasFn('listen')) return true;
+	      if (obj.config && typeof obj.config === 'object' && obj.db && typeof obj.db === 'object' && hasFn('route'))
+	        return true;
+	    } catch (_) {}
+	    return false;
+	  };
+
+	  const isServerPrimary = (obj) => {
+	    try {
+	      if (!obj || (typeof obj !== 'object' && typeof obj !== 'function')) return false;
+	      const hasFn = (k) => typeof obj[k] === 'function';
+	      return (hasFn('route') || hasFn('register')) && hasFn('addHook') && hasFn('listen');
+	    } catch (_) {}
+	    return false;
+	  };
+
+	  let cachedServerRef = null;
 	  const pickServerRef = () => {
 	    try {
+	      if (isServerLike(cachedServerRef)) return cachedServerRef;
 	      const candidates = [
 	        globalThis.xn,
 	        globalThis.un,
+	        globalThis.fn,
 	        globalThis.srv,
 	        globalThis.server,
 	        globalThis.app,
 	        globalThis.fastify,
 	      ];
-	      for (const c of candidates) if (c && typeof c === 'object') return c;
+	      for (const c of candidates) {
+	        if (!isServerPrimary(c)) continue;
+	        cachedServerRef = c;
+	        return c;
+	      }
+	      for (const c of candidates) {
+	        if (!isServerLike(c)) continue;
+	        cachedServerRef = c;
+	        return c;
+	      }
+	      const keys = Object.getOwnPropertyNames(globalThis);
+	      for (const k of keys) {
+	        let v = null;
+	        try {
+	          v = globalThis[k];
+	        } catch (_) {
+	          continue;
+	        }
+	        if (!isServerPrimary(v)) continue;
+	        cachedServerRef = v;
+	        return v;
+	      }
+	      for (const k of keys) {
+	        let v = null;
+	        try {
+	          v = globalThis[k];
+	        } catch (_) {
+	          continue;
+	        }
+	        if (!isServerLike(v)) continue;
+	        cachedServerRef = v;
+	        return v;
+	      }
 	    } catch (_) {}
 	    return null;
 	  };
@@ -4115,21 +4173,72 @@ export async function startOnlineRuntime({
 	    })();
 
 	    const candidates = [];
-	    const seen = new Set();
+	    const seenName = new Set();
+	    const seenFn = new Set();
 
 	    const pushCandidate = (name, via) => {
 	      try {
 	        const n = String(name || '').trim();
-	        if (!n || seen.has(n)) return;
+	        if (!n || seenName.has(n)) return;
 	        const f = globalThis ? globalThis[n] : null;
 	        if (typeof f !== 'function') return;
-	        seen.add(n);
+	        if (seenFn.has(f)) return;
+	        seenName.add(n);
+	        seenFn.add(f);
 	        candidates.push({ fn: f, name: n, via: String(via || '') });
 	      } catch (_) {}
 	    };
 
+	    const sourceCache = new Map();
+	    const getFnSource = (name) => {
+	      try {
+	        const n = String(name || '').trim();
+	        if (!n) return '';
+	        if (sourceCache.has(n)) return sourceCache.get(n) || '';
+	        const f = globalThis ? globalThis[n] : null;
+	        const src = typeof f === 'function' ? String(Function.prototype.toString.call(f) || '') : '';
+	        sourceCache.set(n, src);
+	        return src;
+	      } catch (_) {
+	        return '';
+	      }
+	    };
+
+	    const isStopLikeName = (name) => /^(stop|close|dispose|destroy|shutdown|teardown)$/i.test(String(name || '').trim());
+	    const isLegacyStartName = (name) =>
+	      /^(ndr|start|main|run|bootstrap|init|wpr)$/i.test(String(name || '').trim());
+	    const isStrongStartFn = (name) => {
+	      try {
+	        if (isStopLikeName(name)) return false;
+	        const src = getFnSource(name);
+	        if (!src) return false;
+	        if (src.includes('serverFactory:catServerFactory') || src.includes('catServerFactory')) return true;
+	        if (
+	          (src.includes('.listen(') || src.includes('listen({')) &&
+	          (src.includes('.register(') || src.includes('messageToDart'))
+	        )
+	          return true;
+	      } catch (_) {}
+	      return false;
+	    };
+	    const isWeakStartFn = (name) => {
+	      try {
+	        if (isStopLikeName(name)) return false;
+	        if (isLegacyStartName(name)) return true;
+	        const fn = globalThis ? globalThis[name] : null;
+	        if (typeof fn === 'function' && fn.length >= 1) return true;
+	        const src = getFnSource(name);
+	        if (!src) return false;
+	        if (src.includes('DEV_HTTP_PORT') || src.includes('HTTP_PORT') || src.includes('PORT')) return true;
+	        if (src.includes('messageToDart') || src.includes('JsonDB') || src.includes('db.json')) return true;
+	      } catch (_) {}
+	      return false;
+	    };
+
 	    if (envName) pushCandidate(envName, 'env');
-	    if (typeof globalThis.Ndr === 'function') pushCandidate('Ndr', 'default');
+	    for (const legacyName of ['Ndr', 'start', 'main', 'run', 'bootstrap', 'init', 'wpr']) {
+	      pushCandidate(legacyName, 'legacy');
+	    }
 
 		    const addedKeys = (() => {
 		      try {
@@ -4146,48 +4255,12 @@ export async function startOnlineRuntime({
 	      } catch (_) {}
 	    }
 
-	    const scoreFn = (name) => {
-	      let score = 0;
-	      try {
-	        const fn = globalThis[name];
-	        if (typeof fn !== 'function') return -1;
-	        if (/^nd[rR]$/i.test(name)) score += 100;
-	        if (/^(start|main|run|bootstrap|init)$/i.test(name)) score += 40;
-	        if (fn.length >= 1) score += 20;
-	        const src = (() => {
-	          try { return Function.prototype.toString.call(fn); } catch (_) { return ''; }
-	        })();
-	        if (src.includes('serverFactory:catServerFactory')) score += 60;
-	        if (src.includes('catServerFactory')) score += 25;
-	        if (src.includes('DEV_HTTP_PORT') || src.includes('HTTP_PORT') || src.includes('PORT')) score += 10;
-	        if (src.includes('.listen(') || src.includes('listen({')) score += 10;
-	        if (src.includes('.register(')) score += 6;
-	        if (src.includes('messageToDart')) score += 6;
-	        if (src.includes('JsonDB') || src.includes('db.json')) score += 4;
-	        if (/^(stop|close|dispose|destroy|shutdown|teardown)$/i.test(name)) score -= 100;
-	      } catch (_) {}
-	      return score;
-	    };
-
-	    let best = '';
-	    let bestScore = -1;
-	    for (const n of addedFns) {
-	      const sc = scoreFn(n);
-	      if (sc > bestScore) {
-	        bestScore = sc;
-	        best = n;
-	      }
-		    }
-
-		    if (best && bestScore >= 30) pushCandidate(best, 'auto');
-
-		    try {
-		      const ranked = addedFns
-		        .map((n) => ({ n, sc: scoreFn(n) }))
-		        .sort((a, b) => b.sc - a.sc)
-	        .map((x) => x.n);
-	      for (const n of ranked) pushCandidate(n, 'auto_rank');
-	    } catch (_) {}
+	    const orderedAdded = [];
+	    for (const n of addedFns) if (isLegacyStartName(n)) orderedAdded.push(n);
+	    for (const n of addedFns) if (!isLegacyStartName(n)) orderedAdded.push(n);
+	    for (const n of orderedAdded) if (isStrongStartFn(n)) pushCandidate(n, 'auto_strong');
+	    for (const n of orderedAdded) if (isWeakStartFn(n)) pushCandidate(n, 'auto_weak');
+	    for (const n of orderedAdded) if (!isStopLikeName(n)) pushCandidate(n, 'auto_any');
 
 		    return { candidates, envName, addedFns };
 		  };
