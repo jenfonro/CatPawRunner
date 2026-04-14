@@ -362,8 +362,8 @@ function rewriteSpiderJsonResponse(parsed, { isDetail, cacheHit }) {
 
 function shouldTryRewriteSpiderResponse(forwardPath, responseHeaders) {
     const pathName = String(forwardPath || '').split('?')[0] || '/';
-    const isSearchOrDetail = /^\/spider\/[^/]+\/\d+\/(?:search|detail)$/i.test(pathName);
-    if (!isSearchOrDetail) return { shouldRewrite: false, isDetail: false };
+    const isCacheRoute = /^\/spider\/[^/]+\/\d+\/(?:home|category|search|detail)$/i.test(pathName);
+    if (!isCacheRoute) return { shouldRewrite: false, isDetail: false };
     const isDetail = /\/detail$/i.test(pathName);
     const contentType = String((responseHeaders && (responseHeaders['content-type'] || responseHeaders['Content-Type'])) || '');
     const shouldRewrite =
