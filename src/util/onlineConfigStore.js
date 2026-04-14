@@ -66,6 +66,52 @@ function sanitizeFileStem(name, fallback) {
     return trimmed || 'online';
 }
 
+function sanitizeNameSeedForId(name) {
+    const raw = String(name || '').trim();
+    if (!raw) return '';
+    const base = path.basename(raw);
+    return base.replace(/\s+/g, ' ').trim();
+}
+
+function buildAutoOnlineRuntimeId(name, urlStr, used) {
+    const usedSet = used && typeof used.has === 'function' ? used : new Set();
+    const nameSeed = sanitizeNameSeedForId(name).toLowerCase();
+    const urlSeed = String(urlStr || '').trim();
+
+    const pick = (seed) => stableHashShort(seed);
+
+    const primary = pick(nameSeed ? `name:${nameSeed}` : `url:${urlSeed}`);
+    if (!usedSet.has(primary)) {
+        usedSet.add(primary);
+        return primary;
+    }
+
+    const secondary = pick(`name+url:${nameSeed}:${urlSeed}`);
+    if (!usedSet.has(secondary)) {
+        usedSet.add(secondary);
+        return secondary;
+    }
+
+    for (let n = 1; n <= 100; n += 1) {
+        const next = pick(`name+url:${nameSeed}:${urlSeed}#${n}`);
+        if (usedSet.has(next)) continue;
+        usedSet.add(next);
+        return next;
+    }
+
+    for (let n = 101; n <= 10000; n += 1) {
+        const next = pick(`name+url:${nameSeed}:${urlSeed}#${n}`);
+        if (usedSet.has(next)) continue;
+        usedSet.add(next);
+        return next;
+    }
+
+    // Extremely unlikely path (massive collisions). Keep deterministic output.
+    const fallback = pick(`name+url:${nameSeed}:${urlSeed}:overflow`);
+    usedSet.add(fallback);
+    return fallback;
+}
+
 function pickFileNameFromUrl(urlStr) {
     try {
         const u = new URL(String(urlStr || '').trim());
@@ -204,6 +250,7 @@ export async function applyOnlineConfigs(options = {}) {
     const keepNames = new Set(['.catpaw_online_runtime_bootstrap.cjs']);
     const resolved = [];
     let downloadedAny = false;
+    const usedIds = new Set();
 
     let idsAdded = false;
     const nextList = Array.isArray(rawList) ? rawList.map((v) => (v && typeof v === 'object' ? { ...v } : v)) : [];
@@ -223,8 +270,23 @@ export async function applyOnlineConfigs(options = {}) {
         const fallbackStem = (baseFromUrl || 'online').replace(/\.(cjs|mjs|js)$/i, '');
         const rawStem = it.fileNameRaw ? String(it.fileNameRaw).replace(/\.(cjs|mjs|js)$/i, '') : '';
         const stem = sanitizeFileStem(rawStem, fallbackStem);
-        const idEff = it.idRaw || stableHashShort(parsed.toString());
-        if (!it.idRaw) {
+        let idEff = it.idRaw || '';
+        if (idEff) {
+            if (usedIds.has(idEff)) {
+                idEff = buildAutoOnlineRuntimeId(it.name || idEff, parsed.toString(), usedIds);
+                try {
+                    const rawItem = nextList[idx];
+                    if (rawItem && typeof rawItem === 'object' && !Array.isArray(rawItem)) {
+                        rawItem.id = idEff;
+                        idsAdded = true;
+                    }
+                } catch (_) {}
+            } else {
+                usedIds.add(idEff);
+            }
+        } else {
+            // Auto-id now derives from name (fallback: url) so route ids stay stable across url changes.
+            idEff = buildAutoOnlineRuntimeId(it.name, parsed.toString(), usedIds);
             // Persist generated ids back to config.json so UIs can read them.
             try {
                 const rawItem = nextList[idx];
