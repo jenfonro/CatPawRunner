@@ -11,6 +11,7 @@ import {
     isEligibleSpiderCacheRequest,
 } from './util/runtimeSpiderCache.js';
 import { rewritePanmockDetailPayloadFields } from './util/panmockDetailCodec.js';
+import { isSpiderCacheRoutePath } from './util/spiderRouteMatcher.js';
 
 const spiderPrefix = '/spider';
 
@@ -362,7 +363,7 @@ function rewriteSpiderJsonResponse(parsed, { isDetail, cacheHit }) {
 
 function shouldTryRewriteSpiderResponse(forwardPath, responseHeaders) {
     const pathName = String(forwardPath || '').split('?')[0] || '/';
-    const isCacheRoute = /^\/spider\/[^/]+\/\d+\/(?:home|category|search|detail)$/i.test(pathName);
+    const isCacheRoute = isSpiderCacheRoutePath(pathName);
     if (!isCacheRoute) return { shouldRewrite: false, isDetail: false };
     const isDetail = /\/detail$/i.test(pathName);
     const contentType = String((responseHeaders && (responseHeaders['content-type'] || responseHeaders['Content-Type'])) || '');

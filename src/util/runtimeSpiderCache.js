@@ -1,3 +1,5 @@
+import { isSpiderCacheRoutePath } from './spiderRouteMatcher.js';
+
 const DEFAULT_TTL_MS = 60 * 60 * 1000;
 const DEFAULT_MAX_ENTRIES = 1000;
 
@@ -45,7 +47,7 @@ export function isEligibleSpiderCacheRequest(method, forwardPath) {
     const m = String(method || '').trim().toUpperCase();
     if (m !== 'POST') return false;
     const pathName = trimPathQuery(forwardPath);
-    return /^\/spider\/[^/]+\/\d+\/(?:home|category|search|detail)$/i.test(pathName);
+    return isSpiderCacheRoutePath(pathName);
 }
 
 export function buildSpiderCacheKey({ runtimeId, forwardPath, method, body }) {

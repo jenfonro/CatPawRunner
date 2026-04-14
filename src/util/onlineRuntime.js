@@ -1139,6 +1139,20 @@ export async function startOnlineRuntime({
 			      }
 			    };
 
+			    const __packetCaptureDefaultLimit = 16 * 1024;
+			    const __packetCaptureMaxLimit = 1024 * 1024;
+			    const __normalizePacketCaptureLimit = (v) => {
+			      try {
+			        const n = Number(v);
+			        if (!Number.isFinite(n)) return __packetCaptureDefaultLimit;
+			        const i = Math.trunc(n);
+			        if (i <= 0) return 0;
+			        return Math.min(i, __packetCaptureMaxLimit);
+			      } catch (_) {
+			        return __packetCaptureDefaultLimit;
+			      }
+			    };
+
 			    const __packetCaptureState = (() => {
 			      const parseBool = (v) => {
 			        try {
@@ -1148,20 +1162,9 @@ export async function startOnlineRuntime({
 			          return false;
 			        }
 			      };
-			      const parseLimit = (v) => {
-			        try {
-			          const n = Number(v);
-			          if (!Number.isFinite(n)) return 16 * 1024;
-			          const i = Math.trunc(n);
-			          if (i <= 0) return 0;
-			          return Math.min(i, 1024 * 1024);
-			        } catch (_) {
-			          return 16 * 1024;
-			        }
-			      };
 			      return {
 			        enabled: parseBool(process.env.CATPAW_PACKET_CAPTURE || ''),
-			        bodyLimit: parseLimit(process.env.CATPAW_PACKET_CAPTURE_BODY_LIMIT || ''),
+			        bodyLimit: __normalizePacketCaptureLimit(process.env.CATPAW_PACKET_CAPTURE_BODY_LIMIT || ''),
 			        dir: String(process.env.CATPAW_PACKET_CAPTURE_DIR || '').trim(),
 			        seq: 0,
 			      };
@@ -1177,13 +1180,9 @@ export async function startOnlineRuntime({
 
 			    const __packetCaptureBodyLimit = () => {
 			      try {
-			        const n = Number(__packetCaptureState && __packetCaptureState.bodyLimit);
-			        if (!Number.isFinite(n)) return 16 * 1024;
-			        const i = Math.trunc(n);
-			        if (i <= 0) return 0;
-			        return Math.min(i, 1024 * 1024);
+			        return __normalizePacketCaptureLimit(__packetCaptureState && __packetCaptureState.bodyLimit);
 			      } catch (_) {
-			        return 16 * 1024;
+			        return __packetCaptureDefaultLimit;
 			      }
 			    };
 
@@ -1194,11 +1193,7 @@ export async function startOnlineRuntime({
 			          __packetCaptureState.enabled = !!cfg.enabled;
 			        }
 			        if (Object.prototype.hasOwnProperty.call(cfg, 'bodyLimit')) {
-			          const n = Number(cfg.bodyLimit);
-			          if (Number.isFinite(n)) {
-			            const i = Math.trunc(n);
-			            __packetCaptureState.bodyLimit = i <= 0 ? 0 : Math.min(i, 1024 * 1024);
-			          }
+			          __packetCaptureState.bodyLimit = __normalizePacketCaptureLimit(cfg.bodyLimit);
 			        }
 			        if (Object.prototype.hasOwnProperty.call(cfg, 'dir')) {
 			          __packetCaptureState.dir = typeof cfg.dir === 'string' ? cfg.dir.trim() : '';
@@ -1471,10 +1466,8 @@ export async function startOnlineRuntime({
 			            decoded: !!(decoded && decoded.decoded),
 			          };
 			        }
-			        if (typeof cloned.arrayBuffer === 'function') {
-			          const ab = await cloned.arrayBuffer();
-			          return __captureBodyPreview(Buffer.from(ab), limit, headersLike);
-			        }
+			        // Do not fallback to arrayBuffer/text read here:
+			        // that would force full-buffer read and block response return path.
 			      } catch (_) {}
 			      return { text: '', bytes: 0, truncated: false };
 			    };
@@ -1615,6 +1608,56 @@ export async function startOnlineRuntime({
 			      }
 			    };
 
+			    const __packetCaptureWriters = new Map();
+			    const __appendPacketCaptureText = (filePath, text) => {
+			      try {
+			        const p = String(filePath || '').trim();
+			        if (!p) return;
+			        const line = String(text == null ? '' : text);
+			        if (!line) return;
+			        let st = __packetCaptureWriters.get(p);
+			        if (!st || !st.stream || st.stream.destroyed) {
+			          try {
+			            const dir = path.dirname(p);
+			            if (dir && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+			          } catch (_) {}
+			          try {
+			            const stream = fs.createWriteStream(p, { flags: 'a' });
+			            stream.on('error', () => {
+			              try {
+			                const cur = __packetCaptureWriters.get(p);
+			                if (cur && cur.stream === stream) __packetCaptureWriters.delete(p);
+			              } catch (_) {}
+			            });
+			            st = { stream };
+			            __packetCaptureWriters.set(p, st);
+			          } catch (_) {
+			            st = null;
+			          }
+			        }
+			        if (st && st.stream && !st.stream.destroyed) {
+			          try {
+			            st.stream.write(line);
+			            return;
+			          } catch (_) {}
+			        }
+			        fs.appendFile(p, line, () => {});
+			      } catch (_) {}
+			    };
+
+			    try {
+			      process.on('exit', () => {
+			        try {
+			          for (const st of __packetCaptureWriters.values()) {
+			            try {
+			              if (st && st.stream && !st.stream.destroyed) st.stream.end();
+			            } catch (_) {}
+			          }
+			          __packetCaptureWriters.clear();
+			        } catch (_) {}
+			      });
+			    } catch (_) {}
+
 			    const __appendPacketCaptureLog = (obj) => {
 			      try {
 			        if (!__packetCaptureEnabled()) return;
@@ -1623,14 +1666,10 @@ export async function startOnlineRuntime({
 			        const host = __normalizeHost(req.host || req.url || '') || 'unknown';
 			        const p = __mkPacketCaptureLogPath(host);
 			        if (!p) return;
-			        try {
-			          const dir = path.dirname(p);
-			          if (dir && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-			        } catch (_) {}
 			        if (!Object.prototype.hasOwnProperty.call(o, 't')) o.t = Date.now();
 			        const block = __toCaptureTextBlock(o);
 			        if (!block) return;
-			        fs.appendFileSync(p, block, 'utf8');
+			        __appendPacketCaptureText(p, block);
 			      } catch (_) {}
 			    };
 
@@ -3076,41 +3115,46 @@ export async function startOnlineRuntime({
 						            const res = await __origFetchCapture(input, init);
 						            if (enabled) {
 						              let resHeaders = {};
-						              let resBody = { text: '', bytes: 0, truncated: false };
 						              try {
 						                resHeaders = __normalizeCaptureHeaders(res && res.headers ? res.headers : null);
 						              } catch (_) {}
-						              try {
-						                resBody = await __captureFetchResponseBody(res, __packetCaptureBodyLimit(), resHeaders);
-						              } catch (_) {}
-						              __appendPacketCaptureLog({
-						                type: 'fetch',
-						                id: requestId,
-						                at: startedAt,
-						                duration_ms: Date.now() - startedAt,
-						                pan_mock_intercepted: panMockIntercepted,
-						                request: {
-						                  method,
-						                  url,
-						                  host: __normalizeHost(url),
-						                  path: __pathFromUrl(url),
-						                  headers: reqHeaders,
-						                  body: reqBody.text,
-						                  body_bytes: reqBody.bytes,
-						                  body_truncated: reqBody.truncated,
-						                  body_encoding: reqBody.encoding || '',
-						                  body_decoded: !!reqBody.decoded,
-						                },
-						                response: {
-						                  status: res && Number.isFinite(Number(res.status)) ? Math.max(0, Math.trunc(Number(res.status))) : 0,
-						                  headers: resHeaders,
-						                  body: resBody.text,
-						                  body_bytes: resBody.bytes,
-						                  body_truncated: resBody.truncated,
-						                  body_encoding: resBody.encoding || '',
-						                  body_decoded: !!resBody.decoded,
-						                },
-						              });
+						              // Capture response body asynchronously to avoid blocking the response path.
+						              void Promise.resolve()
+						                .then(async () => {
+						                  let resBody = { text: '', bytes: 0, truncated: false };
+						                  try {
+						                    resBody = await __captureFetchResponseBody(res, __packetCaptureBodyLimit(), resHeaders);
+						                  } catch (_) {}
+						                  __appendPacketCaptureLog({
+						                    type: 'fetch',
+						                    id: requestId,
+						                    at: startedAt,
+						                    duration_ms: Date.now() - startedAt,
+						                    pan_mock_intercepted: panMockIntercepted,
+						                    request: {
+						                      method,
+						                      url,
+						                      host: __normalizeHost(url),
+						                      path: __pathFromUrl(url),
+						                      headers: reqHeaders,
+						                      body: reqBody.text,
+						                      body_bytes: reqBody.bytes,
+						                      body_truncated: reqBody.truncated,
+						                      body_encoding: reqBody.encoding || '',
+						                      body_decoded: !!reqBody.decoded,
+						                    },
+						                    response: {
+						                      status: res && Number.isFinite(Number(res.status)) ? Math.max(0, Math.trunc(Number(res.status))) : 0,
+						                      headers: resHeaders,
+						                      body: resBody.text,
+						                      body_bytes: resBody.bytes,
+						                      body_truncated: resBody.truncated,
+						                      body_encoding: resBody.encoding || '',
+						                      body_decoded: !!resBody.decoded,
+						                    },
+						                  });
+						                })
+						                .catch(() => {});
 						            }
 						            return res;
 						          } catch (e) {
@@ -3624,12 +3668,7 @@ export async function startOnlineRuntime({
 		            }
 		          }
 
-		          let provider = '';
-		          if (__isQuarkHost(host)) provider = 'quark';
-		          else if (__isUcHost(host) || host.includes('open-api-drive.uc.cn')) provider = 'uc';
-		          else if (__is139Host(host)) provider = '139';
-		          else if (__isBaiduPanHost(host) || host.endsWith('baidu.com')) provider = 'baidu';
-		          else if (__isTianyiHost(host)) provider = 'tianyi';
+			          const provider = __providerForHost(host);
 
 		          // Cookie injection (legacy behavior).
 		          if (provider) {
