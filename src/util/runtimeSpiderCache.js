@@ -45,7 +45,7 @@ export function isEligibleSpiderCacheRequest(method, forwardPath) {
     const m = String(method || '').trim().toUpperCase();
     if (m !== 'POST') return false;
     const pathName = trimPathQuery(forwardPath);
-    return /^\/spider\/[^/]+\/\d+\/(?:search|detail)$/i.test(pathName);
+    return /^\/spider\/[^/]+\/\d+\/(?:home|category|search|detail)$/i.test(pathName);
 }
 
 export function buildSpiderCacheKey({ runtimeId, forwardPath, method, body }) {
