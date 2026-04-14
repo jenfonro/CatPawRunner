@@ -12,6 +12,7 @@ import {
 } from './util/runtimeSpiderCache.js';
 import { rewritePanmockDetailPayloadFields } from './util/panmockDetailCodec.js';
 import { isSpiderCacheRoutePath } from './util/spiderRouteMatcher.js';
+import { getOnlineRuntimeUpstreamOrigin } from './util/onlineRuntime.js';
 
 const spiderPrefix = '/spider';
 
@@ -351,9 +352,147 @@ function rewritePanmockDetailPayload(parsed) {
     return { ...parsed, list: [first, ...list.slice(1)] };
 }
 
-function rewriteSpiderJsonResponse(parsed, { isDetail, cacheHit }) {
+const spiderBaseOriginByKey = new Map();
+
+function parseSpiderRouteMeta(forwardPath) {
+    const pathName = String(forwardPath || '').split('?')[0] || '/';
+    const m = /^\/spider\/([^/]+)\/(\d+)\/(home|category|search|detail)$/i.exec(pathName);
+    if (!m) return { spiderKey: '', routeName: '' };
+    return {
+        spiderKey: String(m[1] || '').trim().toLowerCase(),
+        routeName: String(m[3] || '').trim().toLowerCase(),
+    };
+}
+
+function toHttpOrigin(raw) {
+    const s = typeof raw === 'string' ? raw.trim() : '';
+    if (!s) return '';
+    try {
+        const u = new URL(s);
+        if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
+        const host = String(u.hostname || '').trim().toLowerCase();
+        if (!host) return '';
+        if (
+            host === 'localhost' ||
+            host === '127.0.0.1' ||
+            host === '0.0.0.0' ||
+            host === '::1' ||
+            host.endsWith('.localhost')
+        ) {
+            return '';
+        }
+        return `${u.protocol}//${u.host}`;
+    } catch (_) {
+        return '';
+    }
+}
+
+function decodeUrlParamMaybe(raw) {
+    let out = typeof raw === 'string' ? raw.trim() : '';
+    if (!out) return '';
+    for (let i = 0; i < 2; i += 1) {
+        try {
+            const next = decodeURIComponent(out);
+            if (next === out) break;
+            out = next;
+        } catch (_) {
+            break;
+        }
+    }
+    return out;
+}
+
+function extractImageUrlFromQueryPath(raw) {
+    const s = typeof raw === 'string' ? raw.trim() : '';
+    if (!s) return '';
+    try {
+        const u = new URL(s, 'http://placeholder.local');
+        const keys = ['url', 'img', 'image', 'src'];
+        for (const key of keys) {
+            const val = decodeUrlParamMaybe(String(u.searchParams.get(key) || '').trim());
+            if (/^https?:\/\//i.test(val)) return val;
+        }
+    } catch (_) {}
+
+    const m = /[?&](?:url|img|image|src)=([^&]+)/i.exec(s);
+    if (!m || !m[1]) return '';
+    const val = decodeUrlParamMaybe(m[1]);
+    return /^https?:\/\//i.test(val) ? val : '';
+}
+
+function absolutizePicUrl(raw, baseOrigin) {
+    const s = typeof raw === 'string' ? raw.trim() : '';
+    if (!s) return raw;
+    if (/^(?:https?:)?\/\//i.test(s)) return s.startsWith('//') ? `https:${s}` : s;
+    if (/^(?:data|blob|file):/i.test(s)) return s;
+
+    // For paths like "/db.php?url=https://...", prefer the embedded remote image url first.
+    if (s.startsWith('/')) {
+        const embeddedUrl = extractImageUrlFromQueryPath(s);
+        if (embeddedUrl) return embeddedUrl;
+    }
+
+    const origin = toHttpOrigin(baseOrigin);
+    if (origin) {
+        try {
+            return new URL(s, `${origin}/`).toString();
+        } catch (_) {}
+    }
+    return raw;
+}
+
+function pickSpiderBaseOrigin(parsed, spiderKey, runtimeId = '') {
+    void parsed;
+    const key = String(spiderKey || '').trim().toLowerCase();
+    const rid = String(runtimeId || '').trim();
+
+    if (rid && key) {
+        try {
+            const runtimeOrigin = String(getOnlineRuntimeUpstreamOrigin(rid, key) || '').trim();
+            const normalizedRuntimeOrigin = toHttpOrigin(runtimeOrigin);
+            if (normalizedRuntimeOrigin) {
+                spiderBaseOriginByKey.set(key, normalizedRuntimeOrigin);
+                return normalizedRuntimeOrigin;
+            }
+        } catch (_) {}
+    }
+
+    return key ? String(spiderBaseOriginByKey.get(key) || '') : '';
+}
+
+function rewriteSpiderVodPicFields(parsed, forwardPath, runtimeId = '') {
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return parsed;
+    const list = Array.isArray(parsed.list) ? parsed.list : null;
+    if (!list || !list.length) return parsed;
+
+    const { spiderKey, routeName } = parseSpiderRouteMeta(forwardPath);
+    if (!routeName || !['home', 'category', 'search', 'detail'].includes(routeName)) return parsed;
+
+    const baseOrigin = pickSpiderBaseOrigin(parsed, spiderKey, runtimeId);
+    let changed = false;
+    const nextList = list.map((item) => {
+        if (!item || typeof item !== 'object') return item;
+        let nextItem = item;
+        const picKeys = ['vod_pic', 'book_pic', 'pic'];
+        for (const k of picKeys) {
+            const cur = typeof item[k] === 'string' ? item[k] : '';
+            if (!cur) continue;
+            const nextPic = absolutizePicUrl(cur, baseOrigin);
+            if (nextPic !== cur) {
+                if (nextItem === item) nextItem = { ...item };
+                nextItem[k] = nextPic;
+                changed = true;
+            }
+        }
+        return nextItem;
+    });
+
+    return changed ? { ...parsed, list: nextList } : parsed;
+}
+
+function rewriteSpiderJsonResponse(parsed, { isDetail, cacheHit, forwardPath = '', runtimeId = '' }) {
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
-    let next = { ...parsed, cache: !!cacheHit };
+    let next = rewriteSpiderVodPicFields({ ...parsed, cache: !!cacheHit }, forwardPath, runtimeId);
     if (isDetail) {
         next.pan_mock = isPanMockEnabled();
         next = rewritePanmockDetailPayload(next);
@@ -446,7 +585,7 @@ async function fetchBufferedProxyResponse({ request, targetPort, pathToUse, head
     });
 }
 
-function sendBufferedProxyResponse(reply, request, response, { rewriteSpider = false, cacheHit = false, forwardPath = '' } = {}) {
+function sendBufferedProxyResponse(reply, request, response, { rewriteSpider = false, cacheHit = false, forwardPath = '', runtimeId = '' } = {}) {
     const hopByHop = new Set([
         'connection',
         'keep-alive',
@@ -464,7 +603,9 @@ function sendBufferedProxyResponse(reply, request, response, { rewriteSpider = f
     if (rewriteSpider) {
         const parsed = parseJsonSafe(outBody.toString('utf8'));
         const rewriteMeta = shouldTryRewriteSpiderResponse(forwardPath, outHeaders);
-        const next = rewriteMeta.shouldRewrite ? rewriteSpiderJsonResponse(parsed, { isDetail: rewriteMeta.isDetail, cacheHit }) : null;
+        const next = rewriteMeta.shouldRewrite
+            ? rewriteSpiderJsonResponse(parsed, { isDetail: rewriteMeta.isDetail, cacheHit, forwardPath, runtimeId })
+            : null;
         if (next) {
             outBody = Buffer.from(JSON.stringify(next), 'utf8');
             delete outHeaders['content-length'];
@@ -984,6 +1125,7 @@ export default async function router(fastify) {
                         rewriteSpider: true,
                         cacheHit: hit,
                         forwardPath: pathToUse,
+                        runtimeId,
                     });
                     return;
                 }

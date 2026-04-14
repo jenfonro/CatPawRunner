@@ -6,6 +6,7 @@ import { findAvailablePortInRange } from './tool.js';
 
 const children = new Map(); // id -> { child, entry, port }
 const starting = new Map(); // id -> Promise<startResult>
+const upstreamOrigins = new Map(); // runtimeId -> Map<siteKey, origin>
 let runtimeOpsQueue = Promise.resolve();
 
 function getRootDir() {
@@ -223,6 +224,7 @@ export async function startOnlineRuntime({
     })();
 
     const key = typeof id === 'string' && id.trim() ? id.trim() : 'default';
+    upstreamOrigins.delete(key);
 
     // Coalesce concurrent start attempts for the same id.
     const inflight = starting.get(key);
@@ -905,14 +907,42 @@ export async function startOnlineRuntime({
 			      }
 			    };
 
-			    const __isLocalHostForProxy = (hostLike) => {
-			      try {
-			        const h = String(hostLike || '').trim().toLowerCase();
-			        return h === '127.0.0.1' || h === 'localhost' || h === '0.0.0.0' || h === '::1';
-			      } catch (_) {
-			        return false;
-			      }
-			    };
+				    const __isLocalHostForProxy = (hostLike) => {
+				      try {
+				        const h = String(hostLike || '').trim().toLowerCase();
+				        return h === '127.0.0.1' || h === 'localhost' || h === '0.0.0.0' || h === '::1';
+				      } catch (_) {
+				        return false;
+				      }
+				    };
+
+				    const __upstreamOriginBySite = new Map();
+				    const __normalizePublicOrigin = (rawOrigin) => {
+				      try {
+				        const s = String(rawOrigin || '').trim();
+				        if (!s) return '';
+				        const u = new URL(s);
+				        const protocol = String(u.protocol || '').toLowerCase();
+				        const host = String(u.hostname || '').trim().toLowerCase();
+				        if (protocol !== 'http:' && protocol !== 'https:') return '';
+				        if (!host || __isLocalHostForProxy(host) || host.endsWith('.localhost')) return '';
+				        return String(u.protocol || '') + '//' + String(u.host || '');
+				      } catch (_) {
+				        return '';
+				      }
+				    };
+				    const __reportUpstreamOrigin = (originLike) => {
+				      try {
+				        const site = String(__currentSite() || '').trim().toLowerCase();
+				        if (!site) return;
+				        const origin = __normalizePublicOrigin(originLike);
+				        if (!origin) return;
+				        const prev = __upstreamOriginBySite.get(site);
+				        if (prev === origin) return;
+				        __upstreamOriginBySite.set(site, origin);
+				        __send({ type: 'upstream_origin', site, origin, t: Date.now() });
+				      } catch (_) {}
+				    };
 
 			    const __pickProxyForHost = (host) => {
 			      try {
@@ -3099,6 +3129,7 @@ export async function startOnlineRuntime({
 						                : input && typeof input === 'object' && typeof input.url === 'string'
 						                  ? input.url
 						                  : '';
+						            try { __reportUpstreamOrigin(url); } catch (_) {}
 						            const headerSource =
 						              init && typeof init === 'object' && Object.prototype.hasOwnProperty.call(init, 'headers')
 						                ? init.headers
@@ -3284,8 +3315,43 @@ export async function startOnlineRuntime({
 	            : options && typeof options === 'string'
 	              ? (() => { try { return String(new URL(options).hostname || ''); } catch (_) { return ''; } })()
 	              : String((options && (options.hostname || options.host)) || '');
-		          const host = __normalizeHost(hostname);
-		          const __callStack = (() => {
+			          const host = __normalizeHost(hostname);
+			          try {
+			            const originLike = (() => {
+			              try {
+			                if (isUrl && options && options.origin) return String(options.origin || '');
+			                if (typeof options === 'string') {
+			                  try { return String(new URL(options).origin || ''); } catch (_) { return ''; }
+			                }
+			                const isObj = options && typeof options === 'object' && !Array.isArray(options) && !(options instanceof URL);
+			                if (!isObj) return '';
+			                let protocol =
+			                  typeof options.protocol === 'string' && options.protocol
+			                    ? String(options.protocol)
+			                    : mod === https
+			                      ? 'https:'
+			                      : 'http:';
+			                if (!protocol.endsWith(':')) protocol += ':';
+			                const hn = __normalizeHost(options.hostname || options.host || '');
+			                if (!hn) return '';
+			                let port = Number(options.port || 0);
+			                if (!Number.isFinite(port) || port <= 0) {
+			                  const fromHost = /:(\d+)$/.exec(String(options.host || '').trim());
+			                  if (fromHost && fromHost[1]) {
+			                    const p2 = Number(fromHost[1]);
+			                    if (Number.isFinite(p2) && p2 > 0) port = Math.trunc(p2);
+			                  }
+			                }
+			                const defaultPort = protocol === 'https:' ? 443 : 80;
+			                const suffix = Number.isFinite(port) && port > 0 && port !== defaultPort ? ':' + String(Math.trunc(port)) : '';
+			                return String(protocol || '') + '//' + String(hn || '') + String(suffix || '');
+			              } catch (_) {
+			                return '';
+			              }
+			            })();
+			            if (originLike) __reportUpstreamOrigin(originLike);
+			          } catch (_) {}
+			          const __callStack = (() => {
 		            try {
 		              if (!__wantMockStack) return '';
 		              return new Error('catpaw-call-stack').stack || '';
@@ -4737,11 +4803,45 @@ export async function startOnlineRuntime({
 		                    finish({ ok: false, port: expectedPort });
 		                }
 		            };
-	            const onMsg = (msg) => {
-	                if (!msg || typeof msg !== 'object') return;
-	                if (msg.type === 'stage') {
-	                    const st = typeof msg.stage === 'string' ? msg.stage.trim() : '';
-	                    if (st) lastStage = st;
+		            const onMsg = (msg) => {
+		                if (!msg || typeof msg !== 'object') return;
+		                if (msg.type === 'upstream_origin') {
+		                    try {
+		                        const site = typeof msg.site === 'string' ? msg.site.trim().toLowerCase() : '';
+		                        const originRaw = typeof msg.origin === 'string' ? msg.origin.trim() : '';
+		                        if (!site || !originRaw) return;
+		                        let origin = '';
+		                        try {
+		                            const u = new URL(originRaw);
+		                            const protocol = String(u.protocol || '').toLowerCase();
+		                            const host = String(u.hostname || '').trim().toLowerCase();
+		                            if (
+		                                (protocol === 'http:' || protocol === 'https:') &&
+		                                host &&
+		                                host !== 'localhost' &&
+		                                host !== '127.0.0.1' &&
+		                                host !== '0.0.0.0' &&
+		                                host !== '::1' &&
+		                                !host.endsWith('.localhost')
+		                            ) {
+		                                origin = `${u.protocol}//${u.host}`;
+		                            }
+		                        } catch (_) {
+		                            origin = '';
+		                        }
+		                        if (!origin) return;
+		                        let siteMap = upstreamOrigins.get(key);
+		                        if (!siteMap) {
+		                            siteMap = new Map();
+		                            upstreamOrigins.set(key, siteMap);
+		                        }
+		                        siteMap.set(site, origin);
+		                    } catch (_) {}
+		                    return;
+		                }
+		                if (msg.type === 'stage') {
+		                    const st = typeof msg.stage === 'string' ? msg.stage.trim() : '';
+		                    if (st) lastStage = st;
 	                    return;
 	                }
 	                if (msg.type === 'fatal') {
@@ -5038,13 +5138,17 @@ export async function startOnlineRuntime({
 export function stopOnlineRuntime(id = 'default') {
     const key = typeof id === 'string' && id.trim() ? id.trim() : 'default';
     const cur = children.get(key);
-    if (!cur || !cur.child || cur.child.killed) return false;
+    if (!cur || !cur.child || cur.child.killed) {
+        upstreamOrigins.delete(key);
+        return false;
+    }
     try {
         cur.child.kill();
         return true;
     } catch (_) {
         return false;
     } finally {
+        upstreamOrigins.delete(key);
         children.delete(key);
     }
 }
@@ -5057,6 +5161,39 @@ export function stopAllOnlineRuntimes() {
         } catch (_) {}
     });
     return true;
+}
+
+export function getOnlineRuntimeUpstreamOrigin(runtimeId = '', spiderKey = '') {
+    try {
+        const rid = typeof runtimeId === 'string' ? runtimeId.trim() : '';
+        const sk = typeof spiderKey === 'string' ? spiderKey.trim().toLowerCase() : '';
+        if (!rid || !sk) return '';
+        const siteMap = upstreamOrigins.get(rid);
+        if (!siteMap || typeof siteMap.get !== 'function') return '';
+        const origin = String(siteMap.get(sk) || '').trim();
+        if (!origin) return '';
+        try {
+            const u = new URL(origin);
+            const protocol = String(u.protocol || '').toLowerCase();
+            const host = String(u.hostname || '').trim().toLowerCase();
+            if (
+                (protocol !== 'http:' && protocol !== 'https:') ||
+                !host ||
+                host === 'localhost' ||
+                host === '127.0.0.1' ||
+                host === '0.0.0.0' ||
+                host === '::1' ||
+                host.endsWith('.localhost')
+            ) {
+                return '';
+            }
+            return `${u.protocol}//${u.host}`;
+        } catch (_) {
+            return '';
+        }
+    } catch (_) {
+        return '';
+    }
 }
 
 export async function withOnlineRuntimeOpsLock(task) {
