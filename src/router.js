@@ -351,9 +351,127 @@ function rewritePanmockDetailPayload(parsed) {
     return { ...parsed, list: [first, ...list.slice(1)] };
 }
 
-function rewriteSpiderJsonResponse(parsed, { isDetail, cacheHit }) {
+const spiderBaseOriginByKey = new Map();
+
+function parseSpiderRouteMeta(forwardPath) {
+    const pathName = String(forwardPath || '').split('?')[0] || '/';
+    const m = /^\/spider\/([^/]+)\/(\d+)\/(home|category|search|detail)$/i.exec(pathName);
+    if (!m) return { spiderKey: '', routeName: '' };
+    return {
+        spiderKey: String(m[1] || '').trim().toLowerCase(),
+        routeName: String(m[3] || '').trim().toLowerCase(),
+    };
+}
+
+function toHttpOrigin(raw) {
+    const s = typeof raw === 'string' ? raw.trim() : '';
+    if (!s) return '';
+    try {
+        const u = new URL(s);
+        if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
+        const host = String(u.hostname || '').trim().toLowerCase();
+        if (!host) return '';
+        if (
+            host === 'localhost' ||
+            host === '127.0.0.1' ||
+            host === '0.0.0.0' ||
+            host === '::1' ||
+            host.endsWith('.localhost')
+        ) {
+            return '';
+        }
+        return `${u.protocol}//${u.host}`;
+    } catch (_) {
+        return '';
+    }
+}
+
+function absolutizePicUrl(raw, baseOrigin) {
+    const s = typeof raw === 'string' ? raw.trim() : '';
+    if (!s) return raw;
+    if (/^(?:https?:)?\/\//i.test(s)) return s.startsWith('//') ? `https:${s}` : s;
+    if (/^(?:data|blob|file):/i.test(s)) return s;
+
+    const origin = toHttpOrigin(baseOrigin);
+    if (origin) {
+        try {
+            return new URL(s, `${origin}/`).toString();
+        } catch (_) {}
+    }
+    return raw;
+}
+
+function pickSpiderBaseOrigin(parsed, spiderKey) {
+    const key = String(spiderKey || '').trim().toLowerCase();
+    const list = Array.isArray(parsed && parsed.list) ? parsed.list : [];
+
+    const topCandidates = [
+        parsed && parsed.site_url,
+        parsed && parsed.siteUrl,
+        parsed && parsed.base_url,
+        parsed && parsed.baseUrl,
+        parsed && parsed.origin,
+        parsed && parsed.url,
+        parsed && parsed.referer,
+    ];
+    for (const c of topCandidates) {
+        const origin = toHttpOrigin(typeof c === 'string' ? c : '');
+        if (origin) {
+            if (key) spiderBaseOriginByKey.set(key, origin);
+            return origin;
+        }
+    }
+
+    for (const item of list) {
+        if (!item || typeof item !== 'object') continue;
+        const absPic = toHttpOrigin(typeof item.vod_pic === 'string' ? item.vod_pic : '');
+        if (absPic) {
+            if (key) spiderBaseOriginByKey.set(key, absPic);
+            return absPic;
+        }
+        const absId = toHttpOrigin(typeof item.vod_id === 'string' ? item.vod_id : '');
+        if (absId) {
+            if (key) spiderBaseOriginByKey.set(key, absId);
+            return absId;
+        }
+    }
+
+    return key ? String(spiderBaseOriginByKey.get(key) || '') : '';
+}
+
+function rewriteSpiderVodPicFields(parsed, forwardPath) {
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return parsed;
+    const list = Array.isArray(parsed.list) ? parsed.list : null;
+    if (!list || !list.length) return parsed;
+
+    const { spiderKey, routeName } = parseSpiderRouteMeta(forwardPath);
+    if (!routeName || !['home', 'category', 'search', 'detail'].includes(routeName)) return parsed;
+
+    const baseOrigin = pickSpiderBaseOrigin(parsed, spiderKey);
+    let changed = false;
+    const nextList = list.map((item) => {
+        if (!item || typeof item !== 'object') return item;
+        let nextItem = item;
+        const picKeys = ['vod_pic', 'book_pic', 'pic'];
+        for (const k of picKeys) {
+            const cur = typeof item[k] === 'string' ? item[k] : '';
+            if (!cur) continue;
+            const nextPic = absolutizePicUrl(cur, baseOrigin);
+            if (nextPic !== cur) {
+                if (nextItem === item) nextItem = { ...item };
+                nextItem[k] = nextPic;
+                changed = true;
+            }
+        }
+        return nextItem;
+    });
+
+    return changed ? { ...parsed, list: nextList } : parsed;
+}
+
+function rewriteSpiderJsonResponse(parsed, { isDetail, cacheHit, forwardPath = '' }) {
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
-    let next = { ...parsed, cache: !!cacheHit };
+    let next = rewriteSpiderVodPicFields({ ...parsed, cache: !!cacheHit }, forwardPath);
     if (isDetail) {
         next.pan_mock = isPanMockEnabled();
         next = rewritePanmockDetailPayload(next);
@@ -464,7 +582,9 @@ function sendBufferedProxyResponse(reply, request, response, { rewriteSpider = f
     if (rewriteSpider) {
         const parsed = parseJsonSafe(outBody.toString('utf8'));
         const rewriteMeta = shouldTryRewriteSpiderResponse(forwardPath, outHeaders);
-        const next = rewriteMeta.shouldRewrite ? rewriteSpiderJsonResponse(parsed, { isDetail: rewriteMeta.isDetail, cacheHit }) : null;
+        const next = rewriteMeta.shouldRewrite
+            ? rewriteSpiderJsonResponse(parsed, { isDetail: rewriteMeta.isDetail, cacheHit, forwardPath })
+            : null;
         if (next) {
             outBody = Buffer.from(JSON.stringify(next), 'utf8');
             delete outHeaders['content-length'];
