@@ -420,17 +420,57 @@ function extractImageUrlFromQueryPath(raw) {
     return /^https?:\/\//i.test(val) ? val : '';
 }
 
+function normalizeImageUrlForParse(raw) {
+    const s = typeof raw === 'string' ? raw.trim() : '';
+    if (!s) return '';
+    if (s.startsWith('//')) return `https:${s}`;
+    if (s.startsWith('http://')) return `https://${s.slice('http://'.length)}`;
+    return s;
+}
+
+function isAllowedDoubanImageHost(hostname) {
+    const host = typeof hostname === 'string' ? hostname.trim().toLowerCase() : '';
+    if (!host) return false;
+    if (/^img\d+\.doubanio\.com$/.test(host)) return true;
+    if (/^img\d+\.douban\.com$/.test(host)) return true;
+    if (host === 'img3.doubanio.com') return true;
+    if (host === 'img.doubanio.com') return true;
+    if (host === 'img.douban.com') return true;
+    if (host === 'img.doubanio.cmliussss.net') return true;
+    if (host === 'img.doubanio.cmliussss.com') return true;
+    return false;
+}
+
+function isDoubanImageUrl(raw) {
+    const s = normalizeImageUrlForParse(raw);
+    if (!s) return false;
+    try {
+        const u = new URL(s);
+        const protocol = String(u.protocol || '').toLowerCase();
+        if (protocol !== 'http:' && protocol !== 'https:') return false;
+        return isAllowedDoubanImageHost(String(u.hostname || ''));
+    } catch (_) {
+        return false;
+    }
+}
+
+function extractDoubanImageUrlFromQueryPath(raw) {
+    const embedded = extractImageUrlFromQueryPath(raw);
+    const normalized = normalizeImageUrlForParse(embedded);
+    if (!normalized) return '';
+    return isDoubanImageUrl(normalized) ? normalized : '';
+}
+
 function absolutizePicUrl(raw, baseOrigin) {
     const s = typeof raw === 'string' ? raw.trim() : '';
     if (!s) return raw;
+
+    // Apply globally: if query params include a Douban image URL, return that real image URL directly.
+    const embeddedDoubanUrl = extractDoubanImageUrlFromQueryPath(s);
+    if (embeddedDoubanUrl) return embeddedDoubanUrl;
+
     if (/^(?:https?:)?\/\//i.test(s)) return s.startsWith('//') ? `https:${s}` : s;
     if (/^(?:data|blob|file):/i.test(s)) return s;
-
-    // For paths like "/db.php?url=https://...", prefer the embedded remote image url first.
-    if (s.startsWith('/')) {
-        const embeddedUrl = extractImageUrlFromQueryPath(s);
-        if (embeddedUrl) return embeddedUrl;
-    }
 
     const origin = toHttpOrigin(baseOrigin);
     if (origin) {
