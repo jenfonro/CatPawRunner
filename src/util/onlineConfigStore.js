@@ -3,7 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import axios from 'axios';
 
-function resolveRuntimeRootDir() {
+export function resolveRuntimeRootDir() {
     try {
         // eslint-disable-next-line no-undef
         if (process && process.pkg && typeof process.execPath === 'string' && process.execPath) {
@@ -52,6 +52,14 @@ function writeJsonFileAtomic(filePath, obj) {
     atomicWriteFile(filePath, `${JSON.stringify(root, null, 2)}\n`);
 }
 
+export function readJsonObjectSafe(filePath) {
+    return readJsonFileSafe(filePath) || {};
+}
+
+export function writeJsonObjectAtomic(filePath, obj) {
+    writeJsonFileAtomic(filePath, obj);
+}
+
 function sanitizeFileName(name, fallback) {
     const base = path.basename(String(name || '').trim() || String(fallback || '').trim() || 'online.js');
     const safe = base.replace(/[^a-zA-Z0-9._-]/g, '_');
@@ -73,7 +81,7 @@ function sanitizeNameSeedForId(name) {
     return base.replace(/\s+/g, ' ').trim();
 }
 
-function buildAutoOnlineRuntimeId(name, urlStr, used) {
+export function buildAutoOnlineRuntimeId(name, urlStr, used) {
     const usedSet = used && typeof used.has === 'function' ? used : new Set();
     const nameSeed = sanitizeNameSeedForId(name).toLowerCase();
     const urlSeed = String(urlStr || '').trim();
@@ -122,16 +130,6 @@ function pickFileNameFromUrl(urlStr) {
     }
 }
 
-function buildOnlineFileName(urlStr, id) {
-    const baseFromUrl = pickFileNameFromUrl(urlStr);
-    const base = sanitizeFileName(baseFromUrl || 'online.js', 'online.js');
-    const lower = base.toLowerCase();
-    const extFromBase = lower.endsWith('.cjs') ? '.cjs' : lower.endsWith('.mjs') ? '.mjs' : lower.endsWith('.js') ? '.js' : '';
-    const name = base.replace(/\.(cjs|mjs|js)$/i, '');
-    const hash = stableHashShort(id || urlStr);
-    return `${name}.${hash}${extFromBase || '.js'}`.replace(/\.{2,}/g, '.');
-}
-
 function resolveAxiosRequestForUrl(urlStr) {
     const raw = String(urlStr || '').trim();
     if (!raw) return { requestUrl: raw, auth: null };
@@ -174,20 +172,207 @@ function normalizeOnlineConfigs(list) {
     const arr = Array.isArray(list) ? list : [];
     return arr
         .map((raw) => {
-            const it = raw && typeof raw === 'object' ? raw : {};
-            const url = typeof it.url === 'string' ? it.url.trim() : typeof raw === 'string' ? raw.trim() : '';
+            const it = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : null;
+            if (!it) return null;
+            const url = typeof it.url === 'string' ? it.url.trim() : '';
+            if (!url) return null;
             const name = typeof it.name === 'string' ? it.name.trim() : '';
             const idRaw = typeof it.id === 'string' && it.id.trim() ? it.id.trim() : '';
             const fileNameRaw = typeof it.fileName === 'string' ? it.fileName.trim() : '';
-            const entryFn =
-                typeof it.entryFn === 'string'
-                    ? it.entryFn.trim()
-                    : typeof it.entry_fn === 'string'
-                      ? it.entry_fn.trim()
-                      : '';
+            const entryFn = typeof it.entryFn === 'string' ? it.entryFn.trim() : '';
             return { url, name, idRaw, fileNameRaw, entryFn };
         })
-        .filter((it) => it.url);
+        .filter(Boolean);
+}
+
+export function getOnlineConfigListAndKey(cfgRoot) {
+    const cfg = cfgRoot && typeof cfgRoot === 'object' && !Array.isArray(cfgRoot) ? cfgRoot : {};
+    if (Array.isArray(cfg.onlineConfigs)) return { key: 'onlineConfigs', list: cfg.onlineConfigs };
+    if (Array.isArray(cfg.online_configs)) return { key: 'online_configs', list: cfg.online_configs };
+    return { key: '', list: [] };
+}
+
+function normalizeOnlineConfigForSignature(raw) {
+    const it = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+    const url = typeof it.url === 'string' ? it.url.trim() : '';
+    if (!url) return null;
+    return {
+        id: typeof it.id === 'string' ? it.id.trim() : '',
+        url,
+        name: typeof it.name === 'string' ? it.name.trim() : '',
+        fileName: typeof it.fileName === 'string' ? it.fileName.trim() : '',
+        entryFn: typeof it.entryFn === 'string' ? it.entryFn.trim() : '',
+    };
+}
+
+export function buildOnlineConfigWatchSignature(cfgRoot) {
+    const { key, list } = getOnlineConfigListAndKey(cfgRoot);
+    const normalized = (Array.isArray(list) ? list : []).map(normalizeOnlineConfigForSignature).filter(Boolean);
+    return JSON.stringify({ key, list: normalized });
+}
+
+export function hasPendingOnlineConfigStatus(cfgRoot) {
+    const { list } = getOnlineConfigListAndKey(cfgRoot);
+    return (Array.isArray(list) ? list : []).some((raw) => {
+        const it = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : null;
+        if (!it) return false;
+        const status = typeof it.status === 'string' ? it.status.trim() : '';
+        const updateResult = typeof it.updateResult === 'string' ? it.updateResult.trim() : '';
+        return status === 'checking' || updateResult === 'updating';
+    });
+}
+
+export function markOnlineConfigsCheckingInConfig(cfgPath) {
+    const cfgRoot = readJsonFileSafe(cfgPath) || {};
+    const { key, list } = getOnlineConfigListAndKey(cfgRoot);
+    if (!key || !Array.isArray(list) || !list.length) return { changed: false };
+
+    const now = Date.now();
+    let changedAny = false;
+    const nextList = list.map((raw) => {
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return raw;
+        const item = { ...raw };
+        const url = typeof item.url === 'string' ? item.url.trim() : '';
+        if (!url) return item;
+        if (item.status !== 'checking') {
+            item.status = 'checking';
+            changedAny = true;
+        }
+        if (item.checkedAt !== now) {
+            item.checkedAt = now;
+            changedAny = true;
+        }
+        if (Object.prototype.hasOwnProperty.call(item, 'message')) {
+            delete item.message;
+            changedAny = true;
+        }
+        return item;
+    });
+
+    if (!changedAny) return { changed: false };
+    try {
+        writeJsonFileAtomic(cfgPath, { ...cfgRoot, [key]: nextList });
+        return { changed: true };
+    } catch (_) {
+        return { changed: false };
+    }
+}
+
+export function persistOnlineConfigStatePatchesByPath(cfgPath, patches = []) {
+    const list = Array.isArray(patches) ? patches : [];
+    if (!cfgPath || !list.length) return;
+
+    const cfgRoot = readJsonFileSafe(cfgPath) || {};
+    const { key, list: prevList } = getOnlineConfigListAndKey(cfgRoot);
+    if (!key || !Array.isArray(prevList) || !prevList.length) return;
+
+    const byId = new Map();
+    list.forEach((patch) => {
+        const p = patch && typeof patch === 'object' ? patch : null;
+        if (!p) return;
+        const id = typeof p.id === 'string' ? p.id.trim() : '';
+        if (!id) return;
+        byId.set(id, p);
+    });
+    if (!byId.size) return;
+
+    let changedAny = false;
+    const nextList = prevList.map((raw) => {
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return raw;
+        const item = { ...raw };
+        const id = typeof item.id === 'string' ? item.id.trim() : '';
+        if (!id || !byId.has(id)) return item;
+        const patch = byId.get(id) || {};
+
+        const assign = (field) => {
+            if (!Object.prototype.hasOwnProperty.call(patch, field)) return;
+            item[field] = patch[field];
+            changedAny = true;
+        };
+
+        assign('status');
+        assign('checkedAt');
+        assign('updateResult');
+        assign('updateAt');
+        assign('changed');
+        assign('updated');
+        assign('localMd5');
+        assign('remoteMd5');
+
+        if (Object.prototype.hasOwnProperty.call(patch, 'message')) {
+            const msg = typeof patch.message === 'string' ? patch.message.trim() : '';
+            if (msg) item.message = msg;
+            else delete item.message;
+            changedAny = true;
+        }
+        return item;
+    });
+
+    if (!changedAny) return;
+    try {
+        writeJsonFileAtomic(cfgPath, { ...cfgRoot, [key]: nextList });
+    } catch (_) {}
+}
+
+export function buildLoadingPatchesFromSyncResult(syncResult) {
+    const sync = syncResult && typeof syncResult === 'object' ? syncResult : {};
+    const applied = sync.applied && typeof sync.applied === 'object' ? sync.applied : {};
+    const resolved = Array.isArray(applied.resolved) ? applied.resolved : [];
+    const runtimes = Array.isArray(sync.runtimes) ? sync.runtimes : [];
+    const runtimeById = new Map(
+        runtimes
+            .filter((it) => it && typeof it === 'object' && typeof it.id === 'string' && it.id.trim())
+            .map((it) => [it.id.trim(), it])
+    );
+
+    const patches = [];
+    for (const rsRaw of resolved) {
+        const rs = rsRaw && typeof rsRaw === 'object' ? rsRaw : null;
+        if (!rs) continue;
+        const id = typeof rs.id === 'string' ? rs.id.trim() : '';
+        if (!id) continue;
+        const checkedAt = Number.isFinite(Number(rs.checkedAt)) ? Math.max(1, Math.trunc(Number(rs.checkedAt))) : Date.now();
+        const localMd5 = typeof rs.localMd5 === 'string' ? rs.localMd5 : '';
+        const remoteMd5 = typeof rs.remoteMd5 === 'string' ? rs.remoteMd5 : '';
+        if (!rs.ok) {
+            patches.push({
+                id,
+                status: 'error',
+                checkedAt,
+                message: (typeof rs.message === 'string' && rs.message.trim()) || 'download failed',
+                changed: !!rs.changed,
+                localMd5,
+                remoteMd5,
+            });
+            continue;
+        }
+
+        const rt = runtimeById.get(id) || null;
+        const loaded = !!(rt && rt.ok && !rt.keptPrevious);
+        patches.push({
+            id,
+            status: loaded ? 'pass' : 'error',
+            checkedAt,
+            message: loaded
+                ? ''
+                : (rt && typeof rt.message === 'string' && rt.message.trim()) ||
+                  (rt && rt.keptPrevious ? 'new url load failed, keeping previous runtime' : 'runtime load failed'),
+            changed: !!rs.changed,
+            localMd5,
+            remoteMd5,
+        });
+    }
+    return patches;
+}
+
+export function normalizeOnlineConfigIdSet(raw) {
+    const set = new Set();
+    const list = Array.isArray(raw) ? raw : [];
+    list.forEach((v) => {
+        const id = String(v || '').trim();
+        if (id) set.add(id);
+    });
+    return set;
 }
 
 function pickExtFromUrl(parsedUrl) {
@@ -319,7 +504,9 @@ export function discardOnlineStagedScript(options = {}) {
 
 export async function applyOnlineConfigs(options = {}) {
     const rootDir = options && typeof options.rootDir === 'string' && options.rootDir ? options.rootDir : resolveRuntimeRootDir();
-    const forceRemoteCheck = !!(options && options.forceRemoteCheck);
+    const forceRemoteCheckIds = normalizeOnlineConfigIdSet(
+        options && Object.prototype.hasOwnProperty.call(options, 'forceRemoteCheckIds') ? options.forceRemoteCheckIds : []
+    );
     const cfgPath = path.resolve(rootDir, 'config.json');
     const cfg = readJsonFileSafe(cfgPath) || {};
     const hasOnlineConfigs =
@@ -412,7 +599,7 @@ export async function applyOnlineConfigs(options = {}) {
         const localExists = fs.existsSync(destPath);
         const localText = localExists ? readTextFileSafe(destPath) : '';
         const localMd5 = localExists ? md5Hex(localText) : '';
-        const shouldFetchRemote = forceRemoteCheck || !localExists || !prevUrl || prevUrl !== url;
+        const shouldFetchRemote = forceRemoteCheckIds.has(idEff) || !localExists || !prevUrl || prevUrl !== url;
         let checkedAt = prevCheckedAt;
 
         try {

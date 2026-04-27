@@ -1,103 +1,21 @@
-import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
 import https from 'node:https';
-import crypto from 'node:crypto';
-import { findAvailablePortInRange } from '../../util/tool.js';
-import { applyOnlineConfigs, promoteOnlineStagedScript, discardOnlineStagedScript } from '../../util/onlineConfigStore.js';
 import {
-    startOnlineRuntime,
-    stopOnlineRuntime,
-    stopAllOnlineRuntimes,
-    setOnlineRuntimeEntry,
+    persistOnlineConfigStatePatchesByPath,
+    readJsonObjectSafe,
+    writeJsonObjectAtomic,
+    resolveRuntimeRootDir,
+    buildAutoOnlineRuntimeId,
+} from '../../util/onlineConfigStore.js';
+import {
     broadcastOnlineRuntimeMockConfig,
     broadcastOnlineRuntimeProxyConfig,
     broadcastOnlineRuntimePacketCaptureConfig,
-    withOnlineRuntimeOpsLock,
 } from '../../util/onlineRuntime.js';
+import { runOnlineSyncInBackground } from '../../util/onlineConfigSyncService.js';
 
 const onlineConfigUpdateInFlightIds = new Set();
-
-function resolveRuntimeRootDir() {
-    try {
-        if (process && process.pkg && typeof process.execPath === 'string' && process.execPath) {
-            return path.dirname(process.execPath);
-        }
-    } catch (_) {}
-
-    try {
-        const envRoot = typeof process.env.NODE_PATH === 'string' ? process.env.NODE_PATH.trim() : '';
-        if (envRoot) return path.resolve(envRoot);
-    } catch (_) {}
-
-    return process.cwd();
-}
-
-function readJsonFileSafe(filePath) {
-    try {
-        if (!filePath || !fs.existsSync(filePath)) return null;
-        const raw = fs.readFileSync(filePath, 'utf8');
-        const parsed = raw && raw.trim() ? JSON.parse(raw) : null;
-        return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
-    } catch (_) {
-        return null;
-    }
-}
-
-function atomicWriteFile(filePath, content) {
-    const dir = path.dirname(filePath);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    const tmp = path.resolve(dir, `.${path.basename(filePath)}.tmp.${process.pid}.${Date.now()}`);
-    fs.writeFileSync(tmp, content, 'utf8');
-    fs.renameSync(tmp, filePath);
-}
-
-function writeJsonFileAtomic(filePath, obj) {
-    const root = obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : {};
-    atomicWriteFile(filePath, `${JSON.stringify(root, null, 2)}\n`);
-}
-
-function stableHashShort(input) {
-    const s = String(input || '');
-    return crypto.createHash('sha256').update(s).digest('hex').slice(0, 10);
-}
-
-function sanitizeNameSeedForId(name) {
-    const raw = String(name || '').trim();
-    if (!raw) return '';
-    const base = path.basename(raw);
-    return base.replace(/\s+/g, ' ').trim();
-}
-
-function buildAutoOnlineRuntimeId(name, urlStr, used) {
-    const usedSet = used && typeof used.has === 'function' ? used : new Set();
-    const nameSeed = sanitizeNameSeedForId(name).toLowerCase();
-    const urlSeed = String(urlStr || '').trim();
-    const pick = (seed) => stableHashShort(seed);
-
-    const primary = pick(nameSeed ? `name:${nameSeed}` : `url:${urlSeed}`);
-    if (!usedSet.has(primary)) {
-        usedSet.add(primary);
-        return primary;
-    }
-
-    const secondary = pick(`name+url:${nameSeed}:${urlSeed}`);
-    if (!usedSet.has(secondary)) {
-        usedSet.add(secondary);
-        return secondary;
-    }
-
-    for (let n = 1; n <= 10000; n += 1) {
-        const next = pick(`name+url:${nameSeed}:${urlSeed}#${n}`);
-        if (usedSet.has(next)) continue;
-        usedSet.add(next);
-        return next;
-    }
-
-    const fallback = pick(`name+url:${nameSeed}:${urlSeed}:overflow`);
-    usedSet.add(fallback);
-    return fallback;
-}
 
 function save139AuthorizationToConfig(rootDir, authorization) {
     const root = rootDir ? String(rootDir) : '';
@@ -106,7 +24,7 @@ function save139AuthorizationToConfig(rootDir, authorization) {
     if (!auth) throw new Error('missing authorization');
 
     const cfgPath = path.resolve(root, 'config.json');
-    const cfgRoot = readJsonFileSafe(cfgPath) || {};
+    const cfgRoot = readJsonObjectSafe(cfgPath) || {};
     const next = cfgRoot && typeof cfgRoot === 'object' && !Array.isArray(cfgRoot) ? { ...cfgRoot } : {};
 
     const account =
@@ -120,7 +38,7 @@ function save139AuthorizationToConfig(rootDir, authorization) {
     account['139'] = p139;
     next.account = account;
 
-    writeJsonFileAtomic(cfgPath, next);
+    writeJsonObjectAtomic(cfgPath, next);
 }
 
 function savePanCredentialToConfig(rootDir, key, value) {
@@ -138,7 +56,7 @@ function savePanCredentialToConfig(rootDir, key, value) {
     if (!cookie && !authorization && !(username && password)) throw new Error('empty credential');
 
     const cfgPath = path.resolve(root, 'config.json');
-    const cfgRoot = readJsonFileSafe(cfgPath) || {};
+    const cfgRoot = readJsonObjectSafe(cfgPath) || {};
     const next = cfgRoot && typeof cfgRoot === 'object' && !Array.isArray(cfgRoot) ? { ...cfgRoot } : {};
 
     const account =
@@ -157,7 +75,7 @@ function savePanCredentialToConfig(rootDir, key, value) {
     account[panKey] = prev;
     next.account = account;
 
-    writeJsonFileAtomic(cfgPath, next);
+    writeJsonObjectAtomic(cfgPath, next);
 }
 
 function saveQuarkTvCredentialToConfig(rootDir, value) {
@@ -181,7 +99,7 @@ function saveQuarkTvCredentialToConfig(rootDir, value) {
     if (!refreshToken || !deviceId) throw new Error('missing quark_tv refresh_token/device_id');
 
     const cfgPath = path.resolve(root, 'config.json');
-    const cfgRoot = readJsonFileSafe(cfgPath) || {};
+    const cfgRoot = readJsonObjectSafe(cfgPath) || {};
     const next = cfgRoot && typeof cfgRoot === 'object' && !Array.isArray(cfgRoot) ? { ...cfgRoot } : {};
 
     const account =
@@ -200,7 +118,7 @@ function saveQuarkTvCredentialToConfig(rootDir, value) {
     account.quark_tv = prev;
     next.account = account;
 
-    writeJsonFileAtomic(cfgPath, next);
+    writeJsonObjectAtomic(cfgPath, next);
 }
 
 function saveUcTvCredentialToConfig(rootDir, value) {
@@ -224,7 +142,7 @@ function saveUcTvCredentialToConfig(rootDir, value) {
     if (!refreshToken || !deviceId) throw new Error('missing uc_tv refresh_token/device_id');
 
     const cfgPath = path.resolve(root, 'config.json');
-    const cfgRoot = readJsonFileSafe(cfgPath) || {};
+    const cfgRoot = readJsonObjectSafe(cfgPath) || {};
     const next = cfgRoot && typeof cfgRoot === 'object' && !Array.isArray(cfgRoot) ? { ...cfgRoot } : {};
 
     const account =
@@ -241,16 +159,12 @@ function saveUcTvCredentialToConfig(rootDir, value) {
     account.uc_tv = prev;
     next.account = account;
 
-    writeJsonFileAtomic(cfgPath, next);
+    writeJsonObjectAtomic(cfgPath, next);
 }
 
 function normalizeOnlineConfigsInput(body) {
     const b = body && typeof body === 'object' ? body : {};
-    const v = Object.prototype.hasOwnProperty.call(b, 'onlineConfigs')
-        ? b.onlineConfigs
-        : Object.prototype.hasOwnProperty.call(b, 'online_configs')
-          ? b.online_configs
-          : undefined;
+    const v = Object.prototype.hasOwnProperty.call(b, 'onlineConfigs') ? b.onlineConfigs : undefined;
     if (v === undefined) return { provided: false, list: [] };
     if (v == null) return { provided: true, list: [] };
     if (!Array.isArray(v)) return { provided: true, list: null };
@@ -258,10 +172,6 @@ function normalizeOnlineConfigsInput(body) {
 }
 
 function normalizeOnlineConfigItem(raw) {
-    if (typeof raw === 'string') {
-        const url = raw.trim();
-        return { url, name: '', id: '' };
-    }
     const it = raw && typeof raw === 'object' ? raw : {};
     const url = typeof it.url === 'string' ? it.url.trim() : '';
     const name = typeof it.name === 'string' ? it.name.trim() : '';
@@ -336,143 +246,6 @@ function readOnlineConfigsFromConfig(root) {
             };
         })
         .filter((it) => it.url);
-}
-
-function persistOnlineConfigUpdateResults(rootDir, onlineResults = []) {
-    const root = rootDir ? String(rootDir) : '';
-    if (!root) return [];
-    const list = Array.isArray(onlineResults) ? onlineResults : [];
-    if (!list.length) return [];
-
-    const cfgPath = path.resolve(root, 'config.json');
-    const cfgRoot = readJsonFileSafe(cfgPath) || {};
-    const prevList = Array.isArray(cfgRoot.onlineConfigs) ? cfgRoot.onlineConfigs : [];
-    if (!prevList.length) return [];
-
-    const byId = new Map();
-    const byUrl = new Map();
-    list.forEach((it) => {
-        if (!it || typeof it !== 'object') return;
-        const id = typeof it.id === 'string' ? it.id.trim() : '';
-        const url = typeof it.url === 'string' ? it.url.trim() : '';
-        if (id) byId.set(id, it);
-        if (url) byUrl.set(url, it);
-    });
-
-    let changedAny = false;
-    const nextList = prevList.map((raw) => {
-        const item = raw && typeof raw === 'object' && !Array.isArray(raw) ? { ...raw } : raw;
-        if (!item || typeof item !== 'object' || Array.isArray(item)) return item;
-        const id = typeof item.id === 'string' ? item.id.trim() : '';
-        const url = typeof item.url === 'string' ? item.url.trim() : '';
-        const hit = (id && byId.get(id)) || (url && byUrl.get(url)) || null;
-        if (!hit || typeof hit !== 'object') return item;
-
-        const checkedAt = Number.isFinite(Number(hit.checkedAt)) ? Math.trunc(Number(hit.checkedAt)) : Date.now();
-        const updateAtRaw = Number.isFinite(Number(hit.updateAt)) ? Math.trunc(Number(hit.updateAt)) : checkedAt;
-        const updateAt = updateAtRaw > 0 ? updateAtRaw : checkedAt;
-        const status = typeof hit.status === 'string' && hit.status.trim() ? hit.status.trim() : 'unchecked';
-        const message = typeof hit.message === 'string' ? hit.message.trim() : '';
-        const updateResult = typeof hit.updateResult === 'string' ? hit.updateResult.trim() : '';
-        const localMd5 = typeof hit.localMd5 === 'string' ? hit.localMd5.trim() : '';
-        const remoteMd5 = typeof hit.remoteMd5 === 'string' ? hit.remoteMd5.trim() : '';
-        const changed = typeof hit.changed === 'boolean' ? hit.changed : false;
-        const updated = typeof hit.updated === 'boolean' ? hit.updated : false;
-
-        item.status = status;
-        item.checkedAt = checkedAt > 0 ? checkedAt : Date.now();
-        item.updateAt = updateAt > 0 ? updateAt : item.checkedAt;
-        item.updateResult = updateResult || '';
-        item.changed = !!changed;
-        item.updated = !!updated;
-        item.localMd5 = localMd5 || '';
-        item.remoteMd5 = remoteMd5 || '';
-        if (message) item.message = message;
-        else delete item.message;
-
-        changedAny = true;
-        return item;
-    });
-
-    if (changedAny) {
-        try {
-            writeJsonFileAtomic(cfgPath, { ...cfgRoot, onlineConfigs: nextList });
-        } catch (_) {}
-    }
-
-    const cfgAfter = readJsonFileSafe(cfgPath) || cfgRoot;
-    return readOnlineConfigsFromConfig(cfgAfter);
-}
-
-async function readRuntimeHealthById(fastify, items = []) {
-    const out = new Map();
-    try {
-        const list = Array.isArray(items) ? items : [];
-        const portsMap =
-            fastify && fastify.onlineRuntimePorts && typeof fastify.onlineRuntimePorts.get === 'function'
-                ? fastify.onlineRuntimePorts
-                : null;
-        if (!portsMap) return out;
-
-        const ids = Array.from(
-            new Set(
-                list
-                    .map((it) => (it && typeof it.id === 'string' ? it.id.trim() : ''))
-                    .filter(Boolean)
-            )
-        );
-        for (const id of ids) {
-            const port = Number(portsMap.get(id) || 0);
-            if (!Number.isFinite(port) || port <= 0) continue;
-            try {
-                // Keep this short; this endpoint is used by dashboard refresh.
-                // eslint-disable-next-line no-await-in-loop
-                const cfg = await httpGetJson(`http://127.0.0.1:${port}/full-config`, { timeoutMs: 1500 });
-                if (cfg && typeof cfg === 'object') out.set(id, true);
-            } catch (_) {}
-        }
-    } catch (_) {}
-    return out;
-}
-
-async function waitRuntimeReadyById(fastify, runtimeId, options = {}) {
-    const id = typeof runtimeId === 'string' ? runtimeId.trim() : '';
-    if (!id) return { ok: false, message: 'invalid runtime id', port: 0 };
-    const portsMap =
-        fastify && fastify.onlineRuntimePorts && typeof fastify.onlineRuntimePorts.get === 'function'
-            ? fastify.onlineRuntimePorts
-            : null;
-    if (!portsMap) return { ok: false, message: 'onlineRuntimePorts not available', port: 0 };
-
-    const timeoutMs = Number.isFinite(Number(options.timeoutMs)) ? Math.max(500, Math.trunc(Number(options.timeoutMs))) : 30000;
-    const probeTimeoutMs = Number.isFinite(Number(options.probeTimeoutMs))
-        ? Math.max(200, Math.trunc(Number(options.probeTimeoutMs)))
-        : 2000;
-    const intervalMs = Number.isFinite(Number(options.intervalMs)) ? Math.max(100, Math.trunc(Number(options.intervalMs))) : 500;
-
-    const deadline = Date.now() + timeoutMs;
-    let lastErr = 'unreachable';
-    while (Date.now() < deadline) {
-        const port = Number(portsMap.get(id) || 0);
-        if (Number.isFinite(port) && port > 0) {
-            try {
-                // eslint-disable-next-line no-await-in-loop
-                const cfg = await httpGetJson(`http://127.0.0.1:${port}/full-config`, { timeoutMs: probeTimeoutMs });
-                if (cfg && typeof cfg === 'object') return { ok: true, message: '', port };
-                lastErr = 'invalid full-config';
-            } catch (e) {
-                lastErr = e && e.message ? String(e.message) : 'unreachable';
-            }
-        }
-        // eslint-disable-next-line no-await-in-loop
-        await sleep(intervalMs);
-    }
-    const finalPort = Number(portsMap.get(id) || 0);
-    return { ok: false, message: lastErr || 'timeout', port: Number.isFinite(finalPort) ? finalPort : 0 };
-}
-
-function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.trunc(Number(ms) || 0))));
 }
 
 function httpGetJson(urlStr, options = {}) {
@@ -605,117 +378,6 @@ function unwrapWebsiteResp(raw) {
     return { ok: true, data: obj, message: '' };
 }
 
-async function syncOnlineRuntimesNow(fastify, rootDir, options = {}) {
-    return withOnlineRuntimeOpsLock(async () => {
-        const forceRemoteCheck = !!(options && options.forceRemoteCheck);
-        const res = await applyOnlineConfigs({ rootDir, forceRemoteCheck });
-
-        const desired = Array.isArray(res && res.resolved) ? res.resolved.filter((r) => r && r.id && r.destPath) : [];
-        const desiredIds = new Set(desired.map((r) => String(r.id)));
-
-        const portsMap =
-            fastify && fastify.onlineRuntimePorts && typeof fastify.onlineRuntimePorts.get === 'function'
-                ? fastify.onlineRuntimePorts
-                : null;
-        if (!portsMap) return { ok: false, message: 'onlineRuntimePorts not available', applied: res };
-
-        if (!desiredIds.size) {
-            stopAllOnlineRuntimes();
-            portsMap.clear();
-            return { ok: true, applied: res, runtimes: [] };
-        }
-
-        // Stop removed runtimes.
-        for (const [id] of portsMap.entries()) {
-            if (!desiredIds.has(id)) {
-                stopOnlineRuntime(id);
-                portsMap.delete(id);
-            }
-        }
-
-        // Start/restart desired runtimes.
-        const runtimes = [];
-        for (const r of desired) {
-            const id = String(r.id);
-            const curPort = Number(portsMap.get(id) || 0);
-            const hasCurrent = Number.isFinite(curPort) && curPort > 0;
-            const needPort = !hasCurrent;
-            const port = needPort ? await findAvailablePortInRange(30000, 39999) : curPort;
-            const stagedPath = typeof r.stagedPath === 'string' && r.stagedPath.trim() ? path.resolve(r.stagedPath.trim()) : '';
-            const shouldRestart = needPort || !!r.needsReload || !!stagedPath;
-            const entryToStart = stagedPath || path.resolve(r.destPath);
-
-            const started = await startOnlineRuntime({ id, port, entry: entryToStart, entryFn: r.entryFn || '' });
-            const switched = !!(started && started.started && Number(started.port) > 0);
-            const keptPrevious = !switched && hasCurrent;
-
-            let promoteOk = false;
-            let promoteErr = '';
-            if (stagedPath) {
-                if (switched) {
-                    const promoted = promoteOnlineStagedScript({
-                        stagedPath,
-                        destPath: r.destPath,
-                        metaPath: r.metaPath,
-                        url: r.url,
-                        remoteMd5: r.remoteMd5 || '',
-                        checkedAt: r.checkedAt,
-                    });
-                    if (promoted && promoted.ok) {
-                        promoteOk = true;
-                        setOnlineRuntimeEntry(id, r.destPath);
-                    } else {
-                        promoteErr = promoted && promoted.message ? String(promoted.message) : 'promote failed';
-                    }
-                } else {
-                    discardOnlineStagedScript({ stagedPath });
-                }
-            }
-
-            if (switched) portsMap.set(id, Number(started.port));
-            else if (needPort) portsMap.delete(id);
-            // If restart failed but previous runtime exists, keep the old port mapping as-is.
-
-            let message = started && started.reason ? String(started.reason) : '';
-            if (stagedPath && !switched && keptPrevious) {
-                message = message
-                    ? `new script start failed, keeping previous runtime (${message})`
-                    : 'new script start failed, keeping previous runtime';
-            }
-            if (promoteErr) {
-                message = message ? `${message}; ${promoteErr}` : promoteErr;
-            }
-
-            const effectivePort = switched ? Number(started.port) : hasCurrent ? curPort : 0;
-            const changed = !!r.changed;
-            const updated = stagedPath ? switched && promoteOk : switched && changed;
-            const checkedAt = Number.isFinite(Number(r.checkedAt)) ? Math.trunc(Number(r.checkedAt)) : Date.now();
-
-            runtimes.push({
-                id,
-                port: effectivePort > 0 ? effectivePort : 0,
-                entry: path.resolve(r.destPath),
-                testEntry: entryToStart,
-                ok: switched || keptPrevious,
-                restarted: shouldRestart,
-                updated,
-                changed,
-                remoteChecked: !!r.remoteChecked,
-                usedStaged: !!stagedPath,
-                promoted: stagedPath ? promoteOk : false,
-                keptPrevious,
-                message,
-                lastStage: started && started.lastStage ? String(started.lastStage) : '',
-                checkedAt,
-                localMd5: typeof r.localMd5 === 'string' ? r.localMd5 : '',
-                remoteMd5: typeof r.remoteMd5 === 'string' ? r.remoteMd5 : '',
-            });
-        }
-
-        return { ok: true, applied: res, runtimes };
-    });
-}
-
 async function handleAdminFullConfig(fastify, reply) {
     const empty = {
         video: { sites: [] },
@@ -797,35 +459,18 @@ export const apiPlugins = [
             fastify.get('/settings', async function (_request, reply) {
                 const rootDir = resolveRuntimeRootDir();
                 const cfgPath = path.resolve(rootDir, 'config.json');
-                const cfg = readJsonFileSafe(cfgPath) || {};
-                const onlineConfigsRaw = readOnlineConfigsFromConfig(cfg);
-                const runtimeHealth = await readRuntimeHealthById(fastify, onlineConfigsRaw);
-                const stickyFailedResults = new Set(['download_failed', 'runtime_failed', 'kept_previous', 'promote_failed']);
-                const onlineConfigs = onlineConfigsRaw.map((it) => {
-                    if (!it || typeof it !== 'object') return it;
-                    const id = typeof it.id === 'string' ? it.id.trim() : '';
-                    if (!id || !runtimeHealth.get(id)) return it;
-                    const status = typeof it.status === 'string' ? it.status.trim() : '';
-                    const updateResult = typeof it.updateResult === 'string' ? it.updateResult.trim() : '';
-                    if (status === 'error' && stickyFailedResults.has(updateResult)) return it;
-                    // If runtime is currently reachable, avoid stale persisted "runtime failed".
-                    const next = { ...it, status: 'pass' };
-                    try {
-                        delete next.message;
-                    } catch (_) {}
-                    return next;
-                });
+                const cfg = readJsonObjectSafe(cfgPath) || {};
                 return reply.send({
                     success: true,
                     settings: readSettingsFromConfig(cfg),
-                    onlineConfigs,
+                    onlineConfigs: readOnlineConfigsFromConfig(cfg),
                 });
             });
 
             fastify.put('/settings', async function (request, reply) {
                 const rootDir = resolveRuntimeRootDir();
                 const cfgPath = path.resolve(rootDir, 'config.json');
-                const prev = readJsonFileSafe(cfgPath) || {};
+                const prev = readJsonObjectSafe(cfgPath) || {};
 
                 const body = request && request.body && typeof request.body === 'object' ? request.body : {};
                 const next = { ...prev };
@@ -868,6 +513,12 @@ export const apiPlugins = [
                         return reply.code(400).send({ success: false, message: 'onlineConfigs must be an array' });
                     }
                     const prevList = Array.isArray(prev.onlineConfigs) ? prev.onlineConfigs : [];
+                    const prevById = new Map(
+                        prevList
+                            .filter((it) => it && typeof it === 'object')
+                            .map((it) => [typeof it.id === 'string' ? it.id.trim() : '', it])
+                            .filter(([id]) => id)
+                    );
                     const prevByUrl = new Map(
                         prevList
                             .filter((it) => it && typeof it === 'object')
@@ -876,12 +527,17 @@ export const apiPlugins = [
                     );
                     const out = [];
                     const usedIds = new Set();
+                    const now = Date.now();
+                    const loadingIds = [];
                     for (const raw of onlineInput.list || []) {
                         const norm = normalizeOnlineConfigItem(raw);
                         if (!norm || !norm.url) continue;
-                        const prevMatch = prevByUrl.get(norm.url);
-                        const prevId = prevMatch && typeof prevMatch.id === 'string' && prevMatch.id.trim() ? prevMatch.id.trim() : '';
                         const incomingId = typeof norm.id === 'string' && norm.id.trim() ? norm.id.trim() : '';
+                        const prevByIncomingId = incomingId ? prevById.get(incomingId) : null;
+                        const prevByCurrentUrl = prevByUrl.get(norm.url);
+                        const prevRef = prevByIncomingId || prevByCurrentUrl || null;
+                        const prevId = prevRef && typeof prevRef.id === 'string' && prevRef.id.trim() ? prevRef.id.trim() : '';
+
                         let idEff = incomingId || prevId || '';
                         if (idEff) {
                             if (usedIds.has(idEff)) idEff = buildAutoOnlineRuntimeId(norm.name || idEff, norm.url, usedIds);
@@ -889,25 +545,55 @@ export const apiPlugins = [
                         } else {
                             idEff = buildAutoOnlineRuntimeId(norm.name, norm.url, usedIds);
                         }
+
+                        const prevByEffId = prevById.get(idEff) || prevByIncomingId || prevByCurrentUrl || null;
+                        const prevUrlByEffId =
+                            prevByEffId && typeof prevByEffId.url === 'string' ? prevByEffId.url.trim() : '';
+                        const needsLoad = !prevByEffId || prevUrlByEffId !== norm.url;
+                        if (needsLoad) loadingIds.push(idEff);
+
+                        const prevStatus =
+                            prevByEffId && typeof prevByEffId.status === 'string' && prevByEffId.status.trim()
+                                ? prevByEffId.status.trim()
+                                : 'unchecked';
+                        const prevCheckedAt =
+                            prevByEffId && Number.isFinite(Number(prevByEffId.checkedAt)) && Number(prevByEffId.checkedAt) > 0
+                                ? Math.trunc(Number(prevByEffId.checkedAt))
+                                : 0;
+                        const prevUpdateAt =
+                            prevByEffId && Number.isFinite(Number(prevByEffId.updateAt)) && Number(prevByEffId.updateAt) > 0
+                                ? Math.trunc(Number(prevByEffId.updateAt))
+                                : 0;
+                        const prevUpdateResult =
+                            prevByEffId && typeof prevByEffId.updateResult === 'string' ? prevByEffId.updateResult : '';
+                        const prevChanged = !!(prevByEffId && prevByEffId.changed);
+                        const prevUpdated = !!(prevByEffId && prevByEffId.updated);
+                        const prevLocalMd5 =
+                            prevByEffId && typeof prevByEffId.localMd5 === 'string' ? prevByEffId.localMd5 : '';
+                        const prevRemoteMd5 =
+                            prevByEffId && typeof prevByEffId.remoteMd5 === 'string' ? prevByEffId.remoteMd5 : '';
+                        const prevMessage = prevByEffId && typeof prevByEffId.message === 'string' ? prevByEffId.message : '';
+
                         out.push({
                             url: norm.url,
                             name: norm.name || '',
                             id: idEff,
-                            status: 'unchecked',
-                            checkedAt: 0,
-                            updateAt: 0,
-                            updateResult: 'pending',
-                            changed: false,
-                            updated: false,
-                            localMd5: '',
-                            remoteMd5: '',
+                            status: needsLoad ? 'checking' : prevStatus,
+                            checkedAt: needsLoad ? now : prevCheckedAt,
+                            updateAt: needsLoad ? 0 : prevUpdateAt,
+                            updateResult: needsLoad ? '' : prevUpdateResult,
+                            changed: prevChanged,
+                            updated: needsLoad ? false : prevUpdated,
+                            localMd5: prevLocalMd5,
+                            remoteMd5: prevRemoteMd5,
+                            message: needsLoad ? '' : prevMessage,
                         });
                     }
                     next.onlineConfigs = out;
                     requestOnlineConfigIds = Array.from(
                         new Set(
-                            out
-                                .map((it) => (it && typeof it.id === 'string' ? it.id.trim() : ''))
+                            loadingIds
+                                .map((v) => String(v || '').trim())
                                 .filter(Boolean)
                         )
                     );
@@ -917,7 +603,7 @@ export const apiPlugins = [
                 if (onlineInput.provided && requestOnlineConfigIds.length) {
                     const conflictIds = requestOnlineConfigIds.filter((id) => onlineConfigUpdateInFlightIds.has(id));
                     if (conflictIds.length) {
-                        const cfgNow = readJsonFileSafe(cfgPath) || prev;
+                        const cfgNow = readJsonObjectSafe(cfgPath) || prev;
                         return reply.code(202).send({
                             success: true,
                             skipped: true,
@@ -933,13 +619,9 @@ export const apiPlugins = [
                     });
                 }
 
+                let backgroundScheduled = false;
                 try {
-                    try {
-                        writeJsonFileAtomic(cfgPath, next);
-                    } catch (e) {
-                        const msg = e && e.message ? String(e.message) : 'config write failed';
-                        return reply.code(500).send({ success: false, message: msg });
-                    }
+                    writeJsonObjectAtomic(cfgPath, next);
                     try {
                         // Allow toggling pan mock without restarting online runtimes.
                         broadcastOnlineRuntimeMockConfig({ rootDir });
@@ -953,179 +635,128 @@ export const apiPlugins = [
                         broadcastOnlineRuntimePacketCaptureConfig({ rootDir });
                     } catch (_) {}
 
-                    let onlineResults = null;
-                    if (onlineInput.provided) {
-                        try {
-                            const sync = await syncOnlineRuntimesNow(fastify, rootDir, { forceRemoteCheck: true });
-                            const applied = sync && sync.applied ? sync.applied : null;
-                            const resolved = applied && Array.isArray(applied.resolved) ? applied.resolved : [];
-                            const runtimes = sync && Array.isArray(sync.runtimes) ? sync.runtimes : [];
-                            const runtimeById = new Map(
-                                runtimes
-                                    .filter((r) => r && typeof r === 'object' && typeof r.id === 'string' && r.id.trim())
-                                    .map((r) => [r.id.trim(), r])
-                            );
-
-                            onlineResults = [];
-                            for (const it of resolved) {
-                                const url = typeof it.url === 'string' ? it.url : '';
-                                const name = typeof it.name === 'string' ? it.name : '';
-                                const id = typeof it.id === 'string' ? it.id : '';
-                                if (!url) continue;
-                                const checkedAt = Number.isFinite(Number(it.checkedAt)) ? Math.trunc(Number(it.checkedAt)) : Date.now();
-                                const localMd5 = typeof it.localMd5 === 'string' ? it.localMd5 : '';
-                                const remoteMd5 = typeof it.remoteMd5 === 'string' ? it.remoteMd5 : '';
-                                const changed = !!it.changed;
-                                const usedStaged = !!(it.stagedPath && String(it.stagedPath).trim());
-
-                                if (!it.ok) {
-                                    onlineResults.push({
-                                        url,
-                                        name,
-                                        ...(id ? { id } : {}),
-                                        status: 'error',
-                                        phase: 'download',
-                                        message: typeof it.message === 'string' && it.message.trim() ? it.message.trim() : 'download failed',
-                                        checkedAt,
-                                        updateAt: checkedAt,
-                                        updateResult: 'download_failed',
-                                        changed,
-                                        updated: false,
-                                        localMd5,
-                                        remoteMd5,
-                                    });
-                                    continue;
-                                }
-
-                                const rt = id ? runtimeById.get(id) : null;
-                                let rtOk = !!(rt && rt.ok);
-                                let rtPort = rt && Number.isFinite(Number(rt.port)) ? Math.max(1, Math.trunc(Number(rt.port))) : 0;
-                                const entryBase = it.destPath ? path.basename(String(it.destPath)) : '';
-                                let rtMessage =
-                                    rt && typeof rt.message === 'string' && rt.message.trim()
-                                        ? rt.message.trim()
-                                        : rt && typeof rt.lastStage === 'string' && rt.lastStage.trim()
-                                          ? `runtime not ready (stage=${rt.lastStage.trim()})`
-                                          : 'runtime_not_ready';
-
-                                // Restart handoff may report transient SIGTERM on the old child.
-                                // Wait for the runtime to settle before declaring failure.
-                                const mayBeTransientRestart =
-                                    !rtOk &&
-                                    !!id &&
-                                    !!rt &&
-                                    !rt.keptPrevious &&
-                                    (rt.restarted ||
-                                        rt.updated ||
-                                        rtMessage === 'signal:SIGTERM' ||
-                                        rtMessage === 'exit:null' ||
-                                        rtMessage === 'runtime_not_ready');
-                                if (mayBeTransientRestart) {
-                                    // eslint-disable-next-line no-await-in-loop
-                                    const settled = await waitRuntimeReadyById(fastify, id, {
-                                        timeoutMs: 30000,
-                                        probeTimeoutMs: 2500,
-                                        intervalMs: 500,
-                                    });
-                                    if (settled.ok) {
-                                        rtOk = true;
-                                        rtPort = settled.port;
-                                        rtMessage = '';
-                                    } else if (settled.message) {
-                                        rtMessage = settled.message;
-                                    }
-                                }
-
-                                const keptPrevious = !!(rt && rt.keptPrevious);
-                                const updated = !!(rt && rt.updated);
-                                let status = rtOk ? 'pass' : 'error';
-                                let phase = '';
-                                let message = '';
-                                let updateResult = 'unchanged';
-
-                                if (usedStaged) {
-                                    if (updated) {
-                                        status = 'pass';
-                                        updateResult = 'updated';
-                                    } else if (keptPrevious) {
-                                        status = 'error';
-                                        phase = 'runtime';
-                                        message = rtMessage || 'new script start failed, keeping previous runtime';
-                                        updateResult = 'kept_previous';
-                                    } else if (!rtOk) {
-                                        status = 'error';
-                                        phase = 'runtime';
-                                        message = rtMessage;
-                                        updateResult = 'runtime_failed';
-                                    } else {
-                                        status = 'pass';
-                                        updateResult = 'updated';
-                                    }
-                                } else if (changed) {
-                                    if (rtOk) {
-                                        status = 'pass';
-                                        updateResult = 'updated';
-                                    } else {
-                                        status = 'error';
-                                        phase = 'runtime';
-                                        message = rtMessage;
-                                        updateResult = 'runtime_failed';
-                                    }
-                                } else {
-                                    updateResult = rtOk ? 'unchanged' : 'runtime_failed';
-                                    if (!rtOk) {
-                                        phase = 'runtime';
-                                        message = rtMessage;
-                                    }
-                                }
-
-                                onlineResults.push({
-                                    url,
-                                    name,
-                                    ...(id ? { id } : {}),
-                                    status,
-                                    ...(phase ? { phase } : {}),
-                                    ...(message ? { message } : {}),
-                                    checkedAt,
-                                    updateAt: checkedAt,
-                                    updateResult,
-                                    changed,
-                                    updated: updateResult === 'updated',
-                                    localMd5,
-                                    remoteMd5,
-                                    runtime: { id, port: rtPort, entry: entryBase },
-                                });
-                            }
-                            if (Array.isArray(onlineResults) && onlineResults.length) {
-                                const persisted = persistOnlineConfigUpdateResults(rootDir, onlineResults);
-                                if (Array.isArray(persisted) && persisted.length) onlineResults = persisted;
-                            }
-                        } catch (e) {
-                            const msg = e && e.message ? String(e.message) : 'online sync failed';
-                            onlineResults = [
-                                {
-                                    url: '',
-                                    name: '',
-                                    status: 'error',
-                                    message: msg,
-                                    checkedAt: Date.now(),
-                                    updateAt: Date.now(),
-                                    updateResult: 'runtime_failed',
-                                    changed: false,
-                                    updated: false,
-                                },
-                            ];
-                        }
+                    if (onlineInput.provided && requestOnlineConfigIds.length) {
+                        backgroundScheduled = true;
+                        void runOnlineSyncInBackground({
+                            rootDir,
+                            portsMap: fastify.onlineRuntimePorts,
+                            targetIds: requestOnlineConfigIds,
+                            operation: 'loading',
+                            onFinishId: (id) => {
+                                onlineConfigUpdateInFlightIds.delete(id);
+                            },
+                        });
                     }
 
-                    const cfgAfter = readJsonFileSafe(cfgPath) || next;
+                    const cfgAfter = readJsonObjectSafe(cfgPath) || next;
                     return reply.send({
                         success: true,
+                        ...(requestOnlineConfigIds.length ? { pending: true, processingIds: requestOnlineConfigIds } : {}),
                         settings: readSettingsFromConfig(cfgAfter),
-                        onlineConfigs: onlineResults || readOnlineConfigsFromConfig(cfgAfter),
+                        onlineConfigs: readOnlineConfigsFromConfig(cfgAfter),
                     });
+                } catch (e) {
+                    const msg = e && e.message ? String(e.message) : 'settings save failed';
+                    return reply.code(500).send({ success: false, message: msg });
                 } finally {
-                    claimedOnlineUpdateIds.forEach((id) => onlineConfigUpdateInFlightIds.delete(id));
+                    if (!backgroundScheduled) {
+                        claimedOnlineUpdateIds.forEach((id) => onlineConfigUpdateInFlightIds.delete(id));
+                    }
+                }
+            });
+
+            // Trigger remote file update check for existing online configs (by id).
+            // This API only manages update state:
+            // - updateResult: updating -> pass/error
+            // - does not overwrite config status, so old status detection remains intact.
+            fastify.post('/online-configs/update', async function (request, reply) {
+                const rootDir = resolveRuntimeRootDir();
+                const cfgPath = path.resolve(rootDir, 'config.json');
+                const cfg = readJsonObjectSafe(cfgPath) || {};
+                const onlineConfigs = readOnlineConfigsFromConfig(cfg);
+                const allIds = Array.from(
+                    new Set(
+                        onlineConfigs
+                            .map((it) => (it && typeof it.id === 'string' ? it.id.trim() : ''))
+                            .filter(Boolean)
+                    )
+                );
+                if (!allIds.length) {
+                    return reply.code(400).send({ success: false, message: 'no online config id available' });
+                }
+
+                const body = request && request.body && typeof request.body === 'object' ? request.body : {};
+                const useAll = !!body.all;
+                const requested = [];
+                if (!useAll) {
+                    if (typeof body.id === 'string' && body.id.trim()) requested.push(body.id.trim());
+                    if (typeof body.onlineConfigId === 'string' && body.onlineConfigId.trim()) requested.push(body.onlineConfigId.trim());
+                    if (Array.isArray(body.ids)) {
+                        body.ids.forEach((v) => {
+                            const id = String(v || '').trim();
+                            if (id) requested.push(id);
+                        });
+                    }
+                }
+                const requestedSet = new Set((useAll || !requested.length ? allIds : requested).map((id) => String(id || '').trim()).filter(Boolean));
+                const targetIds = allIds.filter((id) => requestedSet.has(id));
+                if (!targetIds.length) {
+                    return reply.code(400).send({ success: false, message: 'no matched online config id' });
+                }
+
+                const conflictIds = targetIds.filter((id) => onlineConfigUpdateInFlightIds.has(id));
+                if (conflictIds.length) {
+                    const cfgNow = readJsonObjectSafe(cfgPath) || cfg;
+                    return reply.code(202).send({
+                        success: true,
+                        skipped: true,
+                        reason: 'online_update_in_progress',
+                        conflictIds,
+                        settings: readSettingsFromConfig(cfgNow),
+                        onlineConfigs: readOnlineConfigsFromConfig(cfgNow),
+                    });
+                }
+
+                const claimedIds = [];
+                let backgroundScheduled = false;
+                try {
+                    targetIds.forEach((id) => {
+                        onlineConfigUpdateInFlightIds.add(id);
+                        claimedIds.push(id);
+                    });
+
+                    const now = Date.now();
+                    persistOnlineConfigStatePatchesByPath(
+                        cfgPath,
+                        targetIds.map((id) => ({ id, updateResult: 'updating', updateAt: now }))
+                    );
+
+                    backgroundScheduled = true;
+                    void runOnlineSyncInBackground({
+                        rootDir,
+                        portsMap: fastify.onlineRuntimePorts,
+                        targetIds,
+                        operation: 'updating',
+                        onFinishId: (id) => {
+                            onlineConfigUpdateInFlightIds.delete(id);
+                        },
+                    });
+
+                    const cfgAfter = readJsonObjectSafe(cfgPath) || cfg;
+                    return reply.send({
+                        success: true,
+                        pending: true,
+                        processingIds: targetIds,
+                        settings: readSettingsFromConfig(cfgAfter),
+                        onlineConfigs: readOnlineConfigsFromConfig(cfgAfter),
+                    });
+                } catch (e) {
+                    const msg = e && e.message ? String(e.message) : 'online update start failed';
+                    return reply.code(500).send({ success: false, message: msg });
+                } finally {
+                    if (!backgroundScheduled) {
+                        claimedIds.forEach((id) => onlineConfigUpdateInFlightIds.delete(id));
+                    }
                 }
             });
 

@@ -5,9 +5,7 @@ import axios from 'axios';
 import {findAvailablePortInRange} from './util/tool.js';
 import {
     startOnlineRuntime,
-    stopOnlineRuntime,
     stopAllOnlineRuntimes,
-    setOnlineRuntimeEntry,
     broadcastOnlineRuntimeMockConfig,
     broadcastOnlineRuntimeProxyConfig,
     broadcastOnlineRuntimePacketCaptureConfig,
@@ -15,13 +13,25 @@ import {
 } from './util/onlineRuntime.js';
 import path from 'node:path';
 import fs from 'node:fs';
-import {applyOnlineConfigs, promoteOnlineStagedScript, discardOnlineStagedScript} from './util/onlineConfigStore.js';
+import {
+    applyOnlineConfigs,
+    readJsonObjectSafe,
+    resolveRuntimeRootDir,
+    getOnlineConfigListAndKey,
+    buildOnlineConfigWatchSignature,
+    hasPendingOnlineConfigStatus,
+    markOnlineConfigsCheckingInConfig,
+    persistOnlineConfigStatePatchesByPath,
+    buildLoadingPatchesFromSyncResult,
+} from './util/onlineConfigStore.js';
+import { syncOnlineRuntimesByDesired } from './util/onlineRuntimeSync.js';
 import {fileURLToPath} from 'node:url';
 
 let server = null;
 let configWatchTimer = null;
 let configWatchLastMtime = 0;
-let onlineLastEntry = '';
+let configWatchLastSignature = '';
+let configWatchInProgress = false;
 const onlineRuntimePorts = new Map(); // id -> port
 
 let shutdownHooksInstalled = false;
@@ -246,15 +256,7 @@ export async function start(config) {
     // Persist db.json in the runtime root:
     // - pkg: next to the executable
     // - dev: NODE_PATH or current working directory
-    const runtimeRoot = (() => {
-        try {
-            if (process && process.pkg && typeof process.execPath === 'string' && process.execPath) {
-                return path.dirname(process.execPath);
-            }
-        } catch (_) {}
-        const p = typeof process.env.NODE_PATH === 'string' && process.env.NODE_PATH.trim() ? process.env.NODE_PATH.trim() : '';
-        return p ? path.resolve(p) : process.cwd();
-    })();
+    const runtimeRoot = resolveRuntimeRootDir();
 
     const ensureConfigJsonDefaults = () => {
         const cfgPath = path.resolve(runtimeRoot, 'config.json');
@@ -306,10 +308,38 @@ export async function start(config) {
     server.onlineRuntimePorts = onlineRuntimePorts;
     server.register(router);
 
+    const cfgPath = path.resolve(runtimeRoot, 'config.json');
+    const emitRuntimeConfigBroadcasts = () => {
+        try {
+            broadcastOnlineRuntimeMockConfig({ rootDir: runtimeRoot });
+        } catch (_) {}
+        try {
+            broadcastOnlineRuntimeProxyConfig({ rootDir: runtimeRoot });
+        } catch (_) {}
+        try {
+            broadcastOnlineRuntimePacketCaptureConfig({ rootDir: runtimeRoot });
+        } catch (_) {}
+    };
+
+    const refreshConfigWatchSnapshot = () => {
+        try {
+            const st = fs.existsSync(cfgPath) ? fs.statSync(cfgPath) : null;
+            configWatchLastMtime = st ? Number(st.mtimeMs || 0) : 0;
+        } catch (_) {
+            configWatchLastMtime = 0;
+        }
+        try {
+            const cfgNow = readJsonObjectSafe(cfgPath) || {};
+            configWatchLastSignature = buildOnlineConfigWatchSignature(cfgNow);
+        } catch (_) {
+            configWatchLastSignature = '';
+        }
+    };
+
     const syncAndMaybeRestartOnline = async (reason) => {
         return withOnlineRuntimeOpsLock(async () => {
             try {
-                const res = await applyOnlineConfigs({rootDir: runtimeRoot});
+                const res = await applyOnlineConfigs({ rootDir: runtimeRoot });
                 if (res && res.skipped) {
                     // Config does not manage online scripts; keep legacy behavior (run whatever exists in custom_spider/).
                     const prevPort = Number(onlineRuntimePorts.get('default') || 0);
@@ -317,113 +347,62 @@ export async function start(config) {
                     const started = await startOnlineRuntime({ id: 'default', port: p });
                     if (started && started.port) onlineRuntimePorts.set('default', started.port);
                     else if (!(Number.isFinite(prevPort) && prevPort > 0)) onlineRuntimePorts.delete('default');
-                    onlineLastEntry = started && started.entry ? started.entry : onlineLastEntry;
-                    return;
+                    return { ok: true, applied: res, runtimes: [], skipped: true };
                 }
-                const nextEntry = res && typeof res.entry === 'string' ? res.entry : '';
 
+                const nextEntry = res && typeof res.entry === 'string' ? res.entry : '';
                 // Stop runtime when no configs remain.
                 if (!nextEntry) {
                     stopAllOnlineRuntimes();
                     onlineRuntimePorts.clear();
-                    onlineLastEntry = '';
-                    return;
+                    return { ok: true, applied: res, runtimes: [] };
                 }
-
-                const desired = Array.isArray(res.resolved) ? res.resolved.filter((r) => r && r.id && r.destPath) : [];
-                const desiredIds = new Set(desired.map((r) => String(r.id)));
-
-                // Stop removed runtimes.
-                for (const [id] of onlineRuntimePorts.entries()) {
-                    if (!desiredIds.has(id)) {
-                        stopOnlineRuntime(id);
-                        onlineRuntimePorts.delete(id);
-                    }
-                }
-
-                // Start/restart desired runtimes.
-                for (const r of desired) {
-                    const id = String(r.id);
-                    const curPort = Number(onlineRuntimePorts.get(id) || 0);
-                    const hasCurrent = Number.isFinite(curPort) && curPort > 0;
-                    const needPort = !hasCurrent;
-                    const port = needPort ? await findAvailablePortInRange(30000, 39999) : curPort;
-                    const stagedPath = typeof r.stagedPath === 'string' && r.stagedPath.trim() ? path.resolve(r.stagedPath.trim()) : '';
-                    const entryToStart = stagedPath || path.resolve(r.destPath);
-                    const started = await startOnlineRuntime({ id, port, entry: entryToStart, entryFn: r.entryFn || '' });
-                    const switched = !!(started && started.started && Number(started.port) > 0);
-                    if (stagedPath) {
-                        if (switched) {
-                            const promoted = promoteOnlineStagedScript({
-                                stagedPath,
-                                destPath: r.destPath,
-                                metaPath: r.metaPath,
-                                url: r.url,
-                                remoteMd5: r.remoteMd5 || '',
-                                checkedAt: r.checkedAt,
-                            });
-                            if (promoted && promoted.ok) {
-                                setOnlineRuntimeEntry(id, r.destPath);
-                            }
-                        } else {
-                            discardOnlineStagedScript({ stagedPath });
-                        }
-                    }
-
-                    if (switched) onlineRuntimePorts.set(id, Number(started.port));
-                    else if (needPort) onlineRuntimePorts.delete(id);
-                    // If restart failed but previous runtime exists, keep old mapping unchanged.
-                }
-
-                onlineLastEntry = nextEntry;
+                const desired = Array.isArray(res.resolved) ? res.resolved : [];
+                const runtimeSync = await syncOnlineRuntimesByDesired({ desired, portsMap: onlineRuntimePorts });
+                if (!runtimeSync.ok) return { ok: false, message: runtimeSync.message || 'online runtime sync failed', applied: res, runtimes: [] };
+                return { ok: true, applied: res, runtimes: runtimeSync.runtimes };
             } catch (e) {
                 const msg = e && e.message ? String(e.message) : String(e);
                 console.log(`[online] sync failed${reason ? ` (${reason})` : ''}: ${msg}`);
+                return { ok: false, message: msg, applied: null, runtimes: [] };
             }
         });
     };
 
-    // Apply once on startup.
-    await syncAndMaybeRestartOnline('startup');
-    try {
-        broadcastOnlineRuntimeMockConfig({ rootDir: runtimeRoot });
-    } catch (_) {}
-    try {
-        broadcastOnlineRuntimeProxyConfig({ rootDir: runtimeRoot });
-    } catch (_) {}
-    try {
-        broadcastOnlineRuntimePacketCaptureConfig({ rootDir: runtimeRoot });
-    } catch (_) {}
-
-    // Watch config.json for onlineConfigs changes (so manual edits or /api/server/settings take effect).
-    const cfgPath = path.resolve(runtimeRoot, 'config.json');
-    const pollMs = 1500;
-    try {
-        const st = fs.existsSync(cfgPath) ? fs.statSync(cfgPath) : null;
-        configWatchLastMtime = st ? Number(st.mtimeMs || 0) : 0;
-    } catch (_) {
-        configWatchLastMtime = 0;
-    }
-    configWatchTimer = setInterval(async () => {
+    const runLoadingSyncAndPersistState = async (reason) => {
         try {
-            if (!fs.existsSync(cfgPath)) return;
-            const st = fs.statSync(cfgPath);
-            const m = Number(st.mtimeMs || 0);
-            if (!m || m === configWatchLastMtime) return;
-            configWatchLastMtime = m;
-            ensureConfigJsonDefaults();
-            await syncAndMaybeRestartOnline('config changed');
-            try {
-                broadcastOnlineRuntimeMockConfig({ rootDir: runtimeRoot });
-            } catch (_) {}
-            try {
-                broadcastOnlineRuntimeProxyConfig({ rootDir: runtimeRoot });
-            } catch (_) {}
-            try {
-                broadcastOnlineRuntimePacketCaptureConfig({ rootDir: runtimeRoot });
-            } catch (_) {}
+            markOnlineConfigsCheckingInConfig(cfgPath);
         } catch (_) {}
-    }, pollMs);
+
+        const sync = await syncAndMaybeRestartOnline(reason);
+        if (!sync || sync.skipped) {
+            refreshConfigWatchSnapshot();
+            return sync;
+        }
+
+        if (!sync.ok) {
+            const cfgNow = readJsonObjectSafe(cfgPath) || {};
+            const { list } = getOnlineConfigListAndKey(cfgNow);
+            const now = Date.now();
+            const patches = (Array.isArray(list) ? list : [])
+                .map((raw) => (raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : null))
+                .filter(Boolean)
+                .map((it) => {
+                    const id = typeof it.id === 'string' ? it.id.trim() : '';
+                    if (!id) return null;
+                    return { id, status: 'error', checkedAt: now, message: sync.message || 'online sync failed' };
+                })
+                .filter(Boolean);
+            if (patches.length) persistOnlineConfigStatePatchesByPath(cfgPath, patches);
+            refreshConfigWatchSnapshot();
+            return sync;
+        }
+
+        const patches = buildLoadingPatchesFromSyncResult(sync);
+        if (patches.length) persistOnlineConfigStatePatchesByPath(cfgPath, patches);
+        refreshConfigWatchSnapshot();
+        return sync;
+    };
 
     const startPortRaw =
         typeof process.env.DEV_HTTP_PORT === 'string' && process.env.DEV_HTTP_PORT.trim()
@@ -438,6 +417,48 @@ export async function start(config) {
     // 注意：优先监听 ipv4，避免部分环境下 ipv6-mapped 地址带来的兼容问题。
     // 固定端口：不再自动选择下一个可用端口，避免端口“跳来跳去”导致客户端配置失效。
     await server.listen({port: startPort, host: '0.0.0.0'});
+
+    refreshConfigWatchSnapshot();
+
+    // Startup online load is async: keep main server available first, then load scripts in background.
+    void (async () => {
+        await runLoadingSyncAndPersistState('startup');
+        emitRuntimeConfigBroadcasts();
+    })();
+
+    // Watch config.json for onlineConfigs changes (so manual edits or /api/server/settings take effect).
+    const pollMs = 1500;
+    configWatchTimer = setInterval(async () => {
+        if (configWatchInProgress) return;
+        configWatchInProgress = true;
+        try {
+            if (!fs.existsSync(cfgPath)) {
+                configWatchLastMtime = 0;
+                configWatchLastSignature = '';
+                return;
+            }
+            const st = fs.statSync(cfgPath);
+            const m = Number(st.mtimeMs || 0);
+            if (!m || m === configWatchLastMtime) return;
+            configWatchLastMtime = m;
+
+            ensureConfigJsonDefaults();
+            const cfgNow = readJsonObjectSafe(cfgPath) || {};
+            const nextSignature = buildOnlineConfigWatchSignature(cfgNow);
+            const onlineSignatureChanged = nextSignature !== configWatchLastSignature;
+            configWatchLastSignature = nextSignature;
+            const pendingOnline = hasPendingOnlineConfigStatus(cfgNow);
+
+            if (onlineSignatureChanged && !pendingOnline) {
+                await runLoadingSyncAndPersistState('config changed');
+            }
+
+            emitRuntimeConfigBroadcasts();
+        } catch (_) {
+        } finally {
+            configWatchInProgress = false;
+        }
+    }, pollMs);
 }
 
 /**
@@ -463,7 +484,8 @@ export async function stop() {
     } catch (_) {}
     configWatchTimer = null;
     configWatchLastMtime = 0;
-    onlineLastEntry = '';
+    configWatchLastSignature = '';
+    configWatchInProgress = false;
     onlineRuntimePorts.clear();
     server = null;
 }
