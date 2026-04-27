@@ -207,6 +207,44 @@ function pickExtFromFileName(fileNameRaw) {
     return '';
 }
 
+function md5Hex(content) {
+    try {
+        return crypto.createHash('md5').update(Buffer.from(String(content == null ? '' : content), 'utf8')).digest('hex');
+    } catch (_) {
+        return '';
+    }
+}
+
+function normalizeMd5Hex(raw) {
+    const v = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+    return /^[0-9a-f]{32}$/.test(v) ? v : '';
+}
+
+function buildStagedFileName(fileName) {
+    const base = sanitizeFileName(String(fileName || '').trim(), 'online.js');
+    return `.${base}.staged.${process.pid}.${Date.now()}`;
+}
+
+function writeRemoteMetaFile(metaPath, payload = {}) {
+    const p = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {};
+    const url = typeof p.url === 'string' ? p.url.trim() : '';
+    const md5 = normalizeMd5Hex(p.md5);
+    const now = Date.now();
+    atomicWriteFile(
+        metaPath,
+        `${JSON.stringify(
+            {
+                ...(url ? { url } : {}),
+                ...(md5 ? { md5 } : {}),
+                savedAt: Number.isFinite(Number(p.savedAt)) ? Math.max(1, Math.trunc(Number(p.savedAt))) : now,
+                checkedAt: Number.isFinite(Number(p.checkedAt)) ? Math.max(1, Math.trunc(Number(p.checkedAt))) : now,
+            },
+            null,
+            2
+        )}\n`
+    );
+}
+
 function resolveOnlineDir(rootDir) {
     // After refactor, online scripts live directly under `custom_spider/`.
     return path.resolve(rootDir, 'custom_spider');
@@ -225,8 +263,63 @@ function listOnlineFiles(onlineDir) {
     }
 }
 
+export function promoteOnlineStagedScript(options = {}) {
+    const stagedPathRaw = options && typeof options.stagedPath === 'string' ? options.stagedPath.trim() : '';
+    const destPathRaw = options && typeof options.destPath === 'string' ? options.destPath.trim() : '';
+    const metaPathRaw = options && typeof options.metaPath === 'string' ? options.metaPath.trim() : '';
+    const urlRaw = options && typeof options.url === 'string' ? options.url.trim() : '';
+    const remoteMd5Raw = options && typeof options.remoteMd5 === 'string' ? options.remoteMd5.trim() : '';
+    const checkedAtRaw = options && Number.isFinite(Number(options.checkedAt)) ? Math.trunc(Number(options.checkedAt)) : Date.now();
+    if (!stagedPathRaw || !destPathRaw || !metaPathRaw || !urlRaw) {
+        return { ok: false, message: 'invalid promote arguments' };
+    }
+    const stagedPath = path.resolve(stagedPathRaw);
+    const destPath = path.resolve(destPathRaw);
+    const metaPath = path.resolve(metaPathRaw);
+    if (!fs.existsSync(stagedPath)) return { ok: false, message: 'staged file not found' };
+
+    const checkedAt = checkedAtRaw > 0 ? checkedAtRaw : Date.now();
+    const remoteMd5 = normalizeMd5Hex(remoteMd5Raw) || md5Hex(readTextFileSafe(stagedPath));
+
+    try {
+        fs.renameSync(stagedPath, destPath);
+    } catch (e) {
+        const msg = e && e.message ? String(e.message) : 'rename failed';
+        return { ok: false, message: msg };
+    }
+
+    try {
+        writeRemoteMetaFile(metaPath, {
+            url: urlRaw,
+            md5: remoteMd5,
+            savedAt: Date.now(),
+            checkedAt,
+        });
+    } catch (e) {
+        const msg = e && e.message ? String(e.message) : 'meta write failed';
+        return { ok: false, message: msg };
+    }
+
+    return { ok: true, md5: remoteMd5, checkedAt };
+}
+
+export function discardOnlineStagedScript(options = {}) {
+    const stagedPathRaw = options && typeof options.stagedPath === 'string' ? options.stagedPath.trim() : '';
+    if (!stagedPathRaw) return { ok: true, removed: false };
+    const stagedPath = path.resolve(stagedPathRaw);
+    try {
+        if (!fs.existsSync(stagedPath)) return { ok: true, removed: false };
+        fs.unlinkSync(stagedPath);
+        return { ok: true, removed: true };
+    } catch (e) {
+        const msg = e && e.message ? String(e.message) : 'remove failed';
+        return { ok: false, removed: false, message: msg };
+    }
+}
+
 export async function applyOnlineConfigs(options = {}) {
     const rootDir = options && typeof options.rootDir === 'string' && options.rootDir ? options.rootDir : resolveRuntimeRootDir();
+    const forceRemoteCheck = !!(options && options.forceRemoteCheck);
     const cfgPath = path.resolve(rootDir, 'config.json');
     const cfg = readJsonFileSafe(cfgPath) || {};
     const hasOnlineConfigs =
@@ -249,7 +342,7 @@ export async function applyOnlineConfigs(options = {}) {
 
     const keepNames = new Set(['.catpaw_online_runtime_bootstrap.cjs']);
     const resolved = [];
-    let downloadedAny = false;
+    let changedAny = false;
     const usedIds = new Set();
 
     let idsAdded = false;
@@ -307,42 +400,105 @@ export async function applyOnlineConfigs(options = {}) {
 
         const localMeta = readJsonFileSafe(metaPath) || {};
         const prevUrl = typeof localMeta.url === 'string' ? localMeta.url.trim() : '';
-        const shouldDownload = !fs.existsSync(destPath) || !prevUrl || prevUrl !== parsed.toString();
+        const prevMd5 = normalizeMd5Hex(localMeta.md5);
+        const prevSavedAt =
+            Number.isFinite(Number(localMeta.savedAt)) && Number(localMeta.savedAt) > 0 ? Math.trunc(Number(localMeta.savedAt)) : 0;
+        const prevCheckedAt =
+            Number.isFinite(Number(localMeta.checkedAt)) && Number(localMeta.checkedAt) > 0
+                ? Math.trunc(Number(localMeta.checkedAt))
+                : 0;
+
+        const url = parsed.toString();
+        const localExists = fs.existsSync(destPath);
+        const localText = localExists ? readTextFileSafe(destPath) : '';
+        const localMd5 = localExists ? md5Hex(localText) : '';
+        const shouldFetchRemote = forceRemoteCheck || !localExists || !prevUrl || prevUrl !== url;
+        let checkedAt = prevCheckedAt;
 
         try {
-            if (shouldDownload) {
-                const text = await downloadText(parsed.toString());
-                atomicWriteFile(destPath, text || '');
-                atomicWriteFile(
-                    metaPath,
-                    `${JSON.stringify({ url: parsed.toString(), savedAt: Date.now() }, null, 2)}\n`
-                );
-                downloadedAny = true;
+            let remoteChecked = false;
+            let downloaded = false;
+            let changed = false;
+            let needsReload = false;
+            let stagedPath = '';
+            let remoteMd5 = prevMd5 || localMd5;
+
+            if (shouldFetchRemote) {
+                remoteChecked = true;
+                checkedAt = Date.now();
+                const remoteText = await downloadText(url);
+                downloaded = true;
+                remoteMd5 = md5Hex(remoteText);
+
+                if (!localExists) {
+                    atomicWriteFile(destPath, remoteText || '');
+                    writeRemoteMetaFile(metaPath, { url, md5: remoteMd5, savedAt: Date.now(), checkedAt });
+                    changed = true;
+                    needsReload = true;
+                    changedAny = true;
+                } else if (remoteMd5 && localMd5 && remoteMd5 === localMd5) {
+                    writeRemoteMetaFile(metaPath, {
+                        url,
+                        md5: remoteMd5,
+                        savedAt: prevSavedAt || Date.now(),
+                        checkedAt,
+                    });
+                } else {
+                    const stagedName = buildStagedFileName(fileName);
+                    keepNames.add(stagedName);
+                    stagedPath = path.resolve(onlineDir, stagedName);
+                    atomicWriteFile(stagedPath, remoteText || '');
+                    changed = true;
+                    needsReload = true;
+                    changedAny = true;
+                }
             } else if (!readTextFileSafe(metaPath)) {
-                atomicWriteFile(
-                    metaPath,
-                    `${JSON.stringify({ url: parsed.toString(), savedAt: Date.now() }, null, 2)}\n`
-                );
+                writeRemoteMetaFile(metaPath, {
+                    url,
+                    md5: localMd5 || prevMd5,
+                    savedAt: prevSavedAt || Date.now(),
+                    checkedAt: prevCheckedAt || Date.now(),
+                });
+                checkedAt = prevCheckedAt || Date.now();
             }
+
             resolved.push({
                 ...it,
-                url: parsed.toString(),
+                url,
                 fileName,
                 destPath,
+                metaPath,
+                stagedPath,
                 ok: true,
-                downloaded: !!shouldDownload,
+                downloaded,
+                changed,
+                needsReload,
+                remoteChecked,
+                localMd5,
+                remoteMd5,
+                checkedAt: checkedAt > 0 ? checkedAt : Date.now(),
                 id: idEff,
                 entryFn: it.entryFn || '',
             });
-        } catch (_) {
+        } catch (e) {
+            const msg = e && e.message ? String(e.message) : 'download failed';
             // Keep file name reserved even if download failed.
             resolved.push({
                 ...it,
-                url: parsed.toString(),
+                url,
                 fileName,
                 destPath,
+                metaPath,
+                stagedPath: '',
                 ok: false,
                 downloaded: false,
+                changed: false,
+                needsReload: false,
+                remoteChecked: shouldFetchRemote,
+                localMd5,
+                remoteMd5: '',
+                checkedAt: Date.now(),
+                message: msg,
                 id: idEff,
                 entryFn: it.entryFn || '',
             });
@@ -370,6 +526,6 @@ export async function applyOnlineConfigs(options = {}) {
     }
 
     const entry = resolved.length ? resolved[0].destPath : '';
-    const runtimeChangedAny = downloadedAny || removed.length > 0;
+    const runtimeChangedAny = changedAny || removed.length > 0;
     return { rootDir, onlineDir, entry, resolved, removed, changedAny: runtimeChangedAny, configUpdatedAny: idsAdded };
 }

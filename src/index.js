@@ -7,6 +7,7 @@ import {
     startOnlineRuntime,
     stopOnlineRuntime,
     stopAllOnlineRuntimes,
+    setOnlineRuntimeEntry,
     broadcastOnlineRuntimeMockConfig,
     broadcastOnlineRuntimeProxyConfig,
     broadcastOnlineRuntimePacketCaptureConfig,
@@ -14,7 +15,7 @@ import {
 } from './util/onlineRuntime.js';
 import path from 'node:path';
 import fs from 'node:fs';
-import {applyOnlineConfigs} from './util/onlineConfigStore.js';
+import {applyOnlineConfigs, promoteOnlineStagedScript, discardOnlineStagedScript} from './util/onlineConfigStore.js';
 import {fileURLToPath} from 'node:url';
 
 let server = null;
@@ -311,10 +312,11 @@ export async function start(config) {
                 const res = await applyOnlineConfigs({rootDir: runtimeRoot});
                 if (res && res.skipped) {
                     // Config does not manage online scripts; keep legacy behavior (run whatever exists in custom_spider/).
+                    const prevPort = Number(onlineRuntimePorts.get('default') || 0);
                     const p = await findAvailablePortInRange(30000, 39999);
                     const started = await startOnlineRuntime({ id: 'default', port: p });
                     if (started && started.port) onlineRuntimePorts.set('default', started.port);
-                    else onlineRuntimePorts.delete('default');
+                    else if (!(Number.isFinite(prevPort) && prevPort > 0)) onlineRuntimePorts.delete('default');
                     onlineLastEntry = started && started.entry ? started.entry : onlineLastEntry;
                     return;
                 }
@@ -328,7 +330,7 @@ export async function start(config) {
                     return;
                 }
 
-                const desired = Array.isArray(res.resolved) ? res.resolved.filter((r) => r && r.ok && r.id && r.destPath) : [];
+                const desired = Array.isArray(res.resolved) ? res.resolved.filter((r) => r && r.id && r.destPath) : [];
                 const desiredIds = new Set(desired.map((r) => String(r.id)));
 
                 // Stop removed runtimes.
@@ -342,12 +344,35 @@ export async function start(config) {
                 // Start/restart desired runtimes.
                 for (const r of desired) {
                     const id = String(r.id);
-                    const curPort = onlineRuntimePorts.get(id);
-                    const needPort = !curPort;
+                    const curPort = Number(onlineRuntimePorts.get(id) || 0);
+                    const hasCurrent = Number.isFinite(curPort) && curPort > 0;
+                    const needPort = !hasCurrent;
                     const port = needPort ? await findAvailablePortInRange(30000, 39999) : curPort;
-                    const started = await startOnlineRuntime({ id, port, entry: r.destPath, entryFn: r.entryFn || '' });
-                    if (started && started.port) onlineRuntimePorts.set(id, started.port);
-                    else onlineRuntimePorts.delete(id);
+                    const stagedPath = typeof r.stagedPath === 'string' && r.stagedPath.trim() ? path.resolve(r.stagedPath.trim()) : '';
+                    const entryToStart = stagedPath || path.resolve(r.destPath);
+                    const started = await startOnlineRuntime({ id, port, entry: entryToStart, entryFn: r.entryFn || '' });
+                    const switched = !!(started && started.started && Number(started.port) > 0);
+                    if (stagedPath) {
+                        if (switched) {
+                            const promoted = promoteOnlineStagedScript({
+                                stagedPath,
+                                destPath: r.destPath,
+                                metaPath: r.metaPath,
+                                url: r.url,
+                                remoteMd5: r.remoteMd5 || '',
+                                checkedAt: r.checkedAt,
+                            });
+                            if (promoted && promoted.ok) {
+                                setOnlineRuntimeEntry(id, r.destPath);
+                            }
+                        } else {
+                            discardOnlineStagedScript({ stagedPath });
+                        }
+                    }
+
+                    if (switched) onlineRuntimePorts.set(id, Number(started.port));
+                    else if (needPort) onlineRuntimePorts.delete(id);
+                    // If restart failed but previous runtime exists, keep old mapping unchanged.
                 }
 
                 onlineLastEntry = nextEntry;

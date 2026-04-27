@@ -224,7 +224,6 @@ export async function startOnlineRuntime({
     })();
 
     const key = typeof id === 'string' && id.trim() ? id.trim() : 'default';
-    upstreamOrigins.delete(key);
 
     // Coalesce concurrent start attempts for the same id.
     const inflight = starting.get(key);
@@ -238,15 +237,12 @@ export async function startOnlineRuntime({
 
     const startPromise = (async () => {
     const prev = children.get(key) || null;
+    const prevAlive = !!(prev && prev.child && !prev.child.killed);
 
     // Avoid duplicate processes across hot restarts.
-    if (prev && prev.child && !prev.child.killed && prev.entry === entry && prev.port === p) {
+    if (prevAlive && prev.entry === entry && prev.port === p) {
         return { started: true, port: prev.port, entry: prev.entry, reused: true, id: key };
     }
-
-    try {
-        if (prev && prev.child && !prev.child.killed) prev.child.kill();
-    } catch (_) {}
 
 				const bootstrap = `
 					(() => {
@@ -4907,6 +4903,10 @@ export async function startOnlineRuntime({
 
 		    const onlineLogPath = wantDebug ? path.resolve(rootDir, `online-runtime.${key}.log`) : '';
 		    let chosenPort = p;
+            if (prevAlive && prev.port === chosenPort && prev.entry !== entry) {
+                // Hot-swap candidate must use another port while old runtime keeps serving.
+                chosenPort = await findAvailablePortInRange(30000, 39999);
+            }
             let lastFailureReason = '';
             let lastFailureStage = '';
 
@@ -4948,7 +4948,6 @@ export async function startOnlineRuntime({
 				                NODE_PATH: rootDir,
 				            },
 				        });
-				        children.set(key, { child, entry, port: chosenPort });
 				        // Push initial mock config (can be toggled later without restarting via IPC).
 				        sendMockConfigToChild(child, panMockCfg);
                         sendProxyConfigToChild(child, proxyCfg);
@@ -5031,8 +5030,19 @@ export async function startOnlineRuntime({
 
 	        const ready = await waitForReady(child, chosenPort);
 	        if (ready && ready.ok) {
-	            const cur = children.get(key);
-	            if (cur && cur.child === child) cur.port = ready.port;
+	            const activeBeforeSwap = children.get(key);
+	            const oldChild =
+	                activeBeforeSwap &&
+	                activeBeforeSwap.child &&
+	                activeBeforeSwap.child !== child &&
+	                !activeBeforeSwap.child.killed
+	                    ? activeBeforeSwap.child
+	                    : null;
+                children.set(key, { child, entry, port: ready.port });
+                upstreamOrigins.delete(key);
+                try {
+                    if (oldChild) oldChild.kill();
+                } catch (_) {}
             try {
                 // eslint-disable-next-line no-console
                 console.log(`${logPrefix} runtime ready: id=${key} entry=${path.basename(entry)} port=${ready.port}`);
@@ -5114,6 +5124,7 @@ export async function startOnlineRuntime({
             id: key,
             reason: lastFailureReason || 'runtime_not_ready',
             lastStage: lastFailureStage || '',
+            keptPrevious: prevAlive,
         };
     }
 
@@ -5124,6 +5135,7 @@ export async function startOnlineRuntime({
         id: key,
         reason: lastFailureReason || 'runtime_not_ready',
         lastStage: lastFailureStage || '',
+        keptPrevious: prevAlive,
     };
     })();
 
@@ -5132,6 +5144,19 @@ export async function startOnlineRuntime({
         return await startPromise;
     } finally {
         starting.delete(key);
+    }
+}
+
+export function setOnlineRuntimeEntry(id = 'default', entry = '') {
+    const key = typeof id === 'string' && id.trim() ? id.trim() : 'default';
+    const nextEntry = typeof entry === 'string' ? entry.trim() : '';
+    const cur = children.get(key);
+    if (!cur || !cur.child || cur.child.killed || !nextEntry) return false;
+    try {
+        cur.entry = path.resolve(nextEntry);
+        return true;
+    } catch (_) {
+        return false;
     }
 }
 
