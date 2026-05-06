@@ -10,6 +10,8 @@ import {
     broadcastOnlineRuntimeProxyConfig,
     broadcastOnlineRuntimePacketCaptureConfig,
     withOnlineRuntimeOpsLock,
+    startOnlineRuntimeWatchdog,
+    stopOnlineRuntimeWatchdog,
 } from './util/onlineRuntime.js';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -295,6 +297,22 @@ export async function start(config) {
                 next.packet_capture = false;
                 changed = true;
             }
+            if (!Object.prototype.hasOwnProperty.call(next, 'online_runtime_watchdog_enabled')) {
+                next.online_runtime_watchdog_enabled = true;
+                changed = true;
+            }
+            if (!Object.prototype.hasOwnProperty.call(next, 'online_runtime_restart_hours')) {
+                next.online_runtime_restart_hours = 6;
+                changed = true;
+            }
+            if (!Object.prototype.hasOwnProperty.call(next, 'online_runtime_health_check_interval_seconds')) {
+                next.online_runtime_health_check_interval_seconds = 300;
+                changed = true;
+            }
+            if (!Object.prototype.hasOwnProperty.call(next, 'online_runtime_health_failures')) {
+                next.online_runtime_health_failures = 2;
+                changed = true;
+            }
             if (changed) {
                 atomicWrite(next);
             }
@@ -425,6 +443,7 @@ export async function start(config) {
         await runLoadingSyncAndPersistState('startup');
         emitRuntimeConfigBroadcasts();
     })();
+    startOnlineRuntimeWatchdog({ rootDir: runtimeRoot, portsMap: onlineRuntimePorts });
 
     // Watch config.json for onlineConfigs changes (so manual edits or /api/server/settings take effect).
     const pollMs = 1500;
@@ -478,6 +497,9 @@ export async function stop() {
     }
     try {
         stopAllOnlineRuntimes();
+    } catch (_) {}
+    try {
+        stopOnlineRuntimeWatchdog();
     } catch (_) {}
     try {
         if (configWatchTimer) clearInterval(configWatchTimer);

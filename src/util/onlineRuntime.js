@@ -4,10 +4,18 @@ import { spawn } from 'node:child_process';
 import http from 'node:http';
 import { findAvailablePortInRange } from './tool.js';
 
-const children = new Map(); // id -> { child, entry, port }
+const children = new Map(); // id -> { child, entry, entryFn, port, startedAt, healthFailures }
 const starting = new Map(); // id -> Promise<startResult>
+const runtimeEntries = new Map(); // id -> { entry, entryFn }
 const upstreamOrigins = new Map(); // runtimeId -> Map<siteKey, origin>
 let runtimeOpsQueue = Promise.resolve();
+let watchdogTimer = null;
+let watchdogRunning = false;
+
+const DEFAULT_WATCHDOG_ENABLED = true;
+const DEFAULT_WATCHDOG_RESTART_MS = 6 * 60 * 60 * 1000;
+const DEFAULT_WATCHDOG_INTERVAL_MS = 5 * 60 * 1000;
+const DEFAULT_WATCHDOG_FAILURES = 2;
 
 function getRootDir() {
     // Prefer the executable directory for pkg builds so `db.json` can sit next to the exe.
@@ -56,6 +64,76 @@ function readJsonFileSafe(filePath) {
     } catch (_) {
         return {};
     }
+}
+
+function normalizeBoolConfig(value, fallback) {
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'number') return value !== 0;
+    if (typeof value === 'string') {
+        const v = value.trim().toLowerCase();
+        if (['1', 'true', 'yes', 'on'].includes(v)) return true;
+        if (['0', 'false', 'no', 'off'].includes(v)) return false;
+    }
+    return !!fallback;
+}
+
+function normalizePositiveMs(value, fallbackMs, unitMs = 1) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallbackMs;
+    const v = Math.trunc(n * unitMs);
+    return v > 0 ? v : fallbackMs;
+}
+
+function readOnlineRuntimeWatchdogConfig(rootDir) {
+    const cfgPath = path.resolve(rootDir || getRootDir(), 'config.json');
+    const cfg = readJsonFileSafe(cfgPath);
+    const enabled = normalizeBoolConfig(cfg.online_runtime_watchdog_enabled, DEFAULT_WATCHDOG_ENABLED);
+    const restartMs = normalizePositiveMs(cfg.online_runtime_restart_hours, DEFAULT_WATCHDOG_RESTART_MS, 60 * 60 * 1000);
+    const intervalMs = normalizePositiveMs(
+        cfg.online_runtime_health_check_interval_seconds,
+        DEFAULT_WATCHDOG_INTERVAL_MS,
+        1000
+    );
+    const maxFailuresRaw = Number(cfg.online_runtime_health_failures);
+    const maxFailures = Number.isFinite(maxFailuresRaw) && maxFailuresRaw > 0 ? Math.trunc(maxFailuresRaw) : DEFAULT_WATCHDOG_FAILURES;
+    return { enabled, restartMs, intervalMs, maxFailures };
+}
+
+function probeOnlineRuntimePort(port, timeoutMs = 1500) {
+    const p = Number.isFinite(Number(port)) ? Math.max(0, Math.trunc(Number(port))) : 0;
+    if (!p) return Promise.resolve(false);
+    return new Promise((resolve) => {
+        let done = false;
+        const finish = (ok) => {
+            if (done) return;
+            done = true;
+            resolve(!!ok);
+        };
+        try {
+            const req = http.request(
+                { method: 'HEAD', hostname: '127.0.0.1', port: p, path: '/', timeout: Math.max(300, timeoutMs) },
+                (res) => {
+                    try {
+                        const st = res ? Number(res.statusCode || 0) : 0;
+                        res.resume();
+                        finish(st >= 100);
+                    } catch (_) {
+                        finish(false);
+                    }
+                }
+            );
+            req.on('timeout', () => {
+                try {
+                    req.destroy(new Error('timeout'));
+                } catch (_) {}
+                finish(false);
+            });
+            req.on('error', () => finish(false));
+            req.end();
+        } catch (_) {
+            finish(false);
+        }
+    });
 }
 
 const DEFAULT_MOCK_PROVIDERS = ['quark', 'uc', '139', 'baidu', 'tianyi'];
@@ -195,6 +273,7 @@ export async function startOnlineRuntime({
     logPrefix = '[online]',
     entry: entryOverride = '',
     entryFn = '',
+    forceRestart = false,
 } = {}) {
     const rootDir = getRootDir();
     const onlineDir = path.resolve(rootDir, 'custom_spider');
@@ -224,6 +303,7 @@ export async function startOnlineRuntime({
     })();
 
     const key = typeof id === 'string' && id.trim() ? id.trim() : 'default';
+    runtimeEntries.set(key, { entry, entryFn: typeof entryFn === 'string' ? entryFn.trim() : '' });
 
     // Coalesce concurrent start attempts for the same id.
     const inflight = starting.get(key);
@@ -240,7 +320,7 @@ export async function startOnlineRuntime({
     const prevAlive = !!(prev && prev.child && !prev.child.killed);
 
     // Avoid duplicate processes across hot restarts.
-    if (prevAlive && prev.entry === entry && prev.port === p) {
+    if (!forceRestart && prevAlive && prev.entry === entry && prev.port === p) {
         return { started: true, port: prev.port, entry: prev.entry, reused: true, id: key };
     }
 
@@ -4903,7 +4983,7 @@ export async function startOnlineRuntime({
 
 		    const onlineLogPath = wantDebug ? path.resolve(rootDir, `online-runtime.${key}.log`) : '';
 		    let chosenPort = p;
-            if (prevAlive && prev.port === chosenPort && prev.entry !== entry) {
+            if (prevAlive && prev.port === chosenPort && (prev.entry !== entry || forceRestart)) {
                 // Hot-swap candidate must use another port while old runtime keeps serving.
                 chosenPort = await findAvailablePortInRange(30000, 39999);
             }
@@ -5038,7 +5118,14 @@ export async function startOnlineRuntime({
 	                !activeBeforeSwap.child.killed
 	                    ? activeBeforeSwap.child
 	                    : null;
-                children.set(key, { child, entry, port: ready.port });
+                children.set(key, {
+                    child,
+                    entry,
+                    entryFn: typeof entryFn === 'string' ? entryFn.trim() : '',
+                    port: ready.port,
+                    startedAt: Date.now(),
+                    healthFailures: 0,
+                });
                 upstreamOrigins.delete(key);
                 try {
                     if (oldChild) oldChild.kill();
@@ -5154,6 +5241,7 @@ export function setOnlineRuntimeEntry(id = 'default', entry = '') {
     if (!cur || !cur.child || cur.child.killed || !nextEntry) return false;
     try {
         cur.entry = path.resolve(nextEntry);
+        runtimeEntries.set(key, { entry: cur.entry, entryFn: cur.entryFn || '' });
         return true;
     } catch (_) {
         return false;
@@ -5165,6 +5253,7 @@ export function stopOnlineRuntime(id = 'default') {
     const cur = children.get(key);
     if (!cur || !cur.child || cur.child.killed) {
         upstreamOrigins.delete(key);
+        runtimeEntries.delete(key);
         return false;
     }
     try {
@@ -5174,6 +5263,7 @@ export function stopOnlineRuntime(id = 'default') {
         return false;
     } finally {
         upstreamOrigins.delete(key);
+        runtimeEntries.delete(key);
         children.delete(key);
     }
 }
@@ -5186,6 +5276,131 @@ export function stopAllOnlineRuntimes() {
         } catch (_) {}
     });
     return true;
+}
+
+async function restartOnlineRuntimeHot({ id, entry, entryFn, port, portsMap, reason } = {}) {
+    const key = typeof id === 'string' && id.trim() ? id.trim() : 'default';
+    runtimeEntries.set(key, { entry, entryFn: typeof entryFn === 'string' ? entryFn.trim() : '' });
+    try {
+        // eslint-disable-next-line no-console
+        console.warn(`[online] watchdog restart: id=${key} reason=${reason || 'scheduled'}`);
+    } catch (_) {}
+    const started = await startOnlineRuntime({
+        id: key,
+        port,
+        entry,
+        entryFn,
+        forceRestart: true,
+    });
+    if (started && started.started && Number(started.port) > 0) {
+        try {
+            if (portsMap && typeof portsMap.set === 'function') portsMap.set(key, Number(started.port));
+        } catch (_) {}
+        return true;
+    }
+    return false;
+}
+
+async function runOnlineRuntimeWatchdogOnce({ rootDir, portsMap } = {}) {
+    const cfg = readOnlineRuntimeWatchdogConfig(rootDir || getRootDir());
+    if (!cfg.enabled) return;
+    const now = Date.now();
+    try {
+        if (portsMap && typeof portsMap.entries === 'function') {
+            for (const [id, port] of portsMap.entries()) {
+                if (children.has(id)) continue;
+                const meta = runtimeEntries.get(id);
+                if (!meta || !meta.entry) {
+                    if (typeof portsMap.delete === 'function') portsMap.delete(id);
+                    continue;
+                }
+                await restartOnlineRuntimeHot({
+                    id,
+                    entry: meta.entry,
+                    entryFn: meta.entryFn,
+                    port,
+                    portsMap,
+                    reason: 'child_missing',
+                });
+            }
+        }
+    } catch (_) {}
+    const items = Array.from(children.entries());
+    for (const [id, cur] of items) {
+        if (!cur || !cur.child || cur.child.killed) {
+            try {
+                if (portsMap && typeof portsMap.delete === 'function') portsMap.delete(id);
+            } catch (_) {}
+            continue;
+        }
+        const startedAt = Number.isFinite(Number(cur.startedAt)) ? Number(cur.startedAt) : now;
+        const ageMs = Math.max(0, now - startedAt);
+        const healthOk = await probeOnlineRuntimePort(cur.port, 1500);
+        const latest = children.get(id);
+        if (!latest || latest.child !== cur.child) continue;
+        if (healthOk) {
+            latest.healthFailures = 0;
+        } else {
+            latest.healthFailures = Math.max(0, Math.trunc(Number(latest.healthFailures) || 0)) + 1;
+        }
+        if (latest.healthFailures >= cfg.maxFailures) {
+            await restartOnlineRuntimeHot({
+                id,
+                entry: latest.entry,
+                entryFn: latest.entryFn,
+                port: latest.port,
+                portsMap,
+                reason: `health_failed:${latest.healthFailures}`,
+            });
+            continue;
+        }
+        if (ageMs >= cfg.restartMs) {
+            await restartOnlineRuntimeHot({
+                id,
+                entry: latest.entry,
+                entryFn: latest.entryFn,
+                port: latest.port,
+                portsMap,
+                reason: `max_age:${Math.round(ageMs / 60000)}m`,
+            });
+        }
+    }
+}
+
+export function startOnlineRuntimeWatchdog({ rootDir, portsMap } = {}) {
+    stopOnlineRuntimeWatchdog();
+    const schedule = () => {
+        const interval = readOnlineRuntimeWatchdogConfig(rootDir || getRootDir()).intervalMs;
+        watchdogTimer = setTimeout(tick, interval);
+        try {
+            if (watchdogTimer && typeof watchdogTimer.unref === 'function') watchdogTimer.unref();
+        } catch (_) {}
+    };
+    const tick = async () => {
+        if (watchdogRunning) return;
+        watchdogRunning = true;
+        try {
+            await withOnlineRuntimeOpsLock(() => runOnlineRuntimeWatchdogOnce({ rootDir, portsMap }));
+        } catch (e) {
+            try {
+                // eslint-disable-next-line no-console
+                console.warn(`[online] watchdog failed: ${e && e.message ? e.message : e}`);
+            } catch (_) {}
+        } finally {
+            watchdogRunning = false;
+            if (watchdogTimer) schedule();
+        }
+    };
+    schedule();
+    return true;
+}
+
+export function stopOnlineRuntimeWatchdog() {
+    try {
+        if (watchdogTimer) clearTimeout(watchdogTimer);
+    } catch (_) {}
+    watchdogTimer = null;
+    watchdogRunning = false;
 }
 
 export function getOnlineRuntimeUpstreamOrigin(runtimeId = '', spiderKey = '') {
