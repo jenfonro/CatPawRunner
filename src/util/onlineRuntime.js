@@ -16,6 +16,11 @@ const DEFAULT_WATCHDOG_ENABLED = true;
 const DEFAULT_WATCHDOG_RESTART_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_WATCHDOG_INTERVAL_MS = 5 * 60 * 1000;
 const DEFAULT_WATCHDOG_FAILURES = 2;
+const DEFAULT_WATCHDOG_RESTART_RETRIES = 3;
+
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.trunc(Number(ms) || 0))));
+}
 
 function getRootDir() {
     // Prefer the executable directory for pkg builds so `db.json` can sit next to the exe.
@@ -96,7 +101,12 @@ function readOnlineRuntimeWatchdogConfig(rootDir) {
     );
     const maxFailuresRaw = Number(cfg.online_runtime_health_failures);
     const maxFailures = Number.isFinite(maxFailuresRaw) && maxFailuresRaw > 0 ? Math.trunc(maxFailuresRaw) : DEFAULT_WATCHDOG_FAILURES;
-    return { enabled, restartMs, intervalMs, maxFailures };
+    const restartRetriesRaw = Number(cfg.online_runtime_restart_retries);
+    const restartRetries =
+        Number.isFinite(restartRetriesRaw) && restartRetriesRaw > 0
+            ? Math.max(1, Math.trunc(restartRetriesRaw))
+            : DEFAULT_WATCHDOG_RESTART_RETRIES;
+    return { enabled, restartMs, intervalMs, maxFailures, restartRetries };
 }
 
 function probeOnlineRuntimePort(port, timeoutMs = 1500) {
@@ -4699,6 +4709,15 @@ export async function startOnlineRuntime({
 		          };
 		        }
 		      } catch (_) {}
+		      try {
+		        const srv = pickServerRef();
+		        const addr = srv && typeof srv.address === 'function' ? srv.address() : null;
+		        const p = Number(globalThis.__catpaw_online_listen_port || (addr && addr.port) || 0);
+		        __stage('runtime_ready');
+		        __send({ type: 'runtime_ready', port: Number.isFinite(p) && p > 0 ? p : 0 });
+		      } catch (_) {
+		        try { __stage('runtime_ready'); __send({ type: 'runtime_ready', port: 0 }); } catch (_) {}
+		      }
 		      return;
 		    }
 		  } catch (_) {}
@@ -4792,6 +4811,15 @@ export async function startOnlineRuntime({
 	        };
 	      }
 	    } catch (_) {}
+		      try {
+		        const srv = pickServerRef();
+		        const addr = srv && typeof srv.address === 'function' ? srv.address() : null;
+		        const p = Number(globalThis.__catpaw_online_listen_port || (addr && addr.port) || 0);
+		        __stage('runtime_ready');
+		        __send({ type: 'runtime_ready', port: Number.isFinite(p) && p > 0 ? p : 0 });
+		      } catch (_) {
+		        try { __stage('runtime_ready'); __send({ type: 'runtime_ready', port: 0 }); } catch (_) {}
+		      }
 
 	    return;
 	  }
@@ -4832,6 +4860,13 @@ export async function startOnlineRuntime({
 	            let done = false;
 	            let lastStage = '';
 	            let lastFatal = null;
+                let sawChildIpc = false;
+                let listeningPort = 0;
+                let readyProbeRunning = false;
+                let finishRuntimeReady = (port, via) => {
+                    const p0 = Number.isFinite(Number(port)) && Number(port) > 0 ? Math.trunc(Number(port)) : expectedPort;
+                    finish({ ok: true, port: p0, via: via || 'runtime_ready' });
+                };
 	            const withMeta = (v) => {
 	                try {
 	                    const out = v && typeof v === 'object' ? { ...v } : v;
@@ -4881,6 +4916,7 @@ export async function startOnlineRuntime({
 		            };
 		            const onMsg = (msg) => {
 		                if (!msg || typeof msg !== 'object') return;
+                        sawChildIpc = true;
 		                if (msg.type === 'upstream_origin') {
 		                    try {
 		                        const site = typeof msg.site === 'string' ? msg.site.trim().toLowerCase() : '';
@@ -4918,15 +4954,29 @@ export async function startOnlineRuntime({
 		                if (msg.type === 'stage') {
 		                    const st = typeof msg.stage === 'string' ? msg.stage.trim() : '';
 		                    if (st) lastStage = st;
+                            if (st === 'runtime_ready' && listeningPort > 0) {
+                                finishRuntimeReady(listeningPort || expectedPort, 'stage:runtime_ready');
+                            }
 	                    return;
 	                }
 	                if (msg.type === 'fatal') {
 	                    lastFatal = msg;
 	                    return;
-	                }
+                    }
+                    if (msg.type === 'runtime_ready') {
+                        const rp =
+                            Number.isFinite(Number(msg.port)) && Number(msg.port) > 0
+                                ? Math.max(1, Math.trunc(Number(msg.port)))
+                                : listeningPort || expectedPort;
+                        finishRuntimeReady(rp, 'runtime_ready');
+                        return;
+                    }
 	                if (msg.type === 'listening') {
 	                    const lp = Number.isFinite(Number(msg.port)) ? Math.max(1, Math.trunc(Number(msg.port))) : expectedPort;
-	                    finish({ ok: true, port: lp });
+                        listeningPort = lp;
+                        // Do not switch on bare "listening": some bundled scripts keep doing async
+                        // initialization after the HTTP server binds. Wait for bootstrap's
+                        // runtime_ready stage so a hot restart cannot kill the previous runtime too early.
 	                    return;
 	                }
 	                if (msg.type === 'listen_error') {
@@ -4937,11 +4987,14 @@ export async function startOnlineRuntime({
 
 		            // Fallback readiness probe (for some pkg/Linux builds where IPC messages may not arrive reliably):
 		            // poll any HTTP response on the expected port (even 404).
-		            const probeOnce = () =>
+		            const probeOnce = (portToProbe = expectedPort) =>
 		                new Promise((r) => {
 		                    try {
+                                const probePort = Number.isFinite(Number(portToProbe))
+                                    ? Math.max(1, Math.trunc(Number(portToProbe)))
+                                    : expectedPort;
 		                        const req = http.request(
-		                            { method: 'HEAD', hostname: '127.0.0.1', port: expectedPort, path: '/', timeout: 700 },
+		                            { method: 'HEAD', hostname: '127.0.0.1', port: probePort, path: '/', timeout: 700 },
 		                            (res) => {
 		                                try {
 		                                    const st = res ? Number(res.statusCode || 0) : 0;
@@ -4962,12 +5015,38 @@ export async function startOnlineRuntime({
 	                        req.end();
 	                    } catch (_) {
 	                        r(false);
-	                    }
-	                });
+		                    }
+		                });
+
+                finishRuntimeReady = async (port, via) => {
+                    if (done || readyProbeRunning) return;
+                    readyProbeRunning = true;
+                    const p0 = Number.isFinite(Number(port)) && Number(port) > 0 ? Math.trunc(Number(port)) : expectedPort;
+                    const stableMsRaw = String(process.env.CATPAW_ONLINE_READY_STABLE_MS || '').trim();
+                    const stableMs = stableMsRaw
+                        ? Math.max(0, Math.trunc(Number(stableMsRaw)) || 0)
+                        : forceRestart
+                          ? 2500
+                          : 500;
+                    const deadline = Date.now() + stableMs;
+                    let ok = false;
+                    do {
+                        if (done) return;
+                        // eslint-disable-next-line no-await-in-loop
+                        ok = await probeOnce(p0);
+                        if (ok && Date.now() >= deadline) break;
+                        // eslint-disable-next-line no-await-in-loop
+                        await new Promise((r) => setTimeout(r, 500));
+                    } while (!done && Date.now() < deadline + 5000);
+                    if (done) return;
+                    if (ok) finish({ ok: true, port: p0, via: via || 'runtime_ready' });
+                    else finish({ ok: false, readyProbeFailed: true, port: p0 });
+                };
 
 	            const pollTimer = setInterval(async () => {
 	                try {
 	                    if (done) return;
+                        if (sawChildIpc) return;
 	                    const ok = await probeOnce();
 	                    if (ok) finish({ ok: true, port: expectedPort, via: 'http_probe' });
 	                } catch (_) {}
@@ -4977,7 +5056,7 @@ export async function startOnlineRuntime({
 		            childProc.on('error', onErr);
 		            childProc.on('message', onMsg);
 		            const timeoutMsRaw = String(process.env.CATPAW_ONLINE_READY_TIMEOUT_MS || '').trim();
-		            const timeoutMs = timeoutMsRaw ? Math.max(500, Math.trunc(Number(timeoutMsRaw))) : 30000;
+		            const timeoutMs = timeoutMsRaw ? Math.max(500, Math.trunc(Number(timeoutMsRaw))) : forceRestart ? 60000 : 30000;
 		            const timer = setTimeout(() => finish({ ok: false, timeout: true, port: expectedPort }), timeoutMs);
 		        });
 
@@ -5278,26 +5357,70 @@ export function stopAllOnlineRuntimes() {
     return true;
 }
 
-async function restartOnlineRuntimeHot({ id, entry, entryFn, port, portsMap, reason } = {}) {
+async function restartOnlineRuntimeHot({ id, entry, entryFn, port, portsMap, reason, retries = DEFAULT_WATCHDOG_RESTART_RETRIES } = {}) {
     const key = typeof id === 'string' && id.trim() ? id.trim() : 'default';
     runtimeEntries.set(key, { entry, entryFn: typeof entryFn === 'string' ? entryFn.trim() : '' });
+    // `retries` means extra attempts after the first try.
+    // Default: first try + 3 retries = up to 4 total attempts.
+    const retriesRaw = Number(retries);
+    const retryCount = Number.isFinite(retriesRaw) && retriesRaw >= 0 ? Math.trunc(retriesRaw) : DEFAULT_WATCHDOG_RESTART_RETRIES;
+    const maxAttempts = 1 + retryCount;
+    let lastMessage = '';
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        try {
+            // eslint-disable-next-line no-console
+            console.warn(
+                `[online] watchdog restart: id=${key} reason=${reason || 'scheduled'} attempt=${attempt}/${maxAttempts}`
+            );
+        } catch (_) {}
+        let started = null;
+        try {
+            // eslint-disable-next-line no-await-in-loop
+            started = await startOnlineRuntime({
+                id: key,
+                port,
+                entry,
+                entryFn,
+                forceRestart: true,
+            });
+        } catch (e) {
+            lastMessage = e && e.message ? String(e.message) : String(e);
+            started = null;
+        }
+        if (started && started.started && Number(started.port) > 0) {
+            try {
+                if (portsMap && typeof portsMap.set === 'function') portsMap.set(key, Number(started.port));
+            } catch (_) {}
+            return true;
+        }
+        if (started) {
+            lastMessage =
+                started && typeof started.reason === 'string' && started.reason.trim()
+                    ? started.reason.trim()
+                    : started && typeof started.lastStage === 'string' && started.lastStage.trim()
+                      ? `lastStage:${started.lastStage.trim()}`
+                      : 'start_failed';
+        } else if (!lastMessage) {
+            lastMessage = 'start_failed';
+        }
+        try {
+            // eslint-disable-next-line no-console
+            console.warn(
+                `[online] watchdog restart failed: id=${key} reason=${reason || 'scheduled'} attempt=${attempt}/${maxAttempts} message=${lastMessage}`
+            );
+        } catch (_) {}
+        if (attempt < maxAttempts) {
+            const delayMs = Math.min(30000, 3000 * attempt);
+            // eslint-disable-next-line no-await-in-loop
+            await sleep(delayMs);
+        }
+    }
     try {
         // eslint-disable-next-line no-console
-        console.warn(`[online] watchdog restart: id=${key} reason=${reason || 'scheduled'}`);
+        console.error(
+            `[online] watchdog restart giving up: id=${key} reason=${reason || 'scheduled'} attempts=${maxAttempts} message=${lastMessage || 'start_failed'}`
+        );
     } catch (_) {}
-    const started = await startOnlineRuntime({
-        id: key,
-        port,
-        entry,
-        entryFn,
-        forceRestart: true,
-    });
-    if (started && started.started && Number(started.port) > 0) {
-        try {
-            if (portsMap && typeof portsMap.set === 'function') portsMap.set(key, Number(started.port));
-        } catch (_) {}
-        return true;
-    }
     return false;
 }
 
@@ -5321,6 +5444,7 @@ async function runOnlineRuntimeWatchdogOnce({ rootDir, portsMap } = {}) {
                     port,
                     portsMap,
                     reason: 'child_missing',
+                    retries: cfg.restartRetries,
                 });
             }
         }
@@ -5351,6 +5475,7 @@ async function runOnlineRuntimeWatchdogOnce({ rootDir, portsMap } = {}) {
                 port: latest.port,
                 portsMap,
                 reason: `health_failed:${latest.healthFailures}`,
+                retries: cfg.restartRetries,
             });
             continue;
         }
@@ -5362,6 +5487,7 @@ async function runOnlineRuntimeWatchdogOnce({ rootDir, portsMap } = {}) {
                 port: latest.port,
                 portsMap,
                 reason: `max_age:${Math.round(ageMs / 60000)}m`,
+                retries: cfg.restartRetries,
             });
         }
     }

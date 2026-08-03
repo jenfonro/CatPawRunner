@@ -313,6 +313,10 @@ export async function start(config) {
                 next.online_runtime_health_failures = 2;
                 changed = true;
             }
+            if (!Object.prototype.hasOwnProperty.call(next, 'online_runtime_restart_retries')) {
+                next.online_runtime_restart_retries = 3;
+                changed = true;
+            }
             if (changed) {
                 atomicWrite(next);
             }
