@@ -504,6 +504,8 @@ export function discardOnlineStagedScript(options = {}) {
 
 export async function applyOnlineConfigs(options = {}) {
     const rootDir = options && typeof options.rootDir === 'string' && options.rootDir ? options.rootDir : resolveRuntimeRootDir();
+    const targetIds = normalizeOnlineConfigIdSet(options.targetIds);
+    const preferLocal = options.preferLocal === true;
     const forceRemoteCheckIds = normalizeOnlineConfigIdSet(
         options && Object.prototype.hasOwnProperty.call(options, 'forceRemoteCheckIds') ? options.forceRemoteCheckIds : []
     );
@@ -537,6 +539,7 @@ export async function applyOnlineConfigs(options = {}) {
 
     for (let idx = 0; idx < items.length; idx += 1) {
         const it = items[idx];
+        if (targetIds.size && !targetIds.has(it.idRaw)) continue;
         let parsed;
         try {
             parsed = new URL(it.url);
@@ -599,7 +602,7 @@ export async function applyOnlineConfigs(options = {}) {
         const localExists = fs.existsSync(destPath);
         const localText = localExists ? readTextFileSafe(destPath) : '';
         const localMd5 = localExists ? md5Hex(localText) : '';
-        const shouldFetchRemote = forceRemoteCheckIds.has(idEff) || !localExists || !prevUrl || prevUrl !== url;
+        const shouldFetchRemote = !localExists || (!preferLocal && (forceRemoteCheckIds.has(idEff) || !prevUrl || prevUrl !== url));
         let checkedAt = prevCheckedAt;
 
         try {
@@ -694,7 +697,7 @@ export async function applyOnlineConfigs(options = {}) {
 
     // Cleanup: remove files not referenced by config (bootstrap + per-file meta are preserved via keepNames).
     const removed = [];
-    const files = listOnlineFiles(onlineDir);
+    const files = targetIds.size ? [] : listOnlineFiles(onlineDir);
     for (const name of files) {
         if (!name) continue;
         if (keepNames.has(name)) continue;

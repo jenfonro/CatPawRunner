@@ -5357,6 +5357,31 @@ export function stopAllOnlineRuntimes() {
     return true;
 }
 
+export async function stopOnlineRuntimeAndWait(id) {
+    // A manual restart must not reuse an in-flight start or overlap the old process.
+    const pending = starting.get(id);
+    if (pending) await pending.catch(() => {});
+    const child = children.get(id)?.child;
+    if (!child || child.exitCode !== null || child.signalCode !== null) {
+        stopOnlineRuntime(id);
+        return;
+    }
+    await new Promise((resolve, reject) => {
+        const finish = (error) => {
+            clearTimeout(killTimer);
+            clearTimeout(exitTimer);
+            child.removeListener('exit', onExit);
+            if (error) reject(error);
+            else resolve();
+        };
+        const onExit = () => finish();
+        const killTimer = setTimeout(() => child.kill('SIGKILL'), 5000);
+        const exitTimer = setTimeout(() => finish(new Error('runtime did not exit')), 10000);
+        child.once('exit', onExit);
+        stopOnlineRuntime(id);
+    });
+}
+
 async function restartOnlineRuntimeHot({ id, entry, entryFn, port, portsMap, reason, retries = DEFAULT_WATCHDOG_RESTART_RETRIES } = {}) {
     const key = typeof id === 'string' && id.trim() ? id.trim() : 'default';
     runtimeEntries.set(key, { entry, entryFn: typeof entryFn === 'string' ? entryFn.trim() : '' });

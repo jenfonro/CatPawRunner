@@ -13,9 +13,10 @@ import {
     broadcastOnlineRuntimeProxyConfig,
     broadcastOnlineRuntimePacketCaptureConfig,
 } from '../../util/onlineRuntime.js';
-import { runOnlineSyncInBackground } from '../../util/onlineConfigSyncService.js';
+import { restartOnlineConfigNow, runOnlineSyncInBackground } from '../../util/onlineConfigSyncService.js';
 
 const onlineConfigUpdateInFlightIds = new Set();
+const onlineConfigRestartInFlightIds = new Set();
 
 function save139AuthorizationToConfig(rootDir, authorization) {
     const root = rootDir ? String(rootDir) : '';
@@ -758,6 +759,37 @@ export const apiPlugins = [
                         claimedIds.forEach((id) => onlineConfigUpdateInFlightIds.delete(id));
                     }
                 }
+            });
+
+            fastify.post('/online-configs/restart', async function (request, reply) {
+                const rootDir = resolveRuntimeRootDir();
+                const cfgPath = path.resolve(rootDir, 'config.json');
+                const cfg = readJsonObjectSafe(cfgPath) || {};
+                const id = typeof request.body?.id === 'string' ? request.body.id.trim() : '';
+                if (!id) return reply.code(400).send({ success: false, message: 'online config id required' });
+                if (!readOnlineConfigsFromConfig(cfg).some((item) => item.id === id)) {
+                    return reply.code(404).send({ success: false, message: 'online config not found' });
+                }
+                if (!fastify.onlineRuntimePorts) {
+                    return reply.code(503).send({ success: false, message: 'onlineRuntimePorts not available' });
+                }
+                const skipped = onlineConfigRestartInFlightIds.has(id);
+                if (!skipped) {
+                    onlineConfigRestartInFlightIds.add(id);
+                    persistOnlineConfigStatePatchesByPath(cfgPath, [{ id, status: 'checking', checkedAt: Date.now(), message: '' }]);
+                    void restartOnlineConfigNow({ rootDir, portsMap: fastify.onlineRuntimePorts, id })
+                        .catch((error) => fastify.log.error(error))
+                        .finally(() => onlineConfigRestartInFlightIds.delete(id));
+                }
+                const latest = readJsonObjectSafe(cfgPath) || cfg;
+                return reply.code(202).send({
+                    success: true,
+                    pending: true,
+                    skipped,
+                    processingIds: [id],
+                    settings: readSettingsFromConfig(latest),
+                    onlineConfigs: readOnlineConfigsFromConfig(latest),
+                });
             });
 
             fastify.get('/full-config', async function (_request, reply) {

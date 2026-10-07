@@ -1,7 +1,7 @@
 import path from 'node:path';
 import http from 'node:http';
-import { applyOnlineConfigs, normalizeOnlineConfigIdSet, persistOnlineConfigStatePatchesByPath } from './onlineConfigStore.js';
-import { withOnlineRuntimeOpsLock } from './onlineRuntime.js';
+import { applyOnlineConfigs, getOnlineConfigListAndKey, readJsonObjectSafe, normalizeOnlineConfigIdSet, persistOnlineConfigStatePatchesByPath } from './onlineConfigStore.js';
+import { startOnlineRuntime, stopOnlineRuntimeAndWait, withOnlineRuntimeOpsLock } from './onlineRuntime.js';
 import { syncOnlineRuntimesByDesired } from './onlineRuntimeSync.js';
 
 function sleep(ms) {
@@ -91,25 +91,59 @@ async function waitRuntimeReadyById(portsMap, runtimeId, options = {}) {
     return { ok: false, message: lastErr || 'timeout', port: Number.isFinite(finalPort) ? finalPort : 0 };
 }
 
-export async function syncOnlineRuntimesNow({ rootDir, portsMap, forceRemoteCheckIds = [] } = {}) {
+async function syncOnlineRuntimesUnlocked({ rootDir, portsMap, forceRemoteCheckIds = [] } = {}) {
+    const ids = Array.from(normalizeOnlineConfigIdSet(forceRemoteCheckIds));
+    const res = await applyOnlineConfigs({
+        rootDir,
+        ...(ids.length ? { forceRemoteCheckIds: ids } : {}),
+    });
+
+    const map = portsMap && typeof portsMap.get === 'function' ? portsMap : null;
+    if (!map) return { ok: false, message: 'onlineRuntimePorts not available', applied: res, runtimes: [] };
+
+    const desired = Array.isArray(res && res.resolved) ? res.resolved : [];
+    const runtimeSync = await syncOnlineRuntimesByDesired({ desired, portsMap: map });
+    if (!runtimeSync.ok) return { ok: false, message: runtimeSync.message || 'online runtime sync failed', applied: res, runtimes: [] };
+    return { ok: true, applied: res, runtimes: runtimeSync.runtimes };
+}
+
+export async function syncOnlineRuntimesNow(options = {}) {
+    return withOnlineRuntimeOpsLock(() => syncOnlineRuntimesUnlocked(options));
+}
+
+export async function restartOnlineConfigNow({ rootDir, portsMap, id } = {}) {
     return withOnlineRuntimeOpsLock(async () => {
-        const ids = Array.from(normalizeOnlineConfigIdSet(forceRemoteCheckIds));
-        const res = await applyOnlineConfigs({
-            rootDir,
-            ...(ids.length ? { forceRemoteCheckIds: ids } : {}),
-        });
-
-        const map = portsMap && typeof portsMap.get === 'function' ? portsMap : null;
-        if (!map) return { ok: false, message: 'onlineRuntimePorts not available', applied: res, runtimes: [] };
-
-        const desired = Array.isArray(res && res.resolved) ? res.resolved : [];
-        const runtimeSync = await syncOnlineRuntimesByDesired({ desired, portsMap: map });
-        if (!runtimeSync.ok) return { ok: false, message: runtimeSync.message || 'online runtime sync failed', applied: res, runtimes: [] };
-        return { ok: true, applied: res, runtimes: runtimeSync.runtimes };
+        const cfgPath = path.resolve(rootDir, 'config.json');
+        try {
+            const { list } = getOnlineConfigListAndKey(readJsonObjectSafe(cfgPath));
+            if (!list.some((item) => item && item.id === id)) throw new Error('online config not found');
+            if (!portsMap) throw new Error('onlineRuntimePorts not available');
+            persistOnlineConfigStatePatchesByPath(cfgPath, [{ id, status: 'checking', checkedAt: Date.now(), message: '' }]);
+            // No status gate and no hot-restart fallback: fully stop only this runtime.
+            portsMap.delete(id);
+            await stopOnlineRuntimeAndWait(id);
+            const applied = await applyOnlineConfigs({ rootDir, targetIds: [id], preferLocal: true });
+            const entry = applied.resolved.find((item) => item.id === id);
+            if (!entry || !entry.ok) throw new Error(entry?.message || 'online config script unavailable');
+            const started = await startOnlineRuntime({ id, entry: entry.destPath, entryFn: entry.entryFn });
+            if (!started.started || !started.port) throw new Error(started.reason || 'runtime restart failed');
+            portsMap.set(id, started.port);
+            persistOnlineConfigStatePatchesByPath(cfgPath, [{ id, status: 'pass', checkedAt: Date.now(), message: '' }]);
+            return { ok: true, id, port: started.port };
+        } catch (error) {
+            const message = error && error.message ? error.message : 'runtime restart failed';
+            persistOnlineConfigStatePatchesByPath(cfgPath, [{ id, status: 'error', checkedAt: Date.now(), message }]);
+            return { ok: false, id, message };
+        }
     });
 }
 
-export async function runOnlineSyncInBackground({
+export async function runOnlineSyncInBackground(options = {}) {
+    // Keep status persistence in the same queue as lifecycle changes.
+    return withOnlineRuntimeOpsLock(() => runOnlineSyncUnlocked(options));
+}
+
+async function runOnlineSyncUnlocked({
     rootDir,
     portsMap,
     targetIds = [],
@@ -122,7 +156,7 @@ export async function runOnlineSyncInBackground({
     const cfgPath = path.resolve(rootDir, 'config.json');
 
     try {
-        const sync = await syncOnlineRuntimesNow({
+        const sync = await syncOnlineRuntimesUnlocked({
             rootDir,
             portsMap,
             ...(opMode === 'updating' ? { forceRemoteCheckIds: ids } : {}),
