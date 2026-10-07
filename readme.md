@@ -96,6 +96,26 @@ npm run dev
 - 通过 `GET /admin/settings` 读取结果：配置状态由 `checking` 变为 `pass` 或 `error`，失败原因见 `message`。启动失败不会恢复旧进程。
 - 必须指定已保存的配置 ID；缺失返回 `400`，不存在返回 `404`，不会重启全部配置。
 
+### 按脚本协议同步网盘账号
+
+MeowFilm 仍调用 `POST /admin/pan/sync`，请求格式保持 `{ "pans": { "<账号标识>": { ... } } }`。无需修改站源或脚本原生路由。
+
+脚本启动后自动通过只读请求识别管理协议；重启、更新替换进程时重新识别，未知类型在同步时重试。`GET /admin/settings` 的配置项 `scriptType` 返回：
+
+- `website-v1`：通过 `/website/pans/list` 识别，账号同步前检查对应原生读取接口，再调用 `/website/{网盘}/cookie` 或 `/account`。
+- `website-api-v1`：通过 `/website/api/credentials` 识别支持的账号字段，再调用原生 `/website/api/...` 保存接口。
+- `detecting` / `unknown`：识别中或未匹配，不向未知接口发送凭据；不影响视频脚本运行。
+
+映射定义集中在 `src/util/onlineScriptAdapters.js`，包括协议识别条件、账号标识、原生路径及字段转换。例如新协议中 `115` 对应 `pan115`，`189` 对应 `pan189`，账号字段 `username` 转为 `account`。增加其他协议只需增加对应适配定义，不按作者名或脚本文件名判断。
+
+同步规则：
+
+- 保留 CatPawRunner 内置账号的 `config.json` 保存逻辑；即使没有脚本运行也可保存。
+- 每份支持该账号的运行中脚本都通过自己的保存接口同步，不直接改脚本的 `db.json`。一个脚本失败不会阻止其他脚本保存。
+- 两种已适配协议均没有可直接导入本项目 `139 authorization`、`quark_tv` 或 `uc_tv` 的 `refresh_token + device_id` 的兼容映射，所以这些账号目前仅供内置解析使用。旧脚本的 UC-TV 扫码接口、新脚本的 `new139` 短信登录不等同于凭据导入接口，不混用。
+- 不支持的账号或缺失的原生接口跳过；保存失败、要求短信确认会明确报告，不视为同步完成。
+- 保留 `okCount` / `failCount` / `results` 返回格式，并在每个结果附加 `builtin` 和 `scripts`，区分内置保存与各配置的同步结果。计数按账号项统计，任何一次实际保存失败，该账号计入 `failCount`；全部跳过不计成功。
+
 ## 内置网盘 API
 
 这些接口主要用于：

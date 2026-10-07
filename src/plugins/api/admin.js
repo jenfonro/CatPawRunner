@@ -12,8 +12,12 @@ import {
     broadcastOnlineRuntimeMockConfig,
     broadcastOnlineRuntimeProxyConfig,
     broadcastOnlineRuntimePacketCaptureConfig,
+    getOnlineRuntimeScriptProtocol,
+    getOnlineRuntimeScriptType,
+    withOnlineRuntimeOpsLock,
 } from '../../util/onlineRuntime.js';
 import { restartOnlineConfigNow, runOnlineSyncInBackground } from '../../util/onlineConfigSyncService.js';
+import { syncOnlineScriptCredential } from '../../util/onlineScriptAdapters.js';
 
 const onlineConfigUpdateInFlightIds = new Set();
 const onlineConfigRestartInFlightIds = new Set();
@@ -163,6 +167,44 @@ function saveUcTvCredentialToConfig(rootDir, value) {
     writeJsonObjectAtomic(cfgPath, next);
 }
 
+function normalizePanSyncCredential(raw) {
+    const value = raw && typeof raw === 'object' ? raw : {};
+    const text = (v) => typeof v === 'string' ? v : '';
+    return {
+        cookie: text(value.cookie),
+        username: text(value.username),
+        password: text(value.password),
+        authorization: text(value.authorization),
+        refresh_token: text(value.refresh_token || value.refreshToken),
+        device_id: text(value.device_id || value.deviceId),
+    };
+}
+
+function syncBuiltinPanCredential(rootDir, key, value) {
+    let save;
+    let present;
+    if (key === '139') {
+        const authorization = (value.authorization || value.cookie).trim();
+        present = !!authorization;
+        save = () => save139AuthorizationToConfig(rootDir, authorization);
+    } else if (key === 'quark_tv' || key === 'uc_tv') {
+        present = !!(value.refresh_token.trim() && value.device_id.trim());
+        save = () => key === 'quark_tv' ? saveQuarkTvCredentialToConfig(rootDir, value) : saveUcTvCredentialToConfig(rootDir, value);
+    } else if (['baidu', 'quark', 'uc', '189'].includes(key)) {
+        present = !!(value.username.trim() && value.password.trim()) || (key !== '189' && !!value.cookie.trim());
+        save = () => savePanCredentialToConfig(rootDir, key, value);
+    } else {
+        return null;
+    }
+    if (!present) return { ok: true, skipped: true, message: 'empty credential' };
+    try {
+        save();
+        return { ok: true, skipped: false, message: '' };
+    } catch (error) {
+        return { ok: false, skipped: false, message: error.message || 'config save failed' };
+    }
+}
+
 function normalizeOnlineConfigsInput(body) {
     const b = body && typeof body === 'object' ? body : {};
     const v = Object.prototype.hasOwnProperty.call(b, 'onlineConfigs') ? b.onlineConfigs : undefined;
@@ -235,6 +277,7 @@ function readOnlineConfigsFromConfig(root) {
                 url,
                 name,
                 ...(id ? { id } : {}),
+                scriptType: getOnlineRuntimeScriptType(id),
                 status,
                 ...(message ? { message } : {}),
                 ...(checkedAt > 0 ? { checkedAt } : {}),
@@ -302,81 +345,6 @@ function httpGetJson(urlStr, options = {}) {
         });
         req.end();
     });
-}
-
-function httpRequestJson(urlStr, options = {}) {
-    const opts = options && typeof options === 'object' ? options : {};
-    const method = typeof opts.method === 'string' && opts.method.trim() ? opts.method.trim().toUpperCase() : 'GET';
-    const timeoutMs = Number.isFinite(Number(opts.timeoutMs)) ? Math.max(100, Math.trunc(Number(opts.timeoutMs))) : 8000;
-    const headersIn = opts.headers && typeof opts.headers === 'object' ? opts.headers : {};
-    const bodyObj = Object.prototype.hasOwnProperty.call(opts, 'body') ? opts.body : undefined;
-    const bodyText = bodyObj == null ? '' : typeof bodyObj === 'string' ? bodyObj : JSON.stringify(bodyObj);
-
-    return new Promise((resolve, reject) => {
-        let u;
-        try {
-            u = new URL(String(urlStr || ''));
-        } catch (_) {
-            reject(new Error('invalid url'));
-            return;
-        }
-        const mod = u.protocol === 'https:' ? https : http;
-        const headers = {
-            accept: 'application/json',
-            'accept-encoding': 'identity',
-            ...headersIn,
-        };
-        if (bodyText && !headers['content-type'] && !headers['Content-Type']) headers['content-type'] = 'application/json';
-        if (bodyText) headers['content-length'] = Buffer.byteLength(bodyText, 'utf8');
-
-        const req = mod.request(
-            {
-                method,
-                hostname: u.hostname,
-                port: u.port || (u.protocol === 'https:' ? 443 : 80),
-                path: `${u.pathname || '/'}${u.search || ''}`,
-                headers,
-            },
-            (res) => {
-                const status = res ? Number(res.statusCode || 0) : 0;
-                const chunks = [];
-                res.on('data', (c) => chunks.push(c));
-                res.on('end', () => {
-                    try {
-                        const text = Buffer.concat(chunks).toString('utf8');
-                        const parsed = text && text.trim() ? JSON.parse(text) : null;
-                        resolve({ status, data: parsed, raw: text });
-                    } catch (e) {
-                        resolve({ status, data: null, raw: '' });
-                    }
-                });
-            }
-        );
-        req.on('error', reject);
-        req.setTimeout(timeoutMs, () => {
-            try {
-                req.destroy(new Error('timeout'));
-            } catch (_) {}
-        });
-        if (bodyText && method !== 'GET' && method !== 'HEAD') req.end(bodyText);
-        else req.end();
-    });
-}
-
-function unwrapWebsiteResp(raw) {
-    const obj = raw && typeof raw === 'object' ? raw : null;
-    if (!obj) return { ok: false, data: null, message: 'empty response' };
-    if (Object.prototype.hasOwnProperty.call(obj, 'code')) {
-        const code = Number(obj.code);
-        if (code === 0) return { ok: true, data: obj.data, message: '' };
-        const msg = obj.message || obj.desc || `code=${String(obj.code)}`;
-        return { ok: false, data: obj.data, message: String(msg || '') };
-    }
-    if (Object.prototype.hasOwnProperty.call(obj, 'success')) {
-        const ok = !!obj.success;
-        return { ok, data: obj, message: ok ? '' : String(obj.message || 'failed') };
-    }
-    return { ok: true, data: obj, message: '' };
 }
 
 async function handleAdminFullConfig(fastify, reply) {
@@ -796,225 +764,47 @@ export const apiPlugins = [
                 return handleAdminFullConfig(fastify, reply);
             });
 
-            // Sync pan credentials from MeowFilm into the running online runtime(s).
-            // Payload: { pans: { [key]: { cookie? } | { username?, password? } | { refresh_token?, device_id? } } }
+            // Builtin credentials stay in our config; script credentials are saved
+            // exclusively through each protocol's native management endpoints.
             fastify.post('/pan/sync', async function (request, reply) {
-                const ports =
-                    fastify && fastify.onlineRuntimePorts && typeof fastify.onlineRuntimePorts.entries === 'function'
-                        ? Array.from(fastify.onlineRuntimePorts.entries())
-                        : [];
-                if (!ports.length) return reply.send({ success: true, okCount: 0, failCount: 0, results: [] });
-
-                const body = request && request.body && typeof request.body === 'object' ? request.body : {};
-                const store =
-                    body && typeof body.pans === 'object' && body.pans && !Array.isArray(body.pans)
-                        ? body.pans
-                        : body && typeof body.settings === 'object' && body.settings && !Array.isArray(body.settings)
-                          ? body.settings
-                          : {};
-                const keys = Object.keys(store || {}).filter(Boolean);
-                if (!keys.length) return reply.send({ success: true, okCount: 0, failCount: 0, results: [] });
-
-                // Build a panKey -> runtime map using `/website/pans/list` for deterministic routing.
-                const panKeyToRuntime = new Map();
-                for (const [runtimeIdRaw, portRaw] of ports) {
-                    const runtimeId = String(runtimeIdRaw || '').trim();
-                    const port = Number(portRaw || 0);
-                    if (!runtimeId || !Number.isFinite(port) || port <= 0) continue;
-                    let resp;
-                    try {
-                        resp = await httpGetJson(`http://127.0.0.1:${port}/website/pans/list`, { timeoutMs: 6000 });
-                    } catch (_) {
-                        continue;
+                const result = await withOnlineRuntimeOpsLock(async () => {
+                    const body = request.body && typeof request.body === 'object' ? request.body : {};
+                    const raw = body.pans || body.settings;
+                    const store = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+                    const keys = Object.keys(store).filter(Boolean);
+                    const rootDir = resolveRuntimeRootDir();
+                    const ports = fastify.onlineRuntimePorts ? Array.from(fastify.onlineRuntimePorts.entries()) : [];
+                    const runtimes = keys.length ? await Promise.all(ports.map(async ([runtimeId, port]) => ({
+                        runtimeId, port, protocol: await getOnlineRuntimeScriptProtocol(runtimeId, port),
+                    }))) : [];
+                    const results = [];
+                    let okCount = 0;
+                    let failCount = 0;
+                    for (const key of keys) {
+                        const value = normalizePanSyncCredential(store[key]);
+                        const builtin = syncBuiltinPanCredential(rootDir, key, value);
+                        const scripts = await Promise.all(runtimes.map(async ({ runtimeId, port, protocol }) => ({
+                            runtimeId,
+                            scriptType: protocol.type,
+                            ...await syncOnlineScriptCredential({ port, protocol, key, value }),
+                        })));
+                        const failed = builtin?.ok === false || scripts.some((item) => !item.ok);
+                        const saved = (builtin?.ok && !builtin.skipped) || scripts.some((item) => item.ok && !item.skipped);
+                        const errors = scripts.filter((item) => !item.ok).map((item) => `${item.runtimeId}: ${item.message}`);
+                        if (builtin?.ok === false) errors.unshift(builtin.message);
+                        if (failed) failCount += 1;
+                        else if (saved) okCount += 1;
+                        results.push({
+                            key, ok: !failed, skipped: !failed && !saved,
+                            message: errors.join('; ') || (saved ? '' : '没有可同步的账号或脚本保存接口'),
+                            builtin, scripts,
+                        });
                     }
-                    const unwrapped = unwrapWebsiteResp(resp);
-                    const list = Array.isArray(unwrapped.data)
-                        ? unwrapped.data
-                        : unwrapped.data && typeof unwrapped.data === 'object' && Array.isArray(unwrapped.data.list)
-                          ? unwrapped.data.list
-                          : [];
-                    list.forEach((it) => {
-                        if (!it || typeof it !== 'object') return;
-                        const key = typeof it.key === 'string' ? it.key.trim() : '';
-                        if (!key || panKeyToRuntime.has(key)) return;
-                        panKeyToRuntime.set(key, { runtimeId, port });
-                    });
-                }
-
-                const results = [];
-                let okCount = 0;
-                let failCount = 0;
-
-                for (const keyRaw of keys) {
-                    const key = String(keyRaw || '').trim();
-                    if (!key) continue;
-                    const websiteKey = key === '189' ? 'tianyi' : key;
-                    const val = store && typeof store[key] === 'object' && store[key] ? store[key] : {};
-                    const cookie = typeof val.cookie === 'string' ? val.cookie : '';
-                    const authorization = typeof val.authorization === 'string' ? val.authorization : '';
-                    const username = typeof val.username === 'string' ? val.username : '';
-                    const password = typeof val.password === 'string' ? val.password : '';
-                    const refreshToken =
-                        typeof val.refresh_token === 'string'
-                            ? val.refresh_token
-                            : typeof val.refreshToken === 'string'
-                              ? val.refreshToken
-                              : '';
-                    const deviceId =
-                        typeof val.device_id === 'string'
-                            ? val.device_id
-                            : typeof val.deviceId === 'string'
-                              ? val.deviceId
-                              : '';
-
-                    // Builtin 139 (移动云盘/和彩云) resolver:
-                    // - not managed by `/website/{key}/...` routes
-                    // - persisted into config.json so `/api/139/play` can read it.
-                    if (key === '139') {
-                        const nextAuth = (authorization || cookie || '').trim();
-                        if (!nextAuth) {
-                            results.push({ key, ok: true, skipped: true, message: 'empty credential' });
-                            continue;
-                        }
-                        try {
-                            save139AuthorizationToConfig(resolveRuntimeRootDir(), nextAuth);
-                            okCount += 1;
-                            results.push({ key, ok: true, skipped: false, message: '' });
-                        } catch (e) {
-                            failCount += 1;
-                            const msg = e && e.message ? String(e.message) : 'save failed';
-                            results.push({ key, ok: false, skipped: false, message: msg });
-                        }
-                        continue;
-                    }
-
-                    // Builtin QuarkTV/UCTV (open-api-drive) resolver:
-                    // - not managed by `/website/{key}/...` routes
-                    // - persisted into config.json under account.{quark_tv|uc_tv} so `/api/{quark|uc}/*` can read it.
-                    if (key === 'quark_tv') {
-                        const rt = String(refreshToken || '').trim();
-                        const dev = String(deviceId || '').trim();
-                        if (!rt || !dev) {
-                            results.push({ key, ok: true, skipped: true, message: 'empty credential' });
-                            continue;
-                        }
-                        try {
-                            saveQuarkTvCredentialToConfig(resolveRuntimeRootDir(), { refresh_token: rt, device_id: dev });
-                            okCount += 1;
-                            results.push({ key, ok: true, skipped: false, message: '' });
-                        } catch (e) {
-                            failCount += 1;
-                            const msg = e && e.message ? String(e.message) : 'save failed';
-                            results.push({ key, ok: false, skipped: false, message: msg });
-                        }
-                        continue;
-                    }
-
-                    if (key === 'uc_tv') {
-                        const rt = String(refreshToken || '').trim();
-                        const dev = String(deviceId || '').trim();
-                        if (!rt || !dev) {
-                            results.push({ key, ok: true, skipped: true, message: 'empty credential' });
-                            continue;
-                        }
-                        try {
-                            saveUcTvCredentialToConfig(resolveRuntimeRootDir(), { refresh_token: rt, device_id: dev });
-                            okCount += 1;
-                            results.push({ key, ok: true, skipped: false, message: '' });
-                        } catch (e) {
-                            failCount += 1;
-                            const msg = e && e.message ? String(e.message) : 'save failed';
-                            results.push({ key, ok: false, skipped: false, message: msg });
-                        }
-                        continue;
-                    }
-
-                    // Builtin baidu/quark/uc credentials are read from config.json; online scripts still use db.json.
-                    if (key === 'baidu' || key === 'quark' || key === 'uc') {
-                        const hasCredential = !!((username && password) || cookie);
-                        if (!hasCredential) {
-                            results.push({ key, ok: true, skipped: true, message: 'empty credential' });
-                            continue;
-                        }
-                        // Best-effort write config.json first; final status still depends on both.
-                        // (Do not early-return here; keep `/website/{key}/{cookie|account}` sync for db.json.)
-                    }
-
-                    const type =
-                        key === '189' ? 'account' : username && password ? 'account' : cookie ? 'cookie' : '';
-                    if (!type) {
-                        results.push({ key, ok: true, skipped: true, message: 'empty credential' });
-                        continue;
-                    }
-                    if (key === '189' && !(username && password)) {
-                        results.push({ key, ok: true, skipped: true, message: 'empty credential' });
-                        continue;
-                    }
-
-                    const preferred = panKeyToRuntime.has(websiteKey) ? [panKeyToRuntime.get(websiteKey)] : [];
-                    const candidates = preferred.length
-                        ? preferred
-                        : ports
-                              .map(([rid, p]) => ({ runtimeId: String(rid || '').trim(), port: Number(p || 0) }))
-                              .filter((r) => r.runtimeId && Number.isFinite(r.port) && r.port > 0);
-
-                    let lastErr = '';
-                    let saved = false;
-
-                    // For builtin baidu/quark/uc/189: persist to config.json, but still sync to website for db.json.
-                    let configOk = true;
-                    let configErr = '';
-                    if (key === 'baidu' || key === 'quark' || key === 'uc' || key === '189') {
-                        try {
-                            savePanCredentialToConfig(resolveRuntimeRootDir(), key, { cookie, username, password });
-                        } catch (e) {
-                            configOk = false;
-                            configErr = e && e.message ? String(e.message) : 'config save failed';
-                        }
-                    }
-
-                    for (const r of candidates) {
-                        const endpoint = `http://127.0.0.1:${r.port}/website/${encodeURIComponent(websiteKey)}/${type}`;
-                        const payload =
-                            key === '189' ? { username, password } : type === 'account' ? { username, password } : { cookie };
-                        let out;
-                        try {
-                            // eslint-disable-next-line no-await-in-loop
-                            out = await httpRequestJson(endpoint, { method: 'PUT', body: payload, timeoutMs: 12000 });
-                        } catch (e) {
-                            lastErr = e && e.message ? String(e.message) : 'request failed';
-                            continue;
-                        }
-                        if (!out || !(out.status >= 200 && out.status < 300)) {
-                            lastErr = `http ${out && out.status ? out.status : 'unknown'}`;
-                            continue;
-                        }
-                        const unwrapped = unwrapWebsiteResp(out.data);
-                        if (unwrapped.ok) {
-                            saved = true;
-                            break;
-                        }
-                        lastErr = unwrapped.message || 'save failed';
-                    }
-
-                    if (saved && configOk) {
-                        okCount += 1;
-                        results.push({ key, ok: true, skipped: false, message: '' });
-                    } else {
-                        failCount += 1;
-                        const msg = !configOk ? configErr || 'config save failed' : lastErr || 'save failed';
-                        results.push({ key, ok: false, skipped: false, message: msg });
-                    }
-                }
-
-
-                return reply.send({
-                    success: true,
-                    okCount,
-                    failCount,
-                    results,
+                    return { success: true, okCount, failCount, results };
                 });
+                return reply.send(result);
             });
+
         },
     },
 ];

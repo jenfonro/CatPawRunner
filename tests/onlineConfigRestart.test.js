@@ -9,7 +9,7 @@ import { createRequire } from 'node:module';
 import adminPlugins from '../src/plugins/api/admin.js';
 import { applyOnlineConfigs, readJsonObjectSafe, writeJsonObjectAtomic } from '../src/util/onlineConfigStore.js';
 import { restartOnlineConfigNow, runOnlineSyncInBackground } from '../src/util/onlineConfigSyncService.js';
-import { stopOnlineRuntimeAndWait, withOnlineRuntimeOpsLock } from '../src/util/onlineRuntime.js';
+import { getOnlineRuntimeScriptProtocol, getOnlineRuntimeScriptType, startOnlineRuntime, stopOnlineRuntimeAndWait, withOnlineRuntimeOpsLock } from '../src/util/onlineRuntime.js';
 
 const waitFor = async (check) => {
     for (let n = 0; n < 200; n += 1) {
@@ -30,6 +30,7 @@ const script = `globalThis.start = async function () {
     globalThis.server = require(${JSON.stringify(fastifyPath)})();
     globalThis.server.address = () => globalThis.server.server.address();
     globalThis.server.get('/full-config', async () => ({ pid: process.pid, previousPidAlive, video: { sites: [] } }));
+    globalThis.server.get('/website/pans/list', async () => ({ code: 0, data: [] }));
     await globalThis.server.listen({ port: Number(process.env.PORT), host: '127.0.0.1' });
 };`;
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (_) { return false; } };
@@ -166,6 +167,30 @@ test('manual config restart is cold, status-independent and isolated', { timeout
             assert.notEqual(await pidFor(ids[0]), oldPid);
             assert.equal((await runtimeFor(ids[0])).previousPidAlive, false);
             assert.equal(await pidFor(ids[1]), otherPid);
+        });
+
+        await t.test('protocol is detected on load and refreshed on replacement; failed hot swap retains it', async () => {
+            assert.equal((await getOnlineRuntimeScriptProtocol(ids[0], portsMap.get(ids[0]))).type, 'website-v1');
+            const modernScript = script.replace(
+                "globalThis.server.get('/website/pans/list', async () => ({ code: 0, data: [] }));",
+                "globalThis.server.get('/website/api/credentials', async () => ({ code: 0, data: { quark: { cookie: '' } } }));"
+            );
+            fs.writeFileSync(entry, modernScript);
+            assert.equal((await restartOnlineConfigNow({ rootDir, portsMap, id: ids[0] })).ok, true);
+            assert.equal((await getOnlineRuntimeScriptProtocol(ids[0], portsMap.get(ids[0]))).type, 'website-api-v1');
+            assert.equal(getOnlineRuntimeScriptType(ids[1]), 'website-v1');
+            const settings = (await app.inject({ method: 'GET', url: '/admin/settings' })).json();
+            assert.equal(settings.onlineConfigs.find((row) => row.id === ids[0]).scriptType, 'website-api-v1');
+
+            const broken = path.join(path.dirname(entry), 'broken.cjs');
+            fs.writeFileSync(broken, 'process.exit(8)');
+            const hot = await withOnlineRuntimeOpsLock(() => startOnlineRuntime({
+                id: ids[0], port: portsMap.get(ids[0]), entry: broken, forceRestart: true,
+            }));
+            assert.equal(hot.started, false);
+            assert.equal(getOnlineRuntimeScriptType(ids[0]), 'website-api-v1');
+            await stopOnlineRuntimeAndWait(ids[0]);
+            assert.equal(getOnlineRuntimeScriptType(ids[0]), 'unknown');
         });
     } finally {
         await withOnlineRuntimeOpsLock(async () => { for (const id of ids) await stopOnlineRuntimeAndWait(id); });

@@ -3,6 +3,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import http from 'node:http';
 import { findAvailablePortInRange } from './tool.js';
+import { detectOnlineScriptProtocol } from './onlineScriptAdapters.js';
 
 const children = new Map(); // id -> { child, entry, entryFn, port, startedAt, healthFailures }
 const starting = new Map(); // id -> Promise<startResult>
@@ -5205,6 +5206,12 @@ export async function startOnlineRuntime({
                     startedAt: Date.now(),
                     healthFailures: 0,
                 });
+                const current = children.get(key);
+                current.scriptType = 'detecting';
+                current.scriptProtocol = detectOnlineScriptProtocol(ready.port).then((protocol) => {
+                    current.scriptType = protocol.type;
+                    return protocol;
+                });
                 upstreamOrigins.delete(key);
                 try {
                     if (oldChild) oldChild.kill();
@@ -5325,6 +5332,23 @@ export function setOnlineRuntimeEntry(id = 'default', entry = '') {
     } catch (_) {
         return false;
     }
+}
+
+export function getOnlineRuntimeScriptType(id) {
+    return children.get(id)?.scriptType || 'unknown';
+}
+
+export async function getOnlineRuntimeScriptProtocol(id, port) {
+    const current = children.get(id);
+    if (!current || current.port !== port) return detectOnlineScriptProtocol(port);
+    const protocol = await current.scriptProtocol;
+    if (protocol && protocol.type !== 'unknown') return protocol;
+    // A script may not have exposed its management routes at the initial probe.
+    current.scriptProtocol = detectOnlineScriptProtocol(port).then((next) => {
+        current.scriptType = next.type;
+        return next;
+    });
+    return current.scriptProtocol;
 }
 
 export function stopOnlineRuntime(id = 'default') {
