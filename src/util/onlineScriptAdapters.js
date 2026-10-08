@@ -68,12 +68,30 @@ async function request(port, path, method = 'GET', body) {
     }
 }
 
-function responseState(response) {
+function responseMessage(data, credentials) {
+    if (!isObject(data)) return '';
+    let message = [data.message, data.msg, data.desc].find((value) => typeof value === 'string' && value.trim()) || '';
+    // Native errors may echo submitted values. Expose a bounded diagnostic, not
+    // credentials, stack traces, or the full response/request object.
+    const secrets = Object.values(credentials || {})
+        .filter((value) => typeof value === 'string' && value)
+        .flatMap((value) => [value, value.trim(), JSON.stringify(value).slice(1, -1)])
+        .filter(Boolean)
+        .sort((a, b) => b.length - a.length);
+    for (const secret of new Set(secrets)) message = message.split(secret).join('[redacted]');
+    return message.replace(/\s+/g, ' ').trim().slice(0, 500);
+}
+
+function responseState(response, credentials) {
     const { status, data } = response;
-    if (!(status >= 200 && status < 300)) return { ok: false, message: response.error || `HTTP ${status}` };
+    const message = responseMessage(data, credentials);
+    if (!(status >= 200 && status < 300)) {
+        const reason = response.error || `HTTP ${status}`;
+        return { ok: false, message: message ? `${reason}: ${message}` : reason };
+    }
     if (!isObject(data)) return { ok: false, message: 'invalid script response' };
     const success = Object.prototype.hasOwnProperty.call(data, 'code') ? data.code === 0 || data.code === '0' : data.success === true;
-    if (!success) return { ok: false, message: String(data.message || data.msg || data.desc || 'script save failed') };
+    if (!success) return { ok: false, message: message || 'script save failed' };
     if (data.sms || data.status === 'waiting') {
         return { ok: false, message: '请到原脚本管理页面完成短信验证或登录确认' };
     }
@@ -111,13 +129,13 @@ export async function syncOnlineScriptCredential({ port, protocol, key, value })
         // Verify the native read endpoint before sending any credentials.
         const probe = await request(port, rule.path);
         if (probe.status === 404 || probe.status === 405) return skip('脚本未提供此账号保存接口');
-        const state = responseState(probe);
+        const state = responseState(probe, value);
         if (!state.ok) return { ...state, skipped: false };
         const data = probe.data.data;
         const compatible = sourceFields.length === 1 ? typeof data === 'string' : hasFields(data, ['username', 'password']);
         if (!compatible) return skip('脚本账号接口格式不兼容');
     }
     const body = Object.fromEntries(Object.entries(rule.fields).map(([target, source]) => [target, value[source]]));
-    const result = responseState(await request(port, rule.path, 'PUT', body));
+    const result = responseState(await request(port, rule.path, 'PUT', body), value);
     return { ...result, skipped: false };
 }

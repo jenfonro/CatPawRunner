@@ -152,6 +152,81 @@ test('sync dispatches each credential to every compatible native script API', as
             legacy.overrides.clear();
         });
 
+        await t.test('native HTTP errors retain the login failure instead of just the status code', async () => {
+            modern.overrides.set('PUT /website/api/pan189/account', {
+                status: 500,
+                data: { statusCode: 500, error: 'Internal Server Error', message: '天翼登录失败：未获取到天翼自动登录地址' },
+            });
+            try {
+                const result = await sync({ '189': { username: 'test-user', password: 'test-pass' } });
+                assert.equal(result.success, true);
+                assert.equal(result.okCount, 0);
+                assert.equal(result.failCount, 1);
+                const item = result.results[0];
+                assert.equal(item.builtin.ok, true);
+                assert.equal(item.scripts[0].ok, true);
+                assert.equal(item.scripts[1].ok, false);
+                assert.equal(item.scripts[1].skipped, false);
+                assert.equal(item.scripts[1].message, 'HTTP 500: 天翼登录失败：未获取到天翼自动登录地址');
+                assert.match(item.message, /bbbbbbbbbb: HTTP 500: 天翼登录失败/);
+            } finally {
+                modern.overrides.clear();
+            }
+        });
+
+        await t.test('HTTP failures use only textual diagnostics and never turn a non-2xx response into success', async () => {
+            const cases = [
+                { status: 502, data: '<html>gateway failed</html>', message: 'HTTP 502' },
+                { status: 503, data: { message: { private: 'do not serialize' }, msg: '登录服务不可用' }, message: 'HTTP 503: 登录服务不可用' },
+                { status: 500, data: { code: 0, desc: '登录被拒绝' }, message: 'HTTP 500: 登录被拒绝' },
+            ];
+            try {
+                for (const { status, data, message } of cases) {
+                    modern.overrides.set('PUT /website/api/pan189/account', { status, data });
+                    const result = await sync({ '189': { username: 'test-user', password: 'test-pass' } });
+                    assert.equal(result.failCount, 1);
+                    assert.equal(result.results[0].scripts[1].ok, false);
+                    assert.equal(result.results[0].scripts[1].message, message);
+                }
+            } finally {
+                modern.overrides.clear();
+            }
+        });
+
+        await t.test('script diagnostics redact submitted credentials and remain bounded', async () => {
+            try {
+                for (const status of [200, 500]) {
+                    modern.overrides.set('PUT /website/api/pan189/account', {
+                        status,
+                        data: {
+                            code: -1,
+                            message: `账号=test-user 密码=test-pass\n${'diagnostic '.repeat(100)}`,
+                            stack: 'private-stack-content',
+                            config: { data: { account: 'test-user', password: 'test-pass' } },
+                        },
+                    });
+                    const result = await sync({ '189': { username: 'test-user', password: 'test-pass' } });
+                    const message = result.results[0].scripts[1].message;
+                    assert.equal(result.failCount, 1);
+                    assert.match(message, /账号=\[redacted\] 密码=\[redacted\]/);
+                    assert.doesNotMatch(message, /[\r\n]/);
+                    assert.ok(message.length <= 512);
+                    assert.doesNotMatch(JSON.stringify(result), /test-user|test-pass|private-stack-content/);
+                }
+                legacy.overrides.set('PUT /website/quark/cookie', {
+                    status: 500,
+                    data: { message: 'save failed for cookie=test-quark-cookie' },
+                });
+                const result = await sync({ quark: { cookie: 'test-quark-cookie' } });
+                assert.equal(result.results[0].scripts[0].message, 'HTTP 500: save failed for cookie=[redacted]');
+                assert.equal(result.results[0].scripts[1].ok, true);
+                assert.doesNotMatch(JSON.stringify(result), /test-quark-cookie/);
+            } finally {
+                legacy.overrides.clear();
+                modern.overrides.clear();
+            }
+        });
+
         await t.test('HTML success, malformed success codes and SMS confirmation are not successful saves', async () => {
             for (const data of ['<html>error</html>', { code: null }, { code: -1, msg: 'refused' }, { code: 0, sms: true, msg: 'enter SMS' }]) {
                 modern.overrides.set('PUT /website/api/pan189/account', { data });
