@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { legacySpiderDataAdapter, panServiceSpiderDataAdapter } from './spiderDataAdapters.js';
 
 const cookie = (path, field = 'cookie') => ({ path, fields: { [field]: 'cookie' } });
 const account = (path, field = 'username') => ({ path, fields: { [field]: 'username', password: 'password' } });
@@ -10,6 +11,7 @@ const hasFields = (value, fields) => isObject(value) && fields.every((field) => 
 const adapters = [
     {
         type: 'website-v1',
+        dataAdapter: legacySpiderDataAdapter,
         probe: '/website/pans/list',
         identify: (data) => {
             const list = Array.isArray(data) ? data : data?.list;
@@ -30,6 +32,7 @@ const adapters = [
     },
     {
         type: 'website-api-v1',
+        dataAdapter: panServiceSpiderDataAdapter,
         probe: '/website/api/credentials',
         identify: (data) => isObject(data) && (
             hasFields(data.quark, ['cookie']) || hasFields(data.uc, ['cookie']) ||
@@ -47,6 +50,13 @@ const adapters = [
         },
     },
 ];
+
+// Credential and data adaptation share protocol discovery. Never identify a
+// protocol from an author, filename, runtime ID or a site name.
+export function getOnlineScriptDataAdapter(protocol) {
+    const type = typeof protocol === 'string' ? protocol : protocol?.type;
+    return adapters.find((adapter) => adapter.type === type)?.dataAdapter || legacySpiderDataAdapter;
+}
 
 async function request(port, path, method = 'GET', body) {
     try {
