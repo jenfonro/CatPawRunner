@@ -50,13 +50,12 @@ export function isEligibleSpiderCacheRequest(method, forwardPath) {
     return isSpiderCacheRoutePath(pathName);
 }
 
-export function buildSpiderCacheKey({ runtimeId, forwardPath, method, body, context }) {
+export function buildSpiderCacheKey({ runtimeId, forwardPath, method, body }) {
     const rid = String(runtimeId || '').trim().toLowerCase();
     const pathName = trimPathQuery(forwardPath);
     const m = String(method || '').trim().toUpperCase();
     const payload = normalizePayloadForCache(body);
-    const scope = context === undefined ? '' : `|${normalizePayloadForCache(context)}`;
-    return `${rid}|${m}|${pathName}|${payload}${scope}`;
+    return `${rid}|${m}|${pathName}|${payload}`;
 }
 
 export function getSpiderCache(key) {

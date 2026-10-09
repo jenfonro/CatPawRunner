@@ -6,7 +6,6 @@ import { findAvailablePortInRange } from './tool.js';
 import { detectOnlineScriptProtocol } from './onlineScriptAdapters.js';
 
 const children = new Map(); // id -> { child, entry, entryFn, port, startedAt, healthFailures }
-let runtimeGeneration = 0;
 const starting = new Map(); // id -> Promise<startResult>
 const runtimeEntries = new Map(); // id -> { entry, entryFn }
 const upstreamOrigins = new Map(); // runtimeId -> Map<siteKey, origin>
@@ -752,11 +751,17 @@ export async function startOnlineRuntime({
 		      };
 		    } catch (_) {}
 		  } catch (_) {}
-				  // Installed inside the interceptor scope below. The factory
-				  // cannot directly reference that try block's lexical bindings.
-				  let __withSiteContext = (req, res, handle) => handle(req, res);
 				  globalThis.catServerFactory = (handle) => {
-				    const srv = http.createServer((req, res) => __withSiteContext(req, res, handle));
+				    const wrapped = (req, res) => {
+				      try {
+				        const site = __extractSiteFromReqUrl(req && req.url ? req.url : '');
+				        if (__siteAls && typeof __siteAls.run === 'function') {
+				          return __siteAls.run({ site }, () => handle(req, res));
+				        }
+				      } catch (_) {}
+				      return handle(req, res);
+				    };
+				    const srv = http.createServer((req, res) => wrapped(req, res));
 				    __stage('server_factory');
 				    try {
 				      srv.on('listening', () => {
@@ -989,15 +994,6 @@ export async function startOnlineRuntime({
 			      }
 			    };
 
-				    __withSiteContext = (req, res, handle) => {
-				      const site = __extractSiteFromReqUrl(req && req.url ? req.url : '');
-				      const mode = req && req.headers ? req.headers['x-catpaw-pan-mock'] : '';
-				      const panMock = mode === '1' ? true : mode === '0' ? false : !!__mockState.enabled;
-				      if (req && req.headers) delete req.headers['x-catpaw-pan-mock'];
-				      if (__siteAls) return __siteAls.run({ site, panMock }, () => handle(req, res));
-				      return handle(req, res);
-				    };
-
 				    const __isLocalHostForProxy = (hostLike) => {
 				      try {
 				        const h = String(hostLike || '').trim().toLowerCase();
@@ -1092,8 +1088,6 @@ export async function startOnlineRuntime({
 			    };
 			    const __mockEnabled = () => {
 			      try {
-			        const st = __siteAls && typeof __siteAls.getStore === 'function' ? __siteAls.getStore() : null;
-			        if (st && typeof st.panMock === 'boolean') return st.panMock;
 			        return !!(__mockState && __mockState.enabled);
 			      } catch (_) {
 			        return false;
@@ -2347,9 +2341,9 @@ export async function startOnlineRuntime({
 				        const parseOutlinkReq = () => {
 				          try {
 				            const parsedBody = __tryParseJson(bodyLike);
-				            const plainJson = !!(parsedBody && typeof parsedBody === 'object' && parsedBody.getOutLinkInfoReq);
 				            const enc = typeof parsedBody === 'string' ? parsedBody : typeof bodyLike === 'string' ? bodyLike.trim() : '';
-				            const obj = plainJson ? parsedBody : __tryParseJson(__aesDec(enc)) || {};
+				            const dec = __aesDec(enc);
+				            const obj = __tryParseJson(dec) || {};
 				            const req = obj && typeof obj === 'object' ? obj.getOutLinkInfoReq : null;
 				            const linkID = req && typeof req === 'object' ? String(req.linkID || '').trim() : '';
 				            const pCaID = req && typeof req === 'object' ? String(req.pCaID || '').trim() : '';
@@ -2357,14 +2351,14 @@ export async function startOnlineRuntime({
 				              req && typeof req === 'object'
 				                ? String(req.passwd || req.passwdStr || req.password || req.pwd || '').trim()
 				                : '';
-				            return { linkID, pCaID, passwd, plainJson };
+				            return { linkID, pCaID, passwd };
 				          } catch (_) {
 				            return { linkID: '', pCaID: '', passwd: '' };
 				          }
 				        };
 
 				        if (isOutLinkInfo) {
-				          const { linkID, pCaID, passwd, plainJson } = parseOutlinkReq();
+				          const { linkID, pCaID, passwd } = parseOutlinkReq();
 				          try {
 				            const k = String(linkID || '').trim();
 				            if (k) __placeholderCache['139'].set(k, { shareCode: k, password: String(passwd || '').trim() });
@@ -2384,21 +2378,17 @@ export async function startOnlineRuntime({
 				            code: 0,
 				            message: 'ok',
 				            data: {
-				              caLst: [],
+				              caLst: null,
 				              coLst: [
 				                {
 				                  coType: 3,
 				                  coName: __mkPlaceholderFileName('139', linkID || 'link', String(passwd || '').trim()),
 				                  coID,
-				                  path: coID,
 				                  coSize: 874 * 1024 * 1024,
 				                },
 				              ],
 				            },
 				          };
-				          // Match the wire protocol, not the script/site: newer
-				          // clients post plain JSON, older clients use AES-CBC.
-				          if (plainJson) return { kind: 'outlink_info', payload: JSON.stringify(outObj) };
 				          const enc = __aesEnc(JSON.stringify(outObj));
 				          return { kind: 'outlink_info', payload: JSON.stringify(enc) };
 				        }
@@ -2635,10 +2625,8 @@ export async function startOnlineRuntime({
 				        const isShareInfo = pathLike.startsWith('/api/open/share/getShareInfoByCodeV2.action');
 				        const isListDir = pathLike.startsWith('/api/open/share/listShareDir.action');
 
-				        const rawShareCode = qp('shareCode') || '';
-				        const combinedCode = /^([A-Za-z0-9]+)[（(](?:访问码|提取码|密码)[:：]([A-Za-z0-9]+)[）)]$/.exec(rawShareCode);
-				        const shareCode = combinedCode ? combinedCode[1] : rawShareCode;
-				        const accessCodeQ = qp('accessCode') || qp('accesscode') || (combinedCode ? combinedCode[2] : '');
+				        const shareCode = qp('shareCode') || '';
+				        const accessCodeQ = qp('accessCode') || qp('accesscode') || '';
 				        if (shareCode) {
 				          try { __placeholderCache.tianyi.set(String(shareCode), { shareCode: String(shareCode), password: String(accessCodeQ || '') }); } catch (_) {}
 				        }
@@ -3812,9 +3800,7 @@ export async function startOnlineRuntime({
 	                  try { if (cb3) process.nextTick(cb3); } catch (_) {}
 	                  return true;
 	                }
-	                // An in-memory response has no idle socket. Registering a
-	                // timeout callback must not immediately report a timeout.
-	                setTimeout(_ms, _cb) { if (typeof _cb === 'function') this.once('timeout', _cb); return this; }
+	                setTimeout(_ms, _cb) { try { if (typeof _cb === 'function') process.nextTick(_cb); } catch (_) {} return this; }
 	                setHeader() { return; }
 	                getHeader() { return undefined; }
 	                removeHeader() { return; }
@@ -5091,7 +5077,6 @@ export async function startOnlineRuntime({
                         const packetCaptureCfg = readPacketCaptureConfigFromRuntimeRoot(rootDir);
 				        const resolvedEntryFn = typeof entryFn === 'string' ? entryFn.trim() : '';
 				        const child = spawn(process.execPath, [bootstrapPath], {
-				            windowsHide: true,
 				            stdio,
 				            cwd: rootDir,
 				            env: {
@@ -5219,7 +5204,6 @@ export async function startOnlineRuntime({
                     entryFn: typeof entryFn === 'string' ? entryFn.trim() : '',
                     port: ready.port,
                     startedAt: Date.now(),
-                    cacheIdentity: ++runtimeGeneration,
                     healthFailures: 0,
                 });
                 const current = children.get(key);
@@ -5352,11 +5336,6 @@ export function setOnlineRuntimeEntry(id = 'default', entry = '') {
 
 export function getOnlineRuntimeScriptType(id) {
     return children.get(id)?.scriptType || 'unknown';
-}
-
-export function getOnlineRuntimeCacheIdentity(id, port) {
-    const current = children.get(id);
-    return current && current.port === port ? String(current.cacheIdentity) : '';
 }
 
 export async function getOnlineRuntimeScriptProtocol(id, port) {

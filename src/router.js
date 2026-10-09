@@ -10,9 +10,9 @@ import {
     getOrCreateSpiderCache,
     isEligibleSpiderCacheRequest,
 } from './util/runtimeSpiderCache.js';
-import { parseSpiderOperation } from './util/spiderDataAdapters.js';
-import { getOnlineScriptDataAdapter } from './util/onlineScriptAdapters.js';
-import { getOnlineRuntimeCacheIdentity, getOnlineRuntimeScriptProtocol, getOnlineRuntimeUpstreamOrigin } from './util/onlineRuntime.js';
+import { rewritePanmockDetailPayloadFields } from './util/panmockDetailCodec.js';
+import { isSpiderCacheRoutePath } from './util/spiderRouteMatcher.js';
+import { getOnlineRuntimeUpstreamOrigin } from './util/onlineRuntime.js';
 
 const spiderPrefix = '/spider';
 
@@ -340,6 +340,18 @@ function cloneHeaders(headers, hopByHop) {
     return outHeaders;
 }
 
+function rewritePanmockDetailPayload(parsed) {
+    if (!parsed || typeof parsed !== 'object') return parsed;
+    if (!parsed.pan_mock) return parsed;
+    const list = Array.isArray(parsed.list) ? parsed.list : null;
+    if (!list || !list.length || !list[0] || typeof list[0] !== 'object') return parsed;
+    const first = { ...list[0] };
+    const rewritten = rewritePanmockDetailPayloadFields(first.vod_play_from, first.vod_play_url);
+    first.vod_play_from = rewritten.vod_play_from;
+    first.vod_play_url = rewritten.vod_play_url;
+    return { ...parsed, list: [first, ...list.slice(1)] };
+}
+
 const spiderBaseOriginByKey = new Map();
 
 function parseSpiderRouteMeta(forwardPath) {
@@ -518,31 +530,31 @@ function rewriteSpiderVodPicFields(parsed, forwardPath, runtimeId = '') {
     return changed ? { ...parsed, list: nextList } : parsed;
 }
 
-function rewriteSpiderJsonResponse(parsed, { dataAdapter, spiderContext, cacheHit, forwardPath = '', runtimeId = '' }) {
+function rewriteSpiderJsonResponse(parsed, { isDetail, cacheHit, forwardPath = '', runtimeId = '' }) {
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
-    if (parsed.ok === false || parsed.success === false || parsed.error) return null;
-    let next = dataAdapter.response(parsed, spiderContext);
-    if (spiderContext.operation !== 'play') {
-        next = rewriteSpiderVodPicFields({ ...next, cache: !!cacheHit }, forwardPath, runtimeId);
+    let next = rewriteSpiderVodPicFields({ ...parsed, cache: !!cacheHit }, forwardPath, runtimeId);
+    if (isDetail) {
+        next.pan_mock = isPanMockEnabled();
+        next = rewritePanmockDetailPayload(next);
     }
     return next;
 }
 
 function shouldTryRewriteSpiderResponse(forwardPath, responseHeaders) {
-    const operation = parseSpiderOperation(forwardPath);
-    if (!operation) return { shouldRewrite: false };
-    const contentType = String((responseHeaders && (responseHeaders['content-type'] || responseHeaders['Content-Type'])) || '').toLowerCase();
-    const encoding = String(responseHeaders?.['content-encoding'] || '').toLowerCase();
-    if (encoding && encoding !== 'identity') return { shouldRewrite: false };
+    const pathName = String(forwardPath || '').split('?')[0] || '/';
+    const isCacheRoute = isSpiderCacheRoutePath(pathName);
+    if (!isCacheRoute) return { shouldRewrite: false, isDetail: false };
+    const isDetail = /\/detail$/i.test(pathName);
+    const contentType = String((responseHeaders && (responseHeaders['content-type'] || responseHeaders['Content-Type'])) || '');
     const shouldRewrite =
-        contentType.includes('application/json') ||
-        contentType.includes('text/plain') ||
-        contentType.includes('text/json') ||
+        String(contentType || '').includes('application/json') ||
+        String(contentType || '').includes('text/plain') ||
+        String(contentType || '').includes('text/json') ||
         !contentType;
-    return { shouldRewrite };
+    return { shouldRewrite, isDetail };
 }
 
-async function fetchBufferedProxyResponse({ request, body, targetPort, pathToUse, headers, limitBytes }) {
+async function fetchBufferedProxyResponse({ request, targetPort, pathToUse, headers, limitBytes }) {
     return await new Promise((resolve, reject) => {
         const proxyReq = http.request(
             {
@@ -586,6 +598,7 @@ async function fetchBufferedProxyResponse({ request, body, targetPort, pathToUse
         proxyReq.on('error', reject);
         try {
             const method = String(request.method || 'GET').toUpperCase();
+            const body = request && Object.prototype.hasOwnProperty.call(request, 'body') ? request.body : undefined;
             if (body !== undefined && body !== null && method !== 'GET' && method !== 'HEAD') {
                 let buf = null;
                 if (Buffer.isBuffer(body) || body instanceof Uint8Array) {
@@ -612,7 +625,7 @@ async function fetchBufferedProxyResponse({ request, body, targetPort, pathToUse
     });
 }
 
-function sendBufferedProxyResponse(reply, request, response, { dataAdapter, spiderContext, cacheHit = false, forwardPath = '', runtimeId = '' } = {}) {
+function sendBufferedProxyResponse(reply, request, response, { rewriteSpider = false, cacheHit = false, forwardPath = '', runtimeId = '' } = {}) {
     const hopByHop = new Set([
         'connection',
         'keep-alive',
@@ -627,11 +640,11 @@ function sendBufferedProxyResponse(reply, request, response, { dataAdapter, spid
     let outHeaders = cloneHeaders((response && response.headers) || {}, hopByHop);
     let outBody = Buffer.isBuffer(response && response.body) ? response.body : Buffer.from(response && response.body ? response.body : '');
 
-    if (dataAdapter && spiderContext && status >= 200 && status < 300) {
+    if (rewriteSpider) {
         const parsed = parseJsonSafe(outBody.toString('utf8'));
         const rewriteMeta = shouldTryRewriteSpiderResponse(forwardPath, outHeaders);
         const next = rewriteMeta.shouldRewrite
-            ? rewriteSpiderJsonResponse(parsed, { dataAdapter, spiderContext, cacheHit, forwardPath, runtimeId })
+            ? rewriteSpiderJsonResponse(parsed, { isDetail: rewriteMeta.isDetail, cacheHit, forwardPath, runtimeId })
             : null;
         if (next) {
             outBody = Buffer.from(JSON.stringify(next), 'utf8');
@@ -931,7 +944,7 @@ export default async function router(fastify) {
         const injected = await fastify.inject({
             method: 'POST',
             url: forwardUrl,
-            headers: { ...baseHeaders, ...(tvUser ? { 'x-tv-user': tvUser } : {}) },
+            headers: baseHeaders,
             payload: forwardBody,
         });
         const parsed = parseJsonSafe(injected.payload);
@@ -1083,15 +1096,7 @@ export default async function router(fastify) {
     // This allows downloaded scripts in `custom_spider/` to expose their own routes while still being accessed from this port.
     const proxyToPort = async function (request, reply, targetPort, urlPath, runtimeId = '') {
         const pathToUse = typeof urlPath === 'string' && urlPath ? urlPath : '/';
-        const operation = parseSpiderOperation(pathToUse);
-        // Snapshot BEFORE awaiting protocol detection or fetching the script.
-        // The child uses the same mode for every pan request in this operation.
-        const spiderContext = { operation, panMock: operation ? isPanMockEnabled() : false };
-        const runtimeInstance = getOnlineRuntimeCacheIdentity(runtimeId, targetPort);
-        const protocol = operation ? await getOnlineRuntimeScriptProtocol(runtimeId, targetPort) : null;
-        const dataAdapter = operation ? getOnlineScriptDataAdapter(protocol) : null;
-        const originalBody = request && Object.prototype.hasOwnProperty.call(request, 'body') ? request.body : undefined;
-        const requestBody = dataAdapter ? dataAdapter.request(originalBody, spiderContext) : originalBody;
+        const wantInjectPanMock = /\/spider\/[^/]+\/\d+\/detail(?:\?|$)/i.test(pathToUse);
         const allowSpiderCache = isEligibleSpiderCacheRequest(request && request.method, pathToUse) && /^[a-f0-9]{10}$/i.test(String(runtimeId || '').trim());
 
         const hopByHop = new Set([
@@ -1113,10 +1118,7 @@ export default async function router(fastify) {
             headers[key] = inHeaders[k];
         });
         // If we plan to parse and rewrite JSON, disable compression from upstream.
-        if (operation) headers['accept-encoding'] = 'identity';
-        // This is an internal parent -> child header, never a client override.
-        delete headers['x-catpaw-pan-mock'];
-        if (operation) headers['x-catpaw-pan-mock'] = spiderContext.panMock ? '1' : '0';
+        if (wantInjectPanMock || allowSpiderCache) headers['accept-encoding'] = 'identity';
         headers.host = `127.0.0.1:${targetPort}`;
         // Fastify may have already consumed the incoming stream to populate `request.body`.
         // Never forward a stale Content-Length (will hang the upstream waiting for bytes).
@@ -1129,25 +1131,12 @@ export default async function router(fastify) {
                 runtimeId,
                 forwardPath: pathToUse,
                 method: request && request.method,
-                body: requestBody,
-                context: {
-                    panMock: spiderContext.panMock,
-                    dataProtocol: dataAdapter.id,
-                    runtimeInstance,
-                    targetPort,
-                    // Isolate native play tokens without retaining auth headers
-                    // in cache keys. Query parameters can also carry identity.
-                    requestScope: md5(JSON.stringify([
-                        headers['x-tv-user'] || '', headers.authorization || '',
-                        headers.cookie || '', splitRawUrl(pathToUse).query,
-                    ])),
-                },
+                body: request && Object.prototype.hasOwnProperty.call(request, 'body') ? request.body : {},
             });
             try {
                 const { hit, entry } = await getOrCreateSpiderCache(cacheKey, async () => {
                     const buffered = await fetchBufferedProxyResponse({
                         request,
-                        body: requestBody,
                         targetPort,
                         pathToUse,
                         headers: { ...headers },
@@ -1164,7 +1153,6 @@ export default async function router(fastify) {
                         parsed &&
                         typeof parsed === 'object' &&
                         !Array.isArray(parsed) &&
-                        parsed.ok !== false && parsed.success !== false && !parsed.error &&
                         bodySize <= 8 * 1024 * 1024;
                     return {
                         entry: buffered,
@@ -1174,8 +1162,7 @@ export default async function router(fastify) {
                 });
                 if (entry) {
                     sendBufferedProxyResponse(reply, request, entry, {
-                        dataAdapter,
-                        spiderContext,
+                        rewriteSpider: true,
                         cacheHit: hit,
                         forwardPath: pathToUse,
                         runtimeId,
@@ -1195,9 +1182,12 @@ export default async function router(fastify) {
                 },
                 (proxyRes) => {
                     const outHeaders = mergeReplyHeaders(reply, cloneHeaders(proxyRes.headers || {}, hopByHop), hopByHop);
-                    const shouldTryInject = dataAdapter &&
-                        proxyRes.statusCode >= 200 && proxyRes.statusCode < 300 &&
-                        shouldTryRewriteSpiderResponse(pathToUse, outHeaders).shouldRewrite;
+                    const shouldTryInject =
+                        wantInjectPanMock &&
+                        (String(outHeaders['content-type'] || '').includes('application/json') ||
+                            String(outHeaders['content-type'] || '').includes('text/plain') ||
+                            String(outHeaders['content-type'] || '').includes('text/json') ||
+                            !outHeaders['content-type']);
 
                     if (!shouldTryInject) {
                         try {
@@ -1242,9 +1232,38 @@ export default async function router(fastify) {
                             resolve();
                             return;
                         }
-                        sendBufferedProxyResponse(reply, request, {
-                            statusCode: status, headers: outHeaders, body: Buffer.concat(chunks),
-                        }, { dataAdapter, spiderContext, forwardPath: pathToUse, runtimeId });
+                        try {
+                            const raw = Buffer.concat(chunks).toString('utf8');
+                            const parsed = raw && raw.trim() ? JSON.parse(raw) : null;
+                            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                                parsed.pan_mock = isPanMockEnabled();
+                                if (parsed.pan_mock) {
+                                    const rewritten = rewritePanmockDetailPayload(parsed);
+                                    if (rewritten && typeof rewritten === 'object') {
+                                        Object.keys(parsed).forEach((k) => {
+                                            delete parsed[k];
+                                        });
+                                        Object.assign(parsed, rewritten);
+                                    }
+                                }
+                                const out = Buffer.from(JSON.stringify(parsed), 'utf8');
+                                delete outHeaders['content-length'];
+                                outHeaders['content-length'] = String(out.length);
+                                if (!outHeaders['content-type']) outHeaders['content-type'] = 'application/json; charset=utf-8';
+                                reply.raw.writeHead(status, outHeaders);
+                                reply.raw.end(out);
+                                resolve();
+                                return;
+                            }
+                        } catch (_) {}
+
+                        // Fallback: stream original response if rewrite fails.
+                        try {
+                            reply.raw.writeHead(status, outHeaders);
+                        } catch (_) {}
+                        try {
+                            reply.raw.end(Buffer.concat(chunks));
+                        } catch (_) {}
                         resolve();
                     });
                 }
@@ -1264,7 +1283,7 @@ export default async function router(fastify) {
             });
             try {
                 const method = String(request.method || 'GET').toUpperCase();
-                const body = requestBody;
+                const body = request && Object.prototype.hasOwnProperty.call(request, 'body') ? request.body : undefined;
 
                 if (body !== undefined && body !== null && method !== 'GET' && method !== 'HEAD') {
                     let buf = null;
@@ -1297,7 +1316,7 @@ export default async function router(fastify) {
     const onlineSpiderInited = new Set(); // key
 
     const ensureOnlineSpiderInited = async function (id, targetPort, spiderKey, spiderType) {
-        const k = `${id}:${targetPort}:${getOnlineRuntimeCacheIdentity(id, targetPort)}:${spiderKey}:${spiderType}`;
+        const k = `${id}:${spiderKey}:${spiderType}`;
         if (onlineSpiderInited.has(k)) return;
         if (onlineSpiderInitPromises.has(k)) return await onlineSpiderInitPromises.get(k);
 
