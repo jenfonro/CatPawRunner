@@ -627,6 +627,9 @@ function pickCookieValueFromSetCookie(setCookieArr, key) {
 function parseSurlFromFlag(flag) {
   const raw = String(flag || '').trim();
   if (!raw) return '';
+  // Normalized detail passes the real share URL, not a legacy display flag.
+  // parseShareUrl removes only the /s/ URL prefix "1"; init?surl= is already short.
+  if (/^https?:\/\//i.test(raw)) return parseShareUrl(raw)?.surl || '';
   const normalizeCandidate = (candRaw) => {
     const cand = String(candRaw || '').trim();
     if (!cand) return '';
@@ -1268,7 +1271,9 @@ const apiPlugins = [
           const shareid = String(decoded.shareid || decoded.share_id || decoded.shareId || '').trim();
           const uk = String(decoded.uk || decoded.share_uk || decoded.uk_str || '').trim();
           const fsid = String(decoded.fs_id || decoded.fsid || decoded.fsId || '').trim();
-          const surl = parseSurlFromFlag(flag) || String(decoded.surl || '').trim();
+          // Display flags can include an optional password and "-" inside the
+          // share code. The full file ID already carries the exact shorturl.
+          const surl = String(decoded.surl || '').trim() || parseSurlFromFlag(flag);
           const pwd = String(decoded.pwd || decoded.pass || '').trim();
           const nameHint = extractNameFromTvServerId(id);
           const fileName = String(decoded.realName || decoded.server_filename || decoded.serverFilename || nameHint || '').trim();
@@ -1475,8 +1480,8 @@ const apiPlugins = [
 
         const surl =
           String(body.surl || '').trim() ||
-          parseSurlFromFlag(flag) ||
-          String((decoded && decoded.surl) || '').trim();
+          String((decoded && decoded.surl) || '').trim() ||
+          parseSurlFromFlag(flag);
         const shareid =
           String(body.shareid || body.shareId || '').trim() ||
           String((decoded && (decoded.shareid ?? decoded.share_id)) || '').trim();

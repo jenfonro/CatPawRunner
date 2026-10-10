@@ -82,7 +82,7 @@ test('two modes reuse raw detail cache but keep normalized mode/account/TV-user 
     const fx = await fixture(t);
     let result = (await fx.detail()).json();
     assert.equal(result.pan_mock, true);
-    assert.equal(result.list[0].vod_play_from, '百度-abcd$$$光鸭原画');
+    assert.equal(result.list[0].vod_play_from, '百度-shareA-abcd$$$光鸭原画');
     assert.equal(result.list[0].vod_play_url, 'https://pan.baidu.com/s/1shareA?pwd=abcd$$$File$native-id');
     assert.equal(result._catpaw_pan_shares, undefined);
     assert.equal(fx.panCalls.length, 0);
@@ -93,6 +93,7 @@ test('two modes reuse raw detail cache but keep normalized mode/account/TV-user 
     fx.setConfig({ pan_mock: false });
     result = (await fx.detail()).json();
     assert.equal(result.pan_mock, false);
+    assert.equal(result.list[0].vod_play_from, '百度-shareA-abcd$$$光鸭原画');
     assert.equal(result.list[0].vod_play_url, `File$${completeId}$$$File$native-id`);
     assert.equal(detailCalls(), 1, 'switching modes does not refetch the script unnecessarily');
     assert.equal(fx.panCalls[0].path, '/api/baidu/list');
@@ -103,7 +104,7 @@ test('two modes reuse raw detail cache but keep normalized mode/account/TV-user 
 
     const played = await fx.app.inject({
         method: 'POST', url: '/play',
-        payload: { flag: '百度-abcd', id: completeId, siteApi: '/aaaaaaaaaa/spider/test/3' },
+        payload: { flag: '百度-shareA-abcd', id: completeId, siteApi: '/aaaaaaaaaa/spider/test/3' },
     });
     assert.equal(played.statusCode, 200);
     assert.equal(fx.panCalls.at(-1).path, '/api/baidu/play');
@@ -133,9 +134,11 @@ test('native and unrecognized private IDs retain their script flag and route', a
 
 test('canonical Tianyi password reaches the existing built-in play accessCode parameter', async t => {
     const fx = await fixture(t);
-    await fx.app.inject({ method: 'POST', url: '/play', payload: { flag: '天翼-abcd', id: '123*456*S01E01.mkv' } });
-    assert.equal(fx.panCalls[0].path, '/api/189/play');
-    assert.equal(fx.panCalls[0].body.accessCode, 'abcd');
+    for (const [flag, accessCode] of [['天翼-shareA-abcd', 'abcd'], ['天翼-shareA', ''], ['天翼-abcd', 'abcd']]) {
+        await fx.app.inject({ method: 'POST', url: '/play', payload: { flag, id: '123*456*S01E01.mkv' } });
+        assert.equal(fx.panCalls.at(-1).path, '/api/189/play');
+        assert.equal(fx.panCalls.at(-1).body.accessCode, accessCode);
+    }
 });
 
 test('an upstream error is not cached or converted into a successful captured detail', async t => {
@@ -150,7 +153,7 @@ test('an upstream error is not cached or converted into a successful captured de
     const second = await fx.detail();
     assert.equal(second.statusCode, 200);
     assert.equal(count, 2);
-    assert.equal(second.json().list[0].vod_play_from, '百度-abcd$$$光鸭原画');
+    assert.equal(second.json().list[0].vod_play_from, '百度-shareA-abcd$$$光鸭原画');
 });
 
 test('compressed cached-script detail can be normalized even without a new intercepted request', async t => {
@@ -162,6 +165,6 @@ test('compressed cached-script detail can be normalized even without a new inter
     const response = await fx.detail();
     assert.equal(response.statusCode, 200);
     assert.equal(response.headers['content-encoding'], undefined);
-    assert.equal(response.json().list[0].vod_play_from, '百度$$$光鸭原画');
+    assert.equal(response.json().list[0].vod_play_from, '百度-shareA$$$光鸭原画');
     assert.match(response.json().list[0].vod_play_url, /^https:\/\/pan\.baidu\.com\/s\/1shareA/);
 });

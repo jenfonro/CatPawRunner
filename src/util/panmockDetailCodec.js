@@ -164,7 +164,7 @@ const validShareId = (value) => /^[A-Za-z0-9_-]{4,256}$/.test(value) && !/^(?:ro
 // Name matching is only a hint. A share URL/ID (or a captured request) is still
 // required before removing a script's source or routing it to a built-in API.
 export function getSupportedPanProvider(label) {
-    // A legacy share ID or canonical password may itself contain provider text.
+    // A share ID or password may itself contain provider text.
     const value = clean(label).split('-')[0].trim();
     if (/百度|baidu/i.test(value)) return 'baidu';
     if (/夸克|夸父|quark/i.test(value)) return 'quark';
@@ -176,8 +176,11 @@ export function getSupportedPanProvider(label) {
 
 export function parsePanShareURL(value, password = '') {
     const raw = clean(value);
+    // Some resource cards append an explicit access code instead of using a
+    // URL query. Extract it here before the script loses it during URL parsing.
+    const annotated = /^(https?:\/\/[^\s（）()]+)\s*[（(]\s*(?:提取码|访问码|密码)\s*[:：]\s*([A-Za-z0-9]{1,16})\s*[）)]$/i.exec(raw);
     let url;
-    try { url = new URL(raw); } catch (_) { return null; }
+    try { url = new URL(annotated ? annotated[1] : raw); } catch (_) { return null; }
     if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password) return null;
     const host = url.hostname.toLowerCase();
     const q = url.searchParams;
@@ -205,7 +208,7 @@ export function parsePanShareURL(value, password = '') {
     if (!provider || !validShareId(shareId)) return null;
     const hashQuery = new URLSearchParams(url.hash.includes('?') ? url.hash.slice(url.hash.indexOf('?') + 1) : '');
     const pwd = clean(password || q.get('pwd') || q.get('passcode') || q.get('accessCode') || q.get('password') || q.get('passwd') ||
-        hashQuery.get('pwd') || hashQuery.get('passwd'));
+        hashQuery.get('pwd') || hashQuery.get('passwd') || (annotated && annotated[2]));
     const bases = {
         baidu: 'https://pan.baidu.com/s/1', quark: 'https://pan.quark.cn/s/',
         uc: 'https://drive.uc.cn/s/', '189': 'https://cloud.189.cn/t/', '139': 'https://caiyun.139.com/m/i?',
@@ -213,7 +216,7 @@ export function parsePanShareURL(value, password = '') {
     const canonical = bases[provider] + shareId;
     return {
         provider, shareId, password: pwd, key: `${provider}:${shareId}`,
-        flag: PAN_NAMES[provider] + (pwd ? `-${pwd}` : ''),
+        flag: `${PAN_NAMES[provider]}-${shareId}` + (pwd ? `-${pwd}` : ''),
         url: canonical + (pwd ? `${provider === '139' ? '&' : '?'}${provider === '189' ? 'accessCode' : 'pwd'}=${encodeURIComponent(pwd)}` : ''),
     };
 }
@@ -245,6 +248,10 @@ export function decodeStructuredDetailId(value) {
 export function extractPanSharesFromSource(flag, group, { placeholders = false } = {}) {
     const found = new Map();
     const add = (share) => {
+        if (share && !share.password) {
+            const prefix = `${PAN_NAMES[share.provider]}-${share.shareId}-`;
+            if (clean(flag).startsWith(prefix)) share = parsePanShareURL(share.url, clean(flag).slice(prefix.length));
+        }
         if (share && (!found.has(share.key) || (!found.get(share.key).password && share.password))) found.set(share.key, share);
     };
     const directShare = parsePanShareURL(group);
@@ -270,8 +277,9 @@ export function extractPanSharesFromSource(flag, group, { placeholders = false }
                 add(shareFromId(p, data.shareCode || data.shareId, pwd));
             }
         }
-        // Old flags contain share identity, unlike canonical flags, whose suffix
-        // is a password. Never infer identity from 百度-1234 / 夸克-1234.
+        // Legacy flags can carry share identity without a URL. Canonical labels
+        // are descriptive; prefer the actual URL/full ID rather than guessing
+        // where a share ID containing "-" ends and its optional password starts.
         const legacy = /^(夸父|优夕|逸动|天意|百度原画)-([^#]+)/.exec(clean(flag));
         if (legacy && provider) {
             let legacyId = legacy[2];

@@ -38,6 +38,8 @@ test('real URL identity, password and mobile hash paths are independent of displ
     ]) {
         const share = parsePanShareURL(url);
         assert.deepEqual([share.provider, share.shareId, share.password], [provider, id, password]);
+        const name = { baidu: '百度', quark: '夸克', uc: 'UC', '189': '天翼', '139': '移动' }[provider];
+        assert.equal(share.flag, `${name}-${id}${password ? `-${password}` : ''}`);
         assert.equal(parsePanShareURL(share.url).key, share.key);
         assert.equal(extractPanSharesFromSource('arbitrary', url).length, 1);
     }
@@ -45,6 +47,78 @@ test('real URL identity, password and mobile hash paths are independent of displ
         assert.equal(parsePanShareURL(url), null, url);
     }
     assert.deepEqual(extractPanSharesFromSource('百度-1234', ''), []);
+});
+
+test('all five providers keep share identity and optional password in the same flag in both modes', async () => {
+    const urls = [
+        'https://pan.baidu.com/s/11share-A_b',
+        'https://pan.quark.cn/s/abcdef123456',
+        'https://drive.uc.cn/s/shareA',
+        'https://cloud.189.cn/t/shareA',
+        'https://caiyun.139.com/m/i?shareA',
+    ];
+    for (const url of urls) for (const password of ['', 'a1b2']) {
+        const share = parsePanShareURL(url, password);
+        const flags = [];
+        for (const panMock of [true, false]) {
+            const out = await normalizePanDetailResponse(film('原线路', share.url), {
+                panMock,
+                listShare: async input => {
+                    assert.equal(input.shareId, share.shareId);
+                    assert.equal(input.password, password);
+                    return { ok: true, vod_play_url: 'File$complete-file-id' };
+                },
+            });
+            flags.push(out.list[0].vod_play_from);
+            assert.equal(out.list[0].vod_play_from, share.flag);
+        }
+        assert.equal(flags[0], flags[1]);
+        assert.ok(flags[0].includes(share.shareId));
+    }
+});
+
+test('a canonical flag password is read after the complete known share ID, not by splitting hyphens', () => {
+    const url = 'https://pan.baidu.com/s/11share-A_b-abcd';
+    for (const [flag, pass] of [
+        ['百度-1share-A_b-abcd', ''],
+        ['百度-1share-A_b-abcd-a1b2', 'a1b2'],
+        ['百度-otherShare-a1b2', ''],
+    ]) {
+        const [share] = extractPanSharesFromSource(flag, url);
+        assert.equal(share.shareId, '1share-A_b-abcd');
+        assert.equal(share.password, pass);
+    }
+    const [share] = extractPanSharesFromSource('百度-1share-A_b-abcd-a1b2', `${url}?pwd=c3d4`);
+    assert.equal(share.password, 'c3d4', 'actual URL credentials remain authoritative');
+});
+
+test('an explicit access code appended to a share URL is extracted before invoking script detail', async () => {
+    for (const url of [
+        'https://pan.quark.cn/s/shareA（访问码：a1b2）',
+        'https://pan.quark.cn/s/shareA (提取码: a1b2)',
+    ]) {
+        const share = parsePanShareURL(url);
+        assert.ok(share);
+        assert.equal(share.flag, '夸克-shareA-a1b2');
+        assert.equal(share.url, 'https://pan.quark.cn/s/shareA?pwd=a1b2');
+        assert.equal(parsePanShareURL(url, 'c3d4').password, 'c3d4', 'explicit caller password still takes precedence');
+        for (const panMock of [true, false]) {
+            const calls = [];
+            const result = await normalizePanDetailResponse({ list: [group('quark', 'share', url)] }, {
+                panMock, requestedId: 'film',
+                loadDetail: async () => assert.fail('the script must not discard a known access code'),
+                listShare: async entry => {
+                    calls.push(entry);
+                    return { ok: true, vod_play_url: 'Movie$shareA*stoken*fid*ftoken***Movie.mkv' };
+                },
+            });
+            assert.equal(result.list[0].vod_play_from, '夸克-shareA-a1b2');
+            assert.equal(calls.length, panMock ? 0 : 1);
+            if (!panMock) assert.equal(calls[0].password, 'a1b2');
+        }
+    }
+    assert.equal(parsePanShareURL('https://pan.quark.cn.evil.test/s/shareA（访问码：a1b2）'), null);
+    assert.equal(parsePanShareURL('https://user@pan.quark.cn/s/shareA（访问码：a1b2）'), null);
 });
 
 test('two script quality lines for one share become one entrance, without dropping distinct shares or native IDs', async () => {
@@ -56,7 +130,7 @@ test('two script quality lines for one share become one entrance, without droppi
     input._catpaw_pan_shares = [{ url: 'https://pan.quark.cn/s/shareA', password: 'abcd' }];
     const snapshot = JSON.stringify(input);
     const out = await normalizePanDetailResponse(input, { panMock: true });
-    assert.equal(out.list[0].vod_play_from, '夸克-abcd$$$夸克$$$蓝光HDR$$$光鸭原画');
+    assert.equal(out.list[0].vod_play_from, '夸克-shareA-abcd$$$夸克-shareB$$$蓝光HDR$$$光鸭原画');
     assert.deepEqual(out.list[0].vod_play_url.split('$$$'), [
         'https://pan.quark.cn/s/shareA?pwd=abcd', 'https://pan.quark.cn/s/shareB',
         `第1集$${native}`, 'File$native-private',
@@ -83,7 +157,7 @@ test('runner mode reuses list results, preserves full IDs, and does not fall bac
     });
     assert.equal(calls.length, 2);
     assert.equal(out.pan_mock, false);
-    assert.equal(out.list[0].vod_play_from, '夸克$$$HDR');
+    assert.equal(out.list[0].vod_play_from, '夸克-liveShare$$$HDR');
     assert.match(out.list[0].vod_play_url, /liveShare\*stoken\*fid\*fileToken/);
     assert.match(out.message, /失效|-9/);
     assert.equal(out.list[0].vod_play_url.includes('private'), false);
@@ -109,7 +183,7 @@ test('navigation groups expand original IDs; unsupported and untagged collection
     assert.equal(out.list[0].vod_name, 'Example');
     assert.equal(out.list[0].vod_id, 'film');
     assert.equal(out.list[0].style, undefined);
-    assert.equal(out.list[0].vod_play_from, '夸克$$$夸克$$$UC$$$光鸭原画$$$蓝光HDR');
+    assert.equal(out.list[0].vod_play_from, '夸克-shareA$$$夸克-shareB$$$UC-shareC$$$光鸭原画$$$蓝光HDR');
 });
 
 for (const panMock of [false, true]) {
@@ -128,7 +202,7 @@ for (const panMock of [false, true]) {
         const out = await normalizePanDetailResponse({ list: [card] }, options);
         assert.equal(out.list[0].vod_id, 'film');
         assert.equal(out.list[0].vod_name, 'Example movie');
-        assert.equal(out.list[0].vod_play_from, '移动-1234');
+        assert.equal(out.list[0].vod_play_from, '移动-shareA-1234');
         assert.equal(out.list[0].style, undefined);
         assert.equal(calls.length, panMock ? 0 : 1);
         assert.equal(out.list[0].vod_play_url, panMock
@@ -142,7 +216,7 @@ for (const panMock of [false, true]) {
         assert.equal(separate.list.length, 2);
         assert.equal(separate.list[0].vod_name, 'Example movie');
         assert.equal(separate.list[1].vod_name, 'Other movie');
-        assert.ok(separate.list.every(item => item.vod_play_from === '移动-1234'));
+        assert.deepEqual(separate.list.map(item => item.vod_play_from), ['移动-shareA-1234', '移动-shareB-1234']);
     });
 }
 
@@ -153,7 +227,7 @@ test('capture replacement is scoped to its child detail and never another siblin
             ? { ...film('百度网盘', 'placeholder'), _catpaw_pan_shares: [{ url: 'https://pan.baidu.com/s/1shareA' }] }
             : film('百度未知自定义线路', 'Episode$native-id'),
     });
-    assert.equal(out.list[0].vod_play_from, '百度$$$百度未知自定义线路');
+    assert.equal(out.list[0].vod_play_from, '百度-shareA$$$百度未知自定义线路');
 });
 
 test('ordinary multiple films are not flattened, empty responses stay empty and navigation limits are visible', async () => {

@@ -832,8 +832,12 @@ export default async function router(fastify) {
             if (route) {
                 const nextBody = { ...body };
                 if (provider === '189' && !nextBody.accessCode) {
-                    const canonical = /^天翼(?:-(.*))?$/.exec(flag.trim());
-                    if (canonical) nextBody.accessCode = canonical[1] || '';
+                    // Tianyi share codes are alphanumeric; the final suffix is
+                    // the password, not the public share code preceding it.
+                    const canonical = /^天翼-([A-Za-z0-9]{6,64})(?:-(.*))?$/.exec(flag.trim());
+                    const legacy = !canonical && /^天翼(?:-(.*))?$/.exec(flag.trim());
+                    if (canonical) nextBody.accessCode = canonical[2] || '';
+                    else if (legacy) nextBody.accessCode = legacy[1] || '';
                 }
                 // Do not leak site routing fields into pan plugins.
                 delete nextBody.siteApi;

@@ -955,39 +955,18 @@ async function tryGetShareStoken({ shareId, passcode, cookie }) {
   const headers = buildQuarkHeaders(cookie);
   const pc = String(passcode || '').trim();
 
-  const attempts = [
-    async () =>
-      await fetchJson('https://drive.quark.cn/1/clouddrive/share/sharepage/token?pr=ucpro&fr=pc', {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(pc ? { pwd_id: pwdId, passcode: pc } : { pwd_id: pwdId }),
-      }),
-    async () =>
-      await fetchJson(`https://drive.quark.cn/1/clouddrive/share/sharepage/detail?pr=ucpro&fr=pc&pwd_id=${encodeURIComponent(pwdId)}`, {
-        method: 'GET',
-        headers,
-      }),
-    async () =>
-      await fetchJson('https://drive.quark.cn/1/clouddrive/share/sharepage/detail?pr=ucpro&fr=pc', {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(pc ? { pwd_id: pwdId, passcode: pc, pdir_fid: '0' } : { pwd_id: pwdId, pdir_fid: '0' }),
-      }),
-  ];
-
-  let lastErr = null;
-  for (const fn of attempts) {
-    try {
-      const data = await fn();
-      const stoken =
-        collectFirstStringByKey(data, 'stoken') ||
-        collectFirstStringByKey(data && data.data ? data.data : null, 'stoken');
-      if (stoken) return { stoken, raw: data };
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-  if (lastErr) throw lastErr;
+  // A token error (expired share, missing password, etc.) is authoritative.
+  // The directory endpoint requires that token and only supports GET; trying
+  // it as a fallback hides the useful upstream error behind an HTTP 405.
+  const data = await fetchJson('https://drive.quark.cn/1/clouddrive/share/sharepage/token?pr=ucpro&fr=pc', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(pc ? { pwd_id: pwdId, passcode: pc } : { pwd_id: pwdId }),
+  });
+  const stoken =
+    collectFirstStringByKey(data, 'stoken') ||
+    collectFirstStringByKey(data && data.data ? data.data : null, 'stoken');
+  if (stoken) return { stoken, raw: data };
   throw new Error('stoken not found');
 }
 
@@ -1056,46 +1035,16 @@ async function getShareDetail({ shareId, stoken, passcode, cookie, pdirFid, page
   const dir = String(pdirFid || '0').trim() || '0';
   const pg = Number.isFinite(Number(page)) ? Math.max(1, Math.trunc(Number(page))) : 1;
   const sz = Number.isFinite(Number(size)) ? Math.max(1, Math.min(500, Math.trunc(Number(size)))) : 200;
-  const url = 'https://drive.quark.cn/1/clouddrive/share/sharepage/detail?pr=ucpro&fr=pc';
-  const body = {
-    pwd_id: pwdId,
-    stoken: sToken,
-    pdir_fid: dir,
-    _fetch_total: 1,
-    _page: pg,
-    _size: sz,
-    _sort: 'file_type:asc,file_name:asc',
-  };
-
-  // Quark deployments differ:
-  // - some accept POST JSON body
-  // - others accept only GET with query params (405 on POST)
-  const attempts = [
-    async () => await fetchJson(url, { method: 'POST', headers, body: JSON.stringify(body) }),
-    async () => {
-      const u = new URL(url);
-      u.searchParams.set('pwd_id', pwdId);
-      u.searchParams.set('stoken', sToken);
-      u.searchParams.set('pdir_fid', dir);
-      // best-effort pagination knobs (some clients include these)
-      u.searchParams.set('force', '0');
-      u.searchParams.set('_page', String(pg));
-      u.searchParams.set('_size', String(sz));
-      u.searchParams.set('_sort', 'file_type:asc,file_name:asc');
-      return await fetchJson(u.toString(), { method: 'GET', headers });
-    },
-  ];
-
-  let lastErr = null;
-  for (const fn of attempts) {
-    try {
-      const detail = await fn();
-      return { shareId: pwdId, stoken: sToken, detail, raw };
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-  throw lastErr || new Error('share detail failed');
+  const url = new URL('https://drive.quark.cn/1/clouddrive/share/sharepage/detail?pr=ucpro&fr=pc');
+  url.searchParams.set('pwd_id', pwdId);
+  url.searchParams.set('stoken', sToken);
+  url.searchParams.set('pdir_fid', dir);
+  url.searchParams.set('force', '0');
+  url.searchParams.set('_page', String(pg));
+  url.searchParams.set('_size', String(sz));
+  url.searchParams.set('_sort', 'file_type:asc,file_name:asc');
+  const detail = await fetchJson(url.toString(), { method: 'GET', headers });
+  return { shareId: pwdId, stoken: sToken, detail, raw };
 }
 
 async function listShareDirAllPages({ shareId, stoken, passcode, cookie, pdirFid, size, maxPages }) {
