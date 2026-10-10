@@ -39,7 +39,7 @@ npm run dev
 - `siteProxy`: 按“站点”走代理（对象；key 为站点名，value 为代理地址字符串；空串表示该站点强制不走代理）
 - `pan_mock`: 是否开启“网盘 mock/拦截”（布尔；启动时若缺失会自动写回 `false`；支持运行中切换）
 - `packet_capture`: 是否开启“在线脚本出站抓包”（布尔；仅抓子进程脚本发出的 `fetch/http/https` 请求，不含客户端入站请求）
-- `panBuiltinResolverEnabled`: 是否启用内置网盘解析 API
+- 支持的网盘始终由内置实现接管；`pan_mock=false` 由 Runner 完成列表/播放，`pan_mock=true` 将标准分享链接交给 MeowFilm 完成列表/播放。旧的 `panBuiltinResolverEnabled` / `panResolver` 开关不再生效。
 - `onlineConfigs`: 在线脚本配置（会下载到 `custom_spider/` 并启动子进程 runtime）
 
 可通过管理接口查看/修改：

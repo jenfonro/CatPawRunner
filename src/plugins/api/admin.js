@@ -248,7 +248,6 @@ function readSettingsFromConfig(root) {
         disable_proxy: !!cfg.disable_proxy,
         pan_mock: !!cfg.pan_mock,
         packet_capture: !!cfg.packet_capture,
-        panBuiltinResolverEnabled: !!cfg.panBuiltinResolverEnabled,
         goProxyApi: typeof cfg.goProxyApi === 'string' ? cfg.goProxyApi : '',
         corsAllowOrigins: Array.isArray(cfg.corsAllowOrigins) ? cfg.corsAllowOrigins : [],
         corsAllowCredentials: !!cfg.corsAllowCredentials,
@@ -467,8 +466,10 @@ export const apiPlugins = [
                 if (Object.prototype.hasOwnProperty.call(body, 'disable_proxy')) next.disable_proxy = !!body.disable_proxy;
                 if (Object.prototype.hasOwnProperty.call(body, 'pan_mock')) next.pan_mock = !!body.pan_mock;
                 if (Object.prototype.hasOwnProperty.call(body, 'packet_capture')) next.packet_capture = !!body.packet_capture;
-                if (Object.prototype.hasOwnProperty.call(body, 'panBuiltinResolverEnabled'))
-                    next.panBuiltinResolverEnabled = !!body.panBuiltinResolverEnabled;
+                // Supported shares are always handled; pan_mock only selects
+                // Runner vs MeowFilm as the list/play owner.
+                delete next.panBuiltinResolverEnabled;
+                delete next.panResolver;
                 if (Object.prototype.hasOwnProperty.call(body, 'goProxyApi'))
                     next.goProxyApi = typeof body.goProxyApi === 'string' ? body.goProxyApi : '';
                 if (Object.prototype.hasOwnProperty.call(body, 'corsAllowOrigins'))

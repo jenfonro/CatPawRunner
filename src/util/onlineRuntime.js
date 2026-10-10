@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import http from 'node:http';
 import { findAvailablePortInRange } from './tool.js';
 import { detectOnlineScriptProtocol } from './onlineScriptAdapters.js';
+import { createRuntimePanCapture } from './runtimePanCapture.js';
 
 const children = new Map(); // id -> { child, entry, entryFn, port, startedAt, healthFailures }
 const starting = new Map(); // id -> Promise<startResult>
@@ -163,10 +164,11 @@ function readPanMockConfigFromRuntimeRoot(rootDir) {
     try {
         const cfgPath = path.resolve(rootDir, 'config.json');
         const cfg = readJsonFileSafe(cfgPath);
-        const enabled = !!cfg.pan_mock;
+        // Supported shares are always captured; pan_mock selects their list/play owner.
+        const enabled = true;
         return { enabled, debug: enabled && isRuntimeDebugEnabled(), providers: DEFAULT_MOCK_PROVIDERS };
     } catch (_) {
-        return { enabled: false, debug: false, providers: DEFAULT_MOCK_PROVIDERS };
+        return { enabled: true, debug: false, providers: DEFAULT_MOCK_PROVIDERS };
     }
 }
 
@@ -753,15 +755,10 @@ export async function startOnlineRuntime({
 		  } catch (_) {}
 				  globalThis.catServerFactory = (handle) => {
 				    const wrapped = (req, res) => {
-				      try {
-				        const site = __extractSiteFromReqUrl(req && req.url ? req.url : '');
-				        if (__siteAls && typeof __siteAls.run === 'function') {
-				          return __siteAls.run({ site }, () => handle(req, res));
-				        }
-				      } catch (_) {}
-				      return handle(req, res);
-				    };
-				    const srv = http.createServer((req, res) => wrapped(req, res));
+                      const withRequest = globalThis.__catpaw_runtime_with_request;
+                      return typeof withRequest === 'function' ? withRequest(req, res, handle) : handle(req, res);
+                    };
+                    const srv = http.createServer((req, res) => wrapped(req, res));
 				    __stage('server_factory');
 				    try {
 				      srv.on('listening', () => {
@@ -1088,7 +1085,7 @@ export async function startOnlineRuntime({
 			    };
 			    const __mockEnabled = () => {
 			      try {
-			        return !!(__mockState && __mockState.enabled);
+			        return !!(__siteAls && __siteAls.getStore() && __siteAls.getStore().panShares);
 			      } catch (_) {
 			        return false;
 			      }
@@ -1963,7 +1960,23 @@ export async function startOnlineRuntime({
 			      return created;
 			    })();
 
-			    const __sanitizeSeg = (raw, maxLen) => {
+			    const __panCapture = (${createRuntimePanCapture.toString()})({
+                  getStore: () => __siteAls && __siteAls.getStore(),
+                  extractCreds: (...args) => __extractInterceptCreds(...args),
+                  placeholderCache: __placeholderCache,
+                  getTianyiCache: () => globalThis.__catpaw_tianyi_sharecode_cache,
+                  zlib: require('node:zlib'),
+                });
+                globalThis.__catpaw_runtime_with_request = (req, res, handle) => {
+                  const site = __extractSiteFromReqUrl(req && req.url ? req.url : '');
+                  const requestPath = String(req && req.url || '').split('?')[0];
+                  const store = { site };
+                  if (/^\\/spider\\/[^/]+\\/\\d+\\/detail\\/?$/.test(requestPath)) store.panShares = new Map();
+                  if (store.panShares) __panCapture.wrapResponse(res, store);
+                  return __siteAls ? __siteAls.run(store, () => handle(req, res)) : handle(req, res);
+                };
+
+                const __sanitizeSeg = (raw, maxLen) => {
 			      try {
 			        let s = String(raw == null ? '' : raw).trim();
 			        if (!s) return '';
@@ -2984,7 +2997,16 @@ export async function startOnlineRuntime({
 			      };
 			    })();
 			    if (__ucInterceptor) __interceptors.push(__ucInterceptor);
-			    const __pickInterceptor = (hostLike) => {
+			    // Reuse all existing fetch/http interceptors and their credential decoding.
+                for (const interceptor of __interceptors) {
+                  const mock = interceptor.mock;
+                  interceptor.mock = (meta) => {
+                    const result = mock(meta);
+                    __panCapture.record(interceptor.name, meta);
+                    return result;
+                  };
+                }
+                const __pickInterceptor = (hostLike) => {
 			      try {
 			        if (!__mockEnabled()) return null;
 			        for (const it of __interceptors) {

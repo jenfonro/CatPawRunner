@@ -2,6 +2,7 @@ import * as cfg from './index.config.js';
 import {md5} from "./util/crypto-util.js";
 import chunkStream from "./util/chunk.js";
 import http from 'node:http';
+import { gunzipSync, inflateSync, brotliDecompressSync } from 'node:zlib';
 import fs from 'node:fs';
 import path from 'node:path';
 import apiPlugins from './plugins/api/index.js';
@@ -10,7 +11,7 @@ import {
     getOrCreateSpiderCache,
     isEligibleSpiderCacheRequest,
 } from './util/runtimeSpiderCache.js';
-import { rewritePanmockDetailPayloadFields } from './util/panmockDetailCodec.js';
+import { getSupportedPanProvider, isBuiltinPanPlayId, normalizePanDetailResponse, parsePanShareURL } from './util/panmockDetailCodec.js';
 import { isSpiderCacheRoutePath } from './util/spiderRouteMatcher.js';
 import { getOnlineRuntimeUpstreamOrigin } from './util/onlineRuntime.js';
 
@@ -165,13 +166,6 @@ function isProxyDisabled() {
     }
 }
 
-function readPanBuiltinResolverEnabledFromConfigRoot(root) {
-    const cfgRoot = root && typeof root === 'object' && !Array.isArray(root) ? root : {};
-    if (Object.prototype.hasOwnProperty.call(cfgRoot, 'panResolver') && typeof cfgRoot.panResolver === 'boolean') return cfgRoot.panResolver;
-    if (Object.prototype.hasOwnProperty.call(cfgRoot, 'panBuiltinResolverEnabled')) return !!cfgRoot.panBuiltinResolverEnabled;
-    return false;
-}
-
 function pickFirstHeaderValue(value) {
     if (typeof value !== 'string') return '';
     const first = value.split(',')[0];
@@ -193,34 +187,21 @@ function parseJsonSafe(text) {
     }
 }
 
-function extractBuiltinPanFlagToken(flag) {
-    const raw = String(flag || '').trim();
-    if (!raw || !raw.includes('-')) return '';
-    return String(raw.split('-')[0] || '').trim().toLowerCase();
-}
-
-function isBaiduFlag(flag) {
-    return extractBuiltinPanFlagToken(flag) === '百度';
-}
-
-function isQuarkFlag(flag) {
-    return extractBuiltinPanFlagToken(flag) === '夸父';
-}
-
-function isUcFlag(flag) {
-    return extractBuiltinPanFlagToken(flag) === '优夕';
+function decodeBufferedDetailResponse(response) {
+    const headers = { ...response.headers };
+    const encoding = String(headers['content-encoding'] || '').trim().toLowerCase();
+    if (!encoding || encoding === 'identity') return response;
+    const decode = { gzip: gunzipSync, deflate: inflateSync, br: brotliDecompressSync }[encoding];
+    if (!decode) throw new Error('不支持的详情压缩格式');
+    const body = decode(response.body, { maxOutputLength: 8 * 1024 * 1024 });
+    delete headers['content-encoding'];
+    delete headers['content-length'];
+    delete headers.etag;
+    return { ...response, headers, body };
 }
 
 function looksLikeHexId32(value) {
     return /^[a-f0-9]{32}$/i.test(String(value || '').trim());
-}
-
-function is139Flag(flag) {
-    return extractBuiltinPanFlagToken(flag) === '逸动';
-}
-
-function is189Flag(flag) {
-    return extractBuiltinPanFlagToken(flag) === '天意';
 }
 
 function pickStringField(obj, keys) {
@@ -338,18 +319,6 @@ function cloneHeaders(headers, hopByHop) {
         outHeaders[k] = headers[k];
     });
     return outHeaders;
-}
-
-function rewritePanmockDetailPayload(parsed) {
-    if (!parsed || typeof parsed !== 'object') return parsed;
-    if (!parsed.pan_mock) return parsed;
-    const list = Array.isArray(parsed.list) ? parsed.list : null;
-    if (!list || !list.length || !list[0] || typeof list[0] !== 'object') return parsed;
-    const first = { ...list[0] };
-    const rewritten = rewritePanmockDetailPayloadFields(first.vod_play_from, first.vod_play_url);
-    first.vod_play_from = rewritten.vod_play_from;
-    first.vod_play_url = rewritten.vod_play_url;
-    return { ...parsed, list: [first, ...list.slice(1)] };
 }
 
 const spiderBaseOriginByKey = new Map();
@@ -534,8 +503,9 @@ function rewriteSpiderJsonResponse(parsed, { isDetail, cacheHit, forwardPath = '
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
     let next = rewriteSpiderVodPicFields({ ...parsed, cache: !!cacheHit }, forwardPath, runtimeId);
     if (isDetail) {
-        next.pan_mock = isPanMockEnabled();
-        next = rewritePanmockDetailPayload(next);
+        // The mode is captured when normalization starts, including cache hits.
+        next.pan_mock = typeof parsed.pan_mock === 'boolean' ? parsed.pan_mock : isPanMockEnabled();
+        delete next._catpaw_pan_shares;
     }
     return next;
 }
@@ -581,7 +551,10 @@ async function fetchBufferedProxyResponse({ request, targetPort, pathToUse, head
                     const b = Buffer.isBuffer(c) ? c : Buffer.from(c);
                     total += b.length;
                     if (limitBytes > 0 && total > limitBytes) {
-                        chunks.push(b);
+                        const error = new Error('详情响应超过大小限制');
+                        proxyRes.destroy(error);
+                        proxyReq.destroy(error);
+                        reject(error);
                         return;
                     }
                     chunks.push(b);
@@ -596,6 +569,7 @@ async function fetchBufferedProxyResponse({ request, targetPort, pathToUse, head
             }
         );
         proxyReq.on('error', reject);
+        proxyReq.setTimeout(45000, () => proxyReq.destroy(new Error('脚本详情请求超时')));
         try {
             const method = String(request.method || 'GET').toUpperCase();
             const body = request && Object.prototype.hasOwnProperty.call(request, 'body') ? request.body : undefined;
@@ -683,8 +657,7 @@ export default async function router(fastify) {
     }
 
     // Unified play entrypoint:
-    // - if builtin pan resolver enabled: dispatch to /api/{baidu,quark,uc,139,189}/play based on flag
-    // - otherwise (or no match): forward to the target runtime play via siteApi + siteId
+    // Dispatch compatible built-in IDs; native IDs retain siteApi/siteId routing.
     fastify.post('/play', async function (request, reply) {
         const body = request && request.body && typeof request.body === 'object' ? request.body : {};
         const flag = typeof body.flag === 'string' ? body.flag : '';
@@ -698,7 +671,6 @@ export default async function router(fastify) {
         const runtimeRoot = resolveRuntimeRootDir();
         const cfgPath = path.resolve(runtimeRoot, 'config.json');
         const cfgRoot = readConfigJsonSafe(cfgPath);
-        const panEnabled = readPanBuiltinResolverEnabledFromConfigRoot(cfgRoot);
         const hasUcTvCred = !!(cfgRoot && cfgRoot.account && cfgRoot.account.uc_tv && cfgRoot.account.uc_tv.refresh_token && cfgRoot.account.uc_tv.device_id);
         const hasUcCookie = !!(cfgRoot && cfgRoot.account && cfgRoot.account.uc && cfgRoot.account.uc.cookie);
 
@@ -708,22 +680,18 @@ export default async function router(fastify) {
         const baseHeaders = { 'content-type': 'application/json' };
 
         // 1) builtin pan resolver path
-        if (panEnabled) {
-            let route = isBaiduFlag(flag)
-                ? '/api/baidu/play'
-                : isQuarkFlag(flag)
-                    ? '/api/quark/play'
-                    : isUcFlag(flag)
-                        ? '/api/uc/play'
-                        : is139Flag(flag)
-                            ? '/api/139/play'
-                            : is189Flag(flag)
-                                ? '/api/189/play'
-                                : '';
+        {
+            const provider = getSupportedPanProvider(flag);
+            let route = provider ? `/api/${provider}/play` : '';
             const shareUrl =
                 pickStringField(body, ['url', 'shareUrl', 'shareURL', 'share_url']) ||
                 extractFirstUrl(flag) ||
                 '';
+            // A script's private Base64 play payload must not be fed to a
+            // built-in resolver merely because its label contains "百度".
+            if (playId && !isBuiltinPanPlayId(provider, playId) &&
+                !((provider === 'quark' || provider === 'uc') && looksLikeHexId32(playId))) route = '';
+            if (!playId && !parsePanShareURL(shareUrl)) route = '';
 
             const injectJson = async (url, payload) => {
                 const injected = await fastify.inject({
@@ -863,6 +831,10 @@ export default async function router(fastify) {
             }
             if (route) {
                 const nextBody = { ...body };
+                if (provider === '189' && !nextBody.accessCode) {
+                    const canonical = /^天翼(?:-(.*))?$/.exec(flag.trim());
+                    if (canonical) nextBody.accessCode = canonical[1] || '';
+                }
                 // Do not leak site routing fields into pan plugins.
                 delete nextBody.siteApi;
                 delete nextBody.spiderApi;
@@ -900,8 +872,7 @@ export default async function router(fastify) {
             }
         }
 
-        // If we reached here with only filename, we cannot proceed (either pan resolver is disabled or the flag didn't match).
-        if (!playId) return reply.code(400).send({ ok: false, message: 'missing id (pan resolver disabled or unsupported flag)' });
+        if (!playId) return reply.code(400).send({ ok: false, message: 'missing id (unsupported share or source)' });
 
         // 2) fallback: forward to the site runtime play
         const siteApi =
@@ -1126,6 +1097,88 @@ export default async function router(fastify) {
         delete headers['transfer-encoding'];
 
         reply.hijack();
+        if (wantInjectPanMock && String(request.method || '').toUpperCase() === 'POST') {
+            // Raw script details (including captured shares) and normalized
+            // details both use the existing bounded TTL/inflight cache.
+            const panMock = isPanMockEnabled();
+            const body = request.body && typeof request.body === 'object' && !Buffer.isBuffer(request.body) ? request.body : {};
+            const config = readConfigJsonSafe(path.resolve(resolveRuntimeRootDir(), 'config.json'));
+            const accountKey = md5(JSON.stringify(config.account || {}));
+            const tvUser = getTvUserFromRequest(request);
+            const keyFor = (payload, variant) => `${buildSpiderCacheKey({
+                runtimeId, forwardPath: pathToUse, method: 'POST', body: payload,
+            })}|${targetPort}|${accountKey}|${tvUser}|${variant}`;
+            const loadRaw = async (payload) => {
+                const { entry } = await getOrCreateSpiderCache(keyFor(payload, 'pan-capture'), async () => {
+                    const response = decodeBufferedDetailResponse(await fetchBufferedProxyResponse({
+                        request: { method: 'POST', body: payload }, targetPort, pathToUse,
+                        headers: { ...headers }, limitBytes: 8 * 1024 * 1024,
+                    }));
+                    const parsed = parseJsonSafe(response.body.toString('utf8'));
+                    return {
+                        entry: response,
+                        cacheable: response.statusCode >= 200 && response.statusCode < 300 &&
+                            parsed && parsed.ok !== false && !parsed.message &&
+                            Array.isArray(parsed.list) && parsed.list.length > 0 &&
+                            response.body.length <= 8 * 1024 * 1024,
+                    };
+                });
+                return entry;
+            };
+            try {
+                const { hit, entry } = await getOrCreateSpiderCache(keyFor(body, `pan-owner:${panMock ? 'client' : 'runner'}`), async () => {
+                    const raw = await loadRaw(body);
+                    const parsed = parseJsonSafe(raw.body.toString('utf8'));
+                    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { entry: raw, cacheable: false };
+                    if (raw.statusCode < 200 || raw.statusCode >= 300 || parsed.ok === false) {
+                        const { _catpaw_pan_shares, ...errorPayload } = parsed;
+                        return { entry: { ...raw, body: Buffer.from(JSON.stringify({ ...errorPayload, pan_mock: panMock })) }, cacheable: false };
+                    }
+                    const next = await normalizePanDetailResponse(parsed, {
+                        panMock,
+                        requestedId: String(body.id || body.ids || ''),
+                        loadDetail: async (id) => {
+                            const payload = { ...body, id };
+                            if (Object.prototype.hasOwnProperty.call(body, 'ids')) payload.ids = id;
+                            const nested = await loadRaw(payload);
+                            const result = parseJsonSafe(nested.body.toString('utf8'));
+                            if (!result) throw new Error('详情响应不是有效 JSON');
+                            if (nested.statusCode < 200 || nested.statusCode >= 300) throw new Error(result.message || `脚本详情 HTTP ${nested.statusCode}`);
+                            return result;
+                        },
+                        listShare: async (share) => {
+                            const injected = await fastify.inject({
+                                method: 'POST', url: `/api/${share.provider}/list`,
+                                headers: { 'content-type': 'application/json', ...(tvUser ? { 'x-tv-user': tvUser } : {}) },
+                                payload: {
+                                    // Existing list parsers already accept share URLs as flag.
+                                    url: share.url, flag: share.url, shareCode: share.provider === '189' ? share.shareId : undefined,
+                                    linkID: share.provider === '139' ? share.shareId : undefined,
+                                    pwd: share.password, passcode: share.password, accessCode: share.password,
+                                },
+                            });
+                            const value = parseJsonSafe(injected.payload);
+                            return value || { ok: false, message: '网盘列表响应不是有效 JSON' };
+                        },
+                    });
+                    const playable = Array.isArray(next.list) && next.list.some((item) => item && item.vod_play_url);
+                    return {
+                        entry: { ...raw, statusCode: playable ? 200 : raw.statusCode, body: Buffer.from(JSON.stringify(next)) },
+                        // Do not pin transient/partial failures for an hour.
+                        cacheable: playable && !next.message,
+                    };
+                });
+                sendBufferedProxyResponse(reply, request, entry, {
+                    rewriteSpider: true, cacheHit: hit, forwardPath: pathToUse, runtimeId,
+                });
+            } catch (error) {
+                sendBufferedProxyResponse(reply, request, {
+                    statusCode: 502, headers: { 'content-type': 'application/json; charset=utf-8' },
+                    body: Buffer.from(JSON.stringify({ ok: false, pan_mock: panMock, list: [], message: `详情解析失败: ${String(error && error.message || error)}` })),
+                });
+            }
+            return;
+        }
         if (allowSpiderCache) {
             const cacheKey = buildSpiderCacheKey({
                 runtimeId,
