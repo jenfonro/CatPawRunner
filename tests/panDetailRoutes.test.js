@@ -168,3 +168,79 @@ test('compressed cached-script detail can be normalized even without a new inter
     assert.equal(response.json().list[0].vod_play_from, '百度-shareA$$$光鸭原画');
     assert.match(response.json().list[0].vod_play_url, /^https:\/\/pan\.baidu\.com\/s\/1shareA/);
 });
+
+test('detail URL navigation expands through the existing proxy/cache in both modes', async t => {
+    const movie = {
+        detailUrl: 'https://movies.example/mv/123.html', name: 'Navigation movie',
+        pic: 'https://movies.example/poster.jpg', year: '2026',
+    };
+    const idFor = data => 'qw:' + Buffer.from(JSON.stringify({ ...movie, ...data })).toString('base64url');
+    const card = (mode, provider, url) => ({
+        vod_id: idFor({ mode, provider, ...(url ? { url } : {}) }),
+        vod_name: provider,
+        ...(provider !== 'collect' ? { vod_tag: 'folder' } : {}),
+    });
+    const rootId = idFor({ mode: 'movie' });
+    const groups = ['quark', 'baidu', 'collect', 'guangya'].map(provider => card('group', provider));
+    const shares = [
+        card('share', 'quark', 'https://pan.quark.cn/s/shareA'),
+        card('share', 'quark', 'https://pan.quark.cn/s/shareB?pwd=abcd'),
+        card('share', 'baidu', 'https://pan.baidu.com/s/1shareC?pwd=1234'),
+        card('share', 'guangya', 'https://unsupported.example/share/duck'),
+    ];
+    const nativeId = 'https://cover.example/pic*Author*1:20****opaque-E65';
+    const native = (flag, id) => ({ list: [{
+        vod_id: movie.detailUrl, vod_name: movie.name,
+        vod_play_from: flag, vod_play_url: `Episode$${id}`,
+    }] });
+    const docs = new Map([
+        [rootId, { list: groups }],
+        [groups[0].vod_id, { list: shares.slice(0, 2) }],
+        [groups[1].vod_id, { list: [shares[2]] }],
+        [groups[2].vod_id, native('蓝光HDR', nativeId)],
+        [groups[3].vod_id, { list: [shares[3]] }],
+        [shares[3].vod_id, native('光鸭原画', 'native-duck-id')],
+    ]);
+    const fx = await fixture(t, body => docs.has(body.id)
+        ? { doc: docs.get(body.id) }
+        : { status: 404, doc: { list: [], message: 'unexpected navigation id' } });
+    const detail = () => fx.app.inject({
+        method: 'POST', url: '/aaaaaaaaaa/spider/test/3/detail', payload: { id: rootId },
+    });
+    const detailCalls = () => fx.rawCalls.filter(call => call.path.endsWith('/detail'));
+    for (const panMock of [true, false]) {
+        fx.setConfig({ pan_mock: panMock });
+        const response = await detail();
+        assert.equal(response.statusCode, 200);
+        const out = response.json();
+        assert.equal(out.pan_mock, panMock);
+        assert.equal(out.cache, false, 'normalized cache entries are mode-specific');
+        assert.equal(out.list.length, 1);
+        assert.equal(out.list[0].vod_id, rootId);
+        assert.equal(out.list[0].vod_name, movie.name);
+        assert.equal(out.list[0].vod_pic, movie.pic);
+        assert.equal(out.list[0].vod_year, movie.year);
+        assert.equal(out.list[0].vod_tag, undefined);
+        assert.equal(out.list[0].vod_play_from, '夸克-shareA$$$夸克-shareB-abcd$$$百度-shareC-1234$$$蓝光HDR$$$光鸭原画');
+        assert.deepEqual(out.list[0].vod_play_url.split('$$$').slice(0, 3), panMock
+            ? ['https://pan.quark.cn/s/shareA', 'https://pan.quark.cn/s/shareB?pwd=abcd', 'https://pan.baidu.com/s/1shareC?pwd=1234']
+            : Array(3).fill(`File$${completeId}`));
+        assert.deepEqual(out.list[0].vod_play_url.split('$$$').slice(-2), [`Episode$${nativeId}`, 'Episode$native-duck-id']);
+        assert.equal(out.message, undefined);
+        assert.equal(detailCalls().length, 6, 'switching owners reuses raw root and nested details');
+        assert.deepEqual(new Set(detailCalls().map(call => call.body.id)), new Set(docs.keys()));
+        assert.equal(fx.panCalls.length, panMock ? 0 : 3);
+        assert.equal((await detail()).json().cache, true);
+        assert.equal(detailCalls().length, 6);
+        assert.equal(fx.panCalls.length, panMock ? 0 : 3);
+    }
+    assert.deepEqual(fx.panCalls.map(call => call.path), ['/api/quark/list', '/api/quark/list', '/api/baidu/list']);
+    for (const [flag, id] of [['蓝光HDR', nativeId], ['光鸭原画', 'native-duck-id']]) {
+        const response = await fx.app.inject({
+            method: 'POST', url: '/play',
+            payload: { flag, id, siteApi: '/aaaaaaaaaa/spider/test/3' },
+        });
+        assert.equal(response.json().nativeFlag, flag);
+        assert.equal(response.json().nativeId, id);
+    }
+});

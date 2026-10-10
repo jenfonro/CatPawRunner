@@ -186,6 +186,106 @@ test('navigation groups expand original IDs; unsupported and untagged collection
     assert.equal(out.list[0].vod_play_from, '夸克-shareA$$$夸克-shareB$$$UC-shareC$$$光鸭原画$$$蓝光HDR');
 });
 
+// Some scripts identify the common movie by its detail URL, not a vodId.
+// The prefix is opaque to the runner; only the decoded navigation data matters.
+const urlMovie = {
+    detailUrl: 'https://movies.example/mv/123.html', name: 'Example movie',
+    pic: 'https://movies.example/poster.jpg', year: '2026', content: 'Movie synopsis',
+};
+const urlCard = (data, meta = urlMovie) => ({
+    vod_id: 'nav:' + Buffer.from(JSON.stringify({ ...meta, ...data })).toString('base64url'),
+    vod_name: data.provider || meta.name,
+    ...(data.mode === 'group' && data.provider !== 'collect' ? { vod_tag: 'folder' } : {}),
+});
+
+test('detail URL navigation requires a common movie and never combines different movies', () => {
+    const cards = ['collect', 'quark', 'baidu'].map(provider => urlCard({ mode: 'group', provider }));
+    const root = urlCard({ mode: 'movie' }).vod_id;
+    assert.equal(isDetailNavigationList(cards, root), true);
+    assert.equal(isDetailNavigationList(cards, urlMovie.detailUrl), true);
+    assert.equal(isDetailNavigationList(cards, 'https://movies.example/mv/other.html'), false);
+    const other = urlCard({ mode: 'group', provider: 'quark' }, { ...urlMovie, detailUrl: 'https://movies.example/mv/other.html' });
+    assert.equal(isDetailNavigationList([cards[1], other], root), false);
+    assert.equal(isDetailNavigationList([cards[1], other]), false);
+});
+
+for (const panMock of [false, true]) {
+    test(`detail URL groups expand through share cards into one playable film (pan_mock=${panMock})`, async () => {
+        const providers = ['collect', 'pan123', 'baidu', 'quark', 'thunder', 'magnet'];
+        const cards = providers.map(provider => urlCard({ mode: 'group', provider }));
+        const rootId = urlCard({ mode: 'movie' }).vod_id;
+        const shareCard = (provider, url) => urlCard({ mode: 'share', provider, url });
+        const shares = [
+            shareCard('pan123', 'https://unsupported.example/share/123'),
+            shareCard('baidu', 'https://pan.baidu.com/s/11share-A_b?pwd=abcd'),
+            shareCard('quark', 'https://pan.quark.cn/s/shareA'),
+            shareCard('quark', 'https://pan.quark.cn/s/shareB'),
+            shareCard('thunder', 'https://unsupported.example/share/thunder'),
+            shareCard('magnet', 'magnet:?xt=urn:btih:fixture'),
+        ];
+        const native = ['HDR$opaque-hdr', 'File$opaque-123', 'File$opaque-thunder', 'Magnet$magnet:?xt=urn:btih:fixture'];
+        const children = new Map([
+            [cards[0].vod_id, film('蓝光HDR', native[0])],
+            [cards[1].vod_id, { list: [shares[0]] }],
+            [cards[2].vod_id, { list: [shares[1]] }],
+            [cards[3].vod_id, { list: [shares[2], shares[3], shares[2]] }],
+            [cards[4].vod_id, { list: [shares[4]] }],
+            [cards[5].vod_id, { list: [shares[5]] }],
+            [shares[0].vod_id, film('123原画', native[1])],
+            [shares[4].vod_id, film('迅雷原画', native[2])],
+            [shares[5].vod_id, film('磁力链接', native[3])],
+        ]);
+        const calls = [], panCalls = [];
+        const input = { list: cards };
+        const snapshot = JSON.stringify(input);
+        const out = await normalizePanDetailResponse(input, {
+            panMock, requestedId: rootId,
+            loadDetail: async id => {
+                calls.push(id);
+                assert.ok(children.has(id), 'supported share cards must not invoke private script detail');
+                return children.get(id);
+            },
+            listShare: async share => {
+                panCalls.push(share);
+                return { ok: true, vod_play_url: `File$complete-${share.key}` };
+            },
+        });
+        assert.equal(out.list.length, 1, 'the six provider cards belong to one film');
+        assert.ok(out.list.every(Boolean), 'JSON must not contain null detail slots');
+        const item = out.list[0];
+        assert.equal(item.vod_id, rootId, 'keep the original opaque request ID for later script calls');
+        assert.equal(item.vod_name, urlMovie.name);
+        assert.equal(item.vod_pic, urlMovie.pic);
+        assert.equal(item.vod_year, urlMovie.year);
+        assert.equal(item.vod_content, urlMovie.content);
+        assert.equal(item.vod_tag, undefined);
+        assert.equal(item.style, undefined);
+        assert.equal(item.vod_play_from, '百度-1share-A_b-abcd$$$夸克-shareA$$$夸克-shareB$$$蓝光HDR$$$123原画$$$迅雷原画$$$磁力链接');
+        assert.deepEqual(item.vod_play_url.split('$$$').slice(-4), native);
+        assert.deepEqual(item.vod_play_url.split('$$$').slice(0, 3), panMock
+            ? ['https://pan.baidu.com/s/11share-A_b?pwd=abcd', 'https://pan.quark.cn/s/shareA', 'https://pan.quark.cn/s/shareB']
+            : ['File$complete-baidu:1share-A_b', 'File$complete-quark:shareA', 'File$complete-quark:shareB']);
+        assert.equal(calls.length, 9);
+        assert.equal(panCalls.length, panMock ? 0 : 3);
+        assert.equal(out.message, undefined);
+        assert.equal(JSON.stringify(input), snapshot, 'cached raw cards remain unchanged');
+    });
+}
+
+test('missing or empty detail items never serialize as null slots', async () => {
+    const out = await normalizePanDetailResponse({ list: [null, undefined, null] }, { panMock: false });
+    assert.deepEqual(out.list, []);
+    assert.equal(JSON.stringify(out).includes('null'), false);
+    const folders = ['opaque-folder-a', 'opaque-folder-b'].map(vod_id => ({
+        vod_id, vod_name: 'Empty folder', style: { type: 'list' },
+    }));
+    const empty = await normalizePanDetailResponse({ list: folders }, { panMock: false });
+    assert.deepEqual(empty.list, [], 'empty child results also must not insert undefined slots');
+    const movie = film('HDR', 'Episode$native-id').list[0];
+    const mixed = await normalizePanDetailResponse({ list: [null, movie, undefined] }, { panMock: false });
+    assert.deepEqual(mixed.list, [movie], 'valid films survive invalid neighboring entries');
+});
+
 for (const panMock of [false, true]) {
     test(`a navigation card with a share URL as vod_id bypasses script detail (pan_mock=${panMock})`, async () => {
         const url = 'https://yun.139.com/shareweb/#/w/i/shareA?pwd=1234';

@@ -317,13 +317,19 @@ export function isBuiltinPanPlayId(provider, value) {
     return false;
 }
 
+function getDetailNavigationParent(data) {
+    // Navigation payloads may retain the movie's original detail URL instead
+    // of a vodId. This is still shared movie identity, not a provider/share URL.
+    return clean(data && (data.vodId || data.parentId || data.parent_id || data.detailUrl));
+}
+
 export function isDetailNavigationList(list, requestedId = '') {
     if (!Array.isArray(list) || !list.length) return false;
     if (list.some((item) => !item || !clean(item.vod_id) || clean(item.vod_play_url) || clean(item.vod_play_from))) return false;
     const decoded = list.map((item) => decodeStructuredDetailId(item.vod_id));
-    const parents = decoded.map((item) => clean(item && (item.vodId || item.parentId || item.parent_id)));
+    const parents = decoded.map(getDetailNavigationParent);
     const requested = decodeStructuredDetailId(requestedId);
-    const expectedParent = clean(requested && (requested.vodId || requested.parentId || requested.parent_id)) || clean(requestedId);
+    const expectedParent = getDetailNavigationParent(requested) || clean(requestedId);
     const sameParent = parents[0] && parents.every((id) => id === parents[0]) &&
         (!expectedParent || parents[0] === expectedParent || list.length === 1);
     const explicit = list.every((item, index) => {
@@ -360,8 +366,8 @@ export async function normalizePanDetailResponse(parsed, { panMock, requestedId 
             for (const item of list) {
                 const data = decodeStructuredDetailId(item.vod_id);
                 if (!base && data && data.meta && typeof data.meta === 'object') base = { ...data.meta };
-                if (!base && data && data.vodId) {
-                    base = { vod_id: data.vodId };
+                if (!base && getDetailNavigationParent(data)) {
+                    base = { vod_id: getDetailNavigationParent(data) };
                     for (const key of ['name', 'pic', 'year', 'content', 'actor', 'director', 'area', 'type']) {
                         if (data[key] != null) base[`vod_${key}`] = data[key];
                     }
@@ -410,6 +416,7 @@ export async function normalizePanDetailResponse(parsed, { panMock, requestedId 
     if (Array.isArray(parsed.list) && parsed.list.length > 1 && !isDetailNavigationList(parsed.list, requestedId)) {
         const items = [];
         for (const item of parsed.list) {
+            if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
             // Only attach captures whose share identity is already present in
             // this item's fields. Unattributable request-wide captures must not
             // be assigned to another film.
@@ -417,8 +424,10 @@ export async function normalizePanDetailResponse(parsed, { panMock, requestedId 
             const groups = clean(item && item.vod_play_url).split('$$$');
             const keys = new Set(flags.flatMap((flag, i) => extractPanSharesFromSource(flag, groups[i], { placeholders: true })).map((share) => share.key));
             const captured = (parsed._catpaw_pan_shares || []).filter((entry) => keys.has(parsePanShareURL(entry && entry.url)?.key));
-            const result = await normalizePanDetailResponse({ list: [item], _catpaw_pan_shares: captured }, { panMock, requestedId: item && item.vod_id, listShare });
-            items.push(result.list[0]);
+            const result = await normalizePanDetailResponse({ list: [item], _catpaw_pan_shares: captured }, { panMock, requestedId: item.vod_id, listShare });
+            // Empty child results must not create undefined slots, which JSON
+            // serialization turns into misleading null detail entries.
+            items.push(...result.list);
             if (result.message) diagnostics.push(result.message);
         }
         const { _catpaw_pan_shares, ...rest } = parsed;
