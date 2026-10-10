@@ -1971,7 +1971,7 @@ export async function startOnlineRuntime({
                   const site = __extractSiteFromReqUrl(req && req.url ? req.url : '');
                   const requestPath = String(req && req.url || '').split('?')[0];
                   const store = { site };
-                  if (/^\\/spider\\/[^/]+\\/\\d+\\/detail\\/?$/.test(requestPath)) store.panShares = new Map();
+                  if (/^\\/spider\\/[^/]+\\/\\d+\\/(?!(?:home|search|init|play|proxy)\\/?$)[a-zA-Z][a-zA-Z0-9_-]*\\/?$/.test(requestPath)) store.panShares = new Map();
                   if (store.panShares) __panCapture.wrapResponse(res, store);
                   return __siteAls ? __siteAls.run(store, () => handle(req, res)) : handle(req, res);
                 };

@@ -1,3 +1,4 @@
+import { serialPanListHandler } from '../../util/panListQueue.js';
 // Tianyi (天翼云盘 / cloud.189.cn) share API plugin.
 // Keep only minimal endpoints:
 // - POST /api/189/list (root list from share flag/code)
@@ -1019,7 +1020,7 @@ export const apiPlugins = [
   {
     prefix: '/api/189',
     plugin: async function pan189Api(instance) {
-      instance.post('/list', async (req, reply) => {
+      instance.post('/list', serialPanListHandler('189', async (req, reply) => {
         const body = normalizeBody(req && req.body);
         const flag = toStr(body.flag).trim();
         const parsed = parse189ShareCodeLike(flag);
@@ -1245,7 +1246,7 @@ export const apiPlugins = [
           } catch (_) {}
 	          return reply.code(502).send({ ok: false, message: (e && e.message) || String(e) });
 	        }
-	      });
+	      }));
 
       instance.post('/share/info', async (req, reply) => {
         const body = normalizeBody(req && req.body);

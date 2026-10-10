@@ -1,27 +1,3 @@
-function getPanmockDetailProviderKey(label) {
-    const raw = String(label || '').trim();
-    if (!raw) return '';
-    if (raw.startsWith('夸父-')) return 'quark';
-    if (raw.startsWith('优夕-')) return 'uc';
-    if (raw.startsWith('逸动-')) return '139';
-    if (raw.startsWith('天意-')) return '189';
-    if (raw.startsWith('百度原画-')) return 'baidu';
-    return '';
-}
-
-function isPanmockDetailSource(label) {
-    return !!getPanmockDetailProviderKey(label);
-}
-
-function sanitizePanmockSourceLabel(label) {
-    const raw = String(label || '').trim();
-    if (!raw) return '';
-    if (raw.startsWith('百度原画-')) {
-        return String(raw.split('#')[0] || '').trim();
-    }
-    return raw;
-}
-
 function normalizePanmockDetailText(raw) {
     try {
         return decodeURIComponent(String(raw || '').trim());
@@ -89,72 +65,6 @@ function extractTianyiPanmockMeta(label, title, playURL) {
         nextLabel = `天意-${shareCode}`;
     }
     return { nextLabel, passcode };
-}
-
-const PANMOCK_DETAIL_CODECS = {
-    quark: extractGenericPanmockMeta,
-    uc: extractGenericPanmockMeta,
-    '139': extractGenericPanmockMeta,
-    baidu: extractGenericPanmockMeta,
-    '189': extractTianyiPanmockMeta,
-};
-
-function rewritePanmockSourceByProvider(label, playURL) {
-    const providerKey = getPanmockDetailProviderKey(label);
-    const codec = providerKey ? PANMOCK_DETAIL_CODECS[providerKey] : null;
-    if (typeof codec !== 'function') {
-        return { playFrom: String(label || '').trim(), playURL: String(playURL || '').trim() };
-    }
-    const tabs = String(playURL || '').split('#');
-    const byDisplay = new Map();
-    for (let idx = 0; idx < tabs.length; idx += 1) {
-        const chunk = String(tabs[idx] || '').trim();
-        if (!chunk) continue;
-        const splitIdx = chunk.indexOf('$');
-        if (splitIdx < 0) continue;
-        const title = String(chunk.slice(0, splitIdx) || '').trim();
-        const urlPart = String(chunk.slice(splitIdx + 1) || '').trim();
-        const meta = codec(label, title, urlPart);
-        const nextLabel = String(meta && meta.nextLabel ? meta.nextLabel : label).trim();
-        const displayTitle = String(meta && meta.passcode ? meta.passcode : '').trim();
-        const dedupeKey = displayTitle ? displayTitle.toLowerCase() : '__empty__';
-        const prev = byDisplay.get(dedupeKey);
-        const next = { raw: displayTitle, hasPasscode: !!displayTitle, order: idx, label: nextLabel };
-        if (!prev || (!prev.hasPasscode && next.hasPasscode)) {
-            byDisplay.set(dedupeKey, next);
-        }
-    }
-    const ordered = Array.from(byDisplay.values()).sort((a, b) => a.order - b.order);
-    return {
-        playFrom: String(ordered[0] && ordered[0].label ? ordered[0].label : label).trim(),
-        playURL: ordered.map((item) => item.raw).join('#'),
-    };
-}
-
-export function rewritePanmockDetailPayloadFields(playFrom, playURL) {
-    const fromRaw = String(playFrom || '');
-    const urlRaw = String(playURL || '');
-    const fromParts = fromRaw.split('$$$');
-    const urlParts = urlRaw.split('$$$');
-    const total = Math.max(fromParts.length, urlParts.length);
-    const nextFroms = [];
-    const nextURLs = [];
-    for (let i = 0; i < total; i += 1) {
-        const label = sanitizePanmockSourceLabel(i < fromParts.length ? fromParts[i] : '');
-        const urls = i < urlParts.length ? String(urlParts[i] || '') : '';
-        if (!isPanmockDetailSource(label)) {
-            nextFroms.push(label);
-            nextURLs.push(urls);
-            continue;
-        }
-        const rewritten = rewritePanmockSourceByProvider(label, urls);
-        nextFroms.push(rewritten.playFrom);
-        nextURLs.push(rewritten.playURL);
-    }
-    return {
-        vod_play_from: nextFroms.join('$$$'),
-        vod_play_url: nextURLs.join('$$$'),
-    };
 }
 
 const PAN_NAMES = { baidu: '百度', quark: '夸克', uc: 'UC', '189': '天翼', '139': '移动' };
@@ -323,126 +233,137 @@ function getDetailNavigationParent(data) {
     return clean(data && (data.vodId || data.parentId || data.parent_id || data.detailUrl));
 }
 
-export function isDetailNavigationList(list, requestedId = '') {
-    if (!Array.isArray(list) || !list.length) return false;
-    if (list.some((item) => !item || !clean(item.vod_id) || clean(item.vod_play_url) || clean(item.vod_play_from))) return false;
-    const decoded = list.map((item) => decodeStructuredDetailId(item.vod_id));
-    const parents = decoded.map(getDetailNavigationParent);
-    const requested = decodeStructuredDetailId(requestedId);
-    const expectedParent = getDetailNavigationParent(requested) || clean(requestedId);
-    const sameParent = parents[0] && parents.every((id) => id === parents[0]) &&
-        (!expectedParent || parents[0] === expectedParent || list.length === 1);
-    const explicit = list.every((item, index) => {
-        const data = decoded[index];
-        return !!(data && ['group', 'share'].includes(data.mode)) ||
-            item.vod_tag === 'folder' || (item.style && item.style.type === 'list');
-    });
-    // Do not flatten ordinary multi-movie search/category results.
-    return explicit && (list.length === 1 || !!sameParent);
+// Describe a script navigation without following it. The original ID stays on
+// the item; clients never need to decode an author's private ID representation.
+export function getDetailNavigation(item) {
+    if (!item || typeof item !== 'object' || Array.isArray(item) ||
+        !clean(item.vod_id) || clean(item.vod_play_url) || clean(item.vod_play_from)) return null;
+    const data = decodeStructuredDetailId(item.vod_id);
+    const declared = item.vod_navigation && typeof item.vod_navigation === 'object'
+        ? item.vod_navigation : null;
+    const explicit = item.action && typeof item.action === 'object' ? item.action : null;
+    const share = parsePanShareURL(declared && declared.share_url) ||
+        parsePanShareURL(item.share_url, item.password || item.pwd || item.passcode || item.accessCode) || parsePanShareURL(item.vod_id) ||
+        (data && parsePanShareURL(data.url || data.shareUrl || data.share_url, data.password || data.pwd || data.passcode || data.accessCode));
+    const args = (declared && declared.payload) || (explicit && explicit.payload);
+    let action = clean((declared && declared.action) || (explicit && explicit.action) ||
+        (typeof item.action === 'string' ? item.action : ''));
+    // A generic UI action (copy/open/etc.) is not a script API. Custom operations
+    // need an explicit navigation descriptor or action+payload, not just a name.
+    if (action && !declared && !['detail', 'category'].includes(action) &&
+        !(explicit && args && typeof args === 'object' && !Array.isArray(args))) return null;
+    if (!action) {
+        if (item.action || declared) return null;
+        if (item.vod_tag === 'folder') action = 'category';
+        else if (share || (data && ['group', 'share'].includes(data.mode))) action = 'detail';
+    }
+    if (!/^[a-z][a-z0-9_-]*$/i.test(action)) return null;
+    const payload = args && typeof args === 'object' && !Array.isArray(args)
+        ? { ...args } : { id: item.vod_id, ...(action === 'category' ? { page: 1 } : {}) };
+    const provider = (share && share.provider) ||
+        getSupportedPanProvider((data && (data.provider || data.providerId)) || item.vod_name);
+    return {
+        action, payload,
+        ...(provider ? { provider } : {}),
+        ...(share ? { share_url: share.url, share_flag: share.flag } : {}),
+    };
 }
 
-export async function normalizePanDetailResponse(parsed, { panMock, requestedId = '', loadDetail, listShare, maxDepth = 5, maxRequests = 64 } = {}) {
+export async function normalizePanDetailResponse(parsed, { panMock, listShare, requestedId = '' } = {}) {
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return parsed;
+    const { _catpaw_pan_shares, ...rest } = parsed;
+    if (!Array.isArray(parsed.list)) return { ...rest, pan_mock: !!panMock };
+    const diagnostics = [];
+    const inputItems = [];
+    const shareSlots = new Map();
+    for (const item of parsed.list) {
+        const nav = getDetailNavigation(item);
+        const share = nav && parsePanShareURL(nav.share_url);
+        if (share && shareSlots.has(share.key)) {
+            const slot = shareSlots.get(share.key);
+            const previous = parsePanShareURL(getDetailNavigation(inputItems[slot]).share_url);
+            if (!previous.password && share.password) inputItems[slot] = item;
+            continue;
+        }
+        if (share) shareSlots.set(share.key, inputItems.length);
+        inputItems.push(item);
+    }
+    const items = await Promise.all(inputItems.map(async (item) => {
+        // Preserve unknown upstream data, including null. Do not turn a schema
+        // we cannot handle into a successful empty detail.
+        if (!item || typeof item !== 'object' || Array.isArray(item)) return item;
+        const nav = getDetailNavigation(item);
+        if (nav) {
+            return {
+                ...item,
+                ...(!nav.share_url && nav.provider ? { vod_name: `${PAN_NAMES[nav.provider]}网盘` } : {}),
+                vod_navigation: nav,
+            };
+        }
+        const captures = Array.isArray(_catpaw_pan_shares) ? _catpaw_pan_shares : [];
+        const ownFlags = clean(item.vod_play_from).split('$$$');
+        const ownUrls = clean(item.vod_play_url).split('$$$');
+        const ownShares = ownFlags.flatMap((flag, i) => extractPanSharesFromSource(flag, ownUrls[i], { placeholders: true }));
+        const keys = new Set(ownShares.map(share => share.key));
+        const captured = parsed.list.length === 1 ? captures :
+            captures.filter(entry => keys.has(parsePanShareURL(entry && entry.url, entry && entry.password)?.key));
+        if (!clean(item.vod_play_from) && !clean(item.vod_play_url) && !captured.length) return item;
+        const result = await normalizePanDetailItem(item, captured, { panMock, listShare });
+        diagnostics.push(...result.diagnostics);
+        return result.item;
+    }));
+    const messages = [parsed.message, ...diagnostics].map(clean).filter(Boolean);
+    let vod = parsed.vod;
+    if (!vod && items.some(item => item && item.vod_navigation)) {
+        const first = items.find(item => item && item.vod_navigation);
+        const data = decodeStructuredDetailId(first.vod_id);
+        if (data && getDetailNavigationParent(data)) {
+            vod = { ...(data.meta || {}), vod_id: requestedId || getDetailNavigationParent(data) };
+            for (const key of ['name', 'pic', 'year', 'content', 'actor', 'director', 'area', 'type']) {
+                if (data[key] != null && vod[`vod_${key}`] == null) vod[`vod_${key}`] = data[key];
+            }
+        }
+    }
+    return {
+        ...rest, pan_mock: !!panMock, list: items,
+        ...(vod ? { vod } : {}),
+        ...(messages.length ? { message: Array.from(new Set(messages)).join('；') } : {}),
+    };
+}
+
+async function normalizePanDetailItem(item, captured, { panMock, listShare }) {
     const shares = new Map();
     const leaves = [];
     const diagnostics = [];
-    const visited = new Set([clean(requestedId)].filter(Boolean));
-    let requests = 0;
-    let expanded = false;
-    let base = null;
     const addShare = (share) => {
         if (!share) return;
         const old = shares.get(share.key);
         if (!old || (!old.password && share.password)) shares.set(share.key, share);
     };
-    const collect = async (doc, depth, currentId) => {
-        if (!doc || typeof doc !== 'object') return;
-        const captured = Array.isArray(doc._catpaw_pan_shares) ? doc._catpaw_pan_shares : [];
-        const capturedProviders = new Set(captured.map((item) => parsePanShareURL(item && item.url, item && item.password)?.provider).filter(Boolean));
-        captured.forEach((item) => addShare(parsePanShareURL(item && item.url, item && item.password)));
-        const list = Array.isArray(doc.list) ? doc.list : [];
-        if (isDetailNavigationList(list, currentId)) {
-            expanded = true;
-            for (const item of list) {
-                const data = decodeStructuredDetailId(item.vod_id);
-                if (!base && data && data.meta && typeof data.meta === 'object') base = { ...data.meta };
-                if (!base && getDetailNavigationParent(data)) {
-                    base = { vod_id: getDetailNavigationParent(data) };
-                    for (const key of ['name', 'pic', 'year', 'content', 'actor', 'director', 'area', 'type']) {
-                        if (data[key] != null) base[`vod_${key}`] = data[key];
-                    }
-                }
-                const direct = parsePanShareURL(item.vod_id) ||
-                    (data && parsePanShareURL(data.url || data.shareUrl, data.password || data.pwd || data.accessCode));
-                if (direct) {
-                    if (!base && !data) base = { ...item };
-                    addShare(direct);
-                    continue;
-                }
-                const id = clean(item.vod_id);
-                if (visited.has(id)) continue;
-                if (depth >= maxDepth || requests >= maxRequests || typeof loadDetail !== 'function') {
-                    diagnostics.push('详情导航超过解析上限');
-                    continue;
-                }
-                visited.add(id);
-                requests += 1;
-                try { await collect(await loadDetail(id), depth + 1, id); }
-                catch (error) { diagnostics.push(`${clean(item.vod_name) || '详情'}: ${clean(error && error.message)}`); }
-            }
-        } else {
-            if (!base && list[0]) base = { ...list[0] };
-            for (const item of list) {
-                if (!item || typeof item !== 'object') continue;
-                const flags = clean(item.vod_play_from).split('$$$');
-                const groups = clean(item.vod_play_url).split('$$$');
-                for (let i = 0; i < Math.max(flags.length, groups.length); i += 1) {
-                    const flag = flags[i] || '';
-                    const group = groups[i] || '';
-                    if (!flag && !group) continue;
-                    const inputs = extractPanSharesFromSource(flag, group, { placeholders: captured.length > 0 });
-                    inputs.forEach(addShare);
-                    const provider = getSupportedPanProvider(flag);
-                    // Capture evidence belongs to this child detail, not every
-                    // sibling navigation branch with a similar display name.
-                    leaves.push({ flag, group, inputs, captured: capturedProviders.has(provider) });
-                }
-            }
-        }
-        if (doc.message) diagnostics.push(clean(doc.message));
-    };
-    // An ordinary multiple-item detail response is not permission to combine
-    // separate movies. Normalize each independently without sharing captures.
-    if (Array.isArray(parsed.list) && parsed.list.length > 1 && !isDetailNavigationList(parsed.list, requestedId)) {
-        const items = [];
-        for (const item of parsed.list) {
-            if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
-            // Only attach captures whose share identity is already present in
-            // this item's fields. Unattributable request-wide captures must not
-            // be assigned to another film.
-            const flags = clean(item && item.vod_play_from).split('$$$');
-            const groups = clean(item && item.vod_play_url).split('$$$');
-            const keys = new Set(flags.flatMap((flag, i) => extractPanSharesFromSource(flag, groups[i], { placeholders: true })).map((share) => share.key));
-            const captured = (parsed._catpaw_pan_shares || []).filter((entry) => keys.has(parsePanShareURL(entry && entry.url)?.key));
-            const result = await normalizePanDetailResponse({ list: [item], _catpaw_pan_shares: captured }, { panMock, requestedId: item.vod_id, listShare });
-            // Empty child results must not create undefined slots, which JSON
-            // serialization turns into misleading null detail entries.
-            items.push(...result.list);
-            if (result.message) diagnostics.push(result.message);
-        }
-        const { _catpaw_pan_shares, ...rest } = parsed;
-        return { ...rest, pan_mock: !!panMock, list: items, ...(diagnostics.length ? { message: Array.from(new Set(diagnostics)).join('；') } : {}) };
+    const capturedProviders = new Set(captured.map(entry => parsePanShareURL(entry && entry.url, entry && entry.password)?.provider).filter(Boolean));
+    captured.forEach(entry => addShare(parsePanShareURL(entry && entry.url, entry && entry.password)));
+    const flags = clean(item.vod_play_from).split('$$$');
+    const urls = clean(item.vod_play_url).split('$$$');
+    for (let i = 0; i < Math.max(flags.length, urls.length); i += 1) {
+        const flag = flags[i] || '';
+        const group = urls[i] || '';
+        if (!flag && !group) continue;
+        const inputs = extractPanSharesFromSource(flag, group, { placeholders: captured.length > 0 });
+        inputs.forEach(addShare);
+        leaves.push({ flag, group, inputs, captured: capturedProviders.has(getSupportedPanProvider(flag)) });
     }
-    await collect(parsed, 0, clean(requestedId));
     const inputs = Array.from(shares.values());
+    if (!inputs.length) return { item, diagnostics };
     const supported = new Array(inputs.length);
-    let nextIndex = 0;
-    // Bound concurrent provider requests without serialising a detail with
-    // many independent shares. Existing list caches still coalesce duplicates.
-    const resolveNext = async () => {
-      while (nextIndex < inputs.length) {
-        const index = nextIndex++;
-        const share = inputs[index];
+    // Independent providers may run together; each provider advances one share
+    // at a time. The actual list entrypoint also gates across detail requests.
+    const queues = new Map();
+    inputs.forEach((share, index) => {
+        if (!queues.has(share.provider)) queues.set(share.provider, []);
+        queues.get(share.provider).push({ share, index });
+    });
+    await Promise.all(Array.from(queues.values(), async queue => {
+      for (const { share, index } of queue) {
         if (panMock) {
             supported[index] = { flag: share.flag, group: share.url };
         } else {
@@ -457,21 +378,13 @@ export async function normalizePanDetailResponse(parsed, { panMock, requestedId 
             }
         }
       }
-    };
-    await Promise.all(Array.from({ length: Math.min(3, inputs.length) }, resolveNext));
+    }));
     const native = leaves.filter((item) => !item.inputs.length && !item.captured);
     const groups = [...supported.filter(Boolean), ...native];
-    const { _catpaw_pan_shares, ...rest } = parsed;
-    const item = {
-        ...(base || {}),
-        ...(expanded && requestedId ? { vod_id: requestedId } : {}),
-        vod_play_from: groups.map((entry) => entry.flag).join('$$$'),
-        vod_play_url: groups.map((entry) => entry.group).join('$$$'),
-    };
-    // Navigation cards' list style/folder tag must not escape as the film detail.
-    if (expanded) { delete item.style; delete item.vod_tag; }
     return {
-        ...rest, pan_mock: !!panMock, list: base || groups.length ? [item] : [],
-        ...(diagnostics.length ? { message: Array.from(new Set(diagnostics)).join('；').slice(0, 2000) } : {}),
+        item: { ...item,
+            vod_play_from: groups.map(entry => entry.flag).join('$$$'),
+            vod_play_url: groups.map(entry => entry.group).join('$$$'),
+        }, diagnostics,
     };
 }

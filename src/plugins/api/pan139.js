@@ -1,3 +1,4 @@
+import { serialPanListHandler } from '../../util/panListQueue.js';
 // 139Yun (移动云盘/和彩云) OutLink API.
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -771,7 +772,7 @@ export const apiPlugins = [
     {
         prefix: '/api/139',
         plugin: async function pan139Api(instance) {
-            instance.post('/list', async (req, reply) => {
+            instance.post('/list', serialPanListHandler('139', async (req, reply) => {
                 const body = normalizeRequestBody(req && req.body);
                 const flag = toStr(body.flag || '').trim();
                 const linkID = toStr(body.linkID || body.linkId || parseLinkIDFromFlag(flag)).trim();
@@ -839,7 +840,7 @@ export const apiPlugins = [
                     reply.code(502);
                     return { ok: false, message: (e && e.message) || String(e) };
                 }
-            });
+            }));
 
             instance.post('/play', async (req, reply) => {
                 const body = normalizeRequestBody(req && req.body);

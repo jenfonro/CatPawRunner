@@ -1071,7 +1071,7 @@ export default async function router(fastify) {
     // This allows downloaded scripts in `custom_spider/` to expose their own routes while still being accessed from this port.
     const proxyToPort = async function (request, reply, targetPort, urlPath, runtimeId = '') {
         const pathToUse = typeof urlPath === 'string' && urlPath ? urlPath : '/';
-        const wantInjectPanMock = /\/spider\/[^/]+\/\d+\/detail(?:\?|$)/i.test(pathToUse);
+        const wantInjectPanMock = /\/spider\/[^/]+\/\d+\/(?!(?:home|search|init|play|proxy)(?:\?|$))[a-z][a-z0-9_-]*(?:\?|$)/i.test(pathToUse);
         const allowSpiderCache = isEligibleSpiderCacheRequest(request && request.method, pathToUse) && /^[a-f0-9]{10}$/i.test(String(runtimeId || '').trim());
 
         const hopByHop = new Set([
@@ -1141,15 +1141,6 @@ export default async function router(fastify) {
                     const next = await normalizePanDetailResponse(parsed, {
                         panMock,
                         requestedId: String(body.id || body.ids || ''),
-                        loadDetail: async (id) => {
-                            const payload = { ...body, id };
-                            if (Object.prototype.hasOwnProperty.call(body, 'ids')) payload.ids = id;
-                            const nested = await loadRaw(payload);
-                            const result = parseJsonSafe(nested.body.toString('utf8'));
-                            if (!result) throw new Error('详情响应不是有效 JSON');
-                            if (nested.statusCode < 200 || nested.statusCode >= 300) throw new Error(result.message || `脚本详情 HTTP ${nested.statusCode}`);
-                            return result;
-                        },
                         listShare: async (share) => {
                             const injected = await fastify.inject({
                                 method: 'POST', url: `/api/${share.provider}/list`,
@@ -1169,7 +1160,7 @@ export default async function router(fastify) {
                     return {
                         entry: { ...raw, statusCode: playable ? 200 : raw.statusCode, body: Buffer.from(JSON.stringify(next)) },
                         // Do not pin transient/partial failures for an hour.
-                        cacheable: playable && !next.message,
+                        cacheable: (playable || (Array.isArray(next.list) && next.list.some(item => item && item.vod_navigation))) && !next.message,
                     };
                 });
                 sendBufferedProxyResponse(reply, request, entry, {

@@ -1,3 +1,4 @@
+import { serialPanListHandler } from '../../util/panListQueue.js';
 // Quark API plugin.
 
 import fs from 'node:fs';
@@ -1372,7 +1373,7 @@ const apiPlugins = [
         }
       });
 
-      instance.post('/list', async (req, reply) => {
+      instance.post('/list', serialPanListHandler('quark', async (req, reply) => {
         const body = req && typeof req.body === 'object' ? req.body : {};
         const flag = String(body.flag || '').trim();
         const shareId = parseQuarkShareIdFromFlag(flag);
@@ -1511,7 +1512,7 @@ const apiPlugins = [
           reply.code(502);
           return { ok: false, message: msg.slice(0, 400) };
         }
-      });
+      }));
 
       instance.post('/share/parse_down', async (req, reply) => {
         const body = req && typeof req.body === 'object' ? req.body : {};

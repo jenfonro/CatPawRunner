@@ -1,3 +1,4 @@
+import { serialPanListHandler } from '../../util/panListQueue.js';
 // UC (优夕) API plugin.
 
 import fs from 'node:fs';
@@ -1607,7 +1608,7 @@ const apiPlugins = [
         }
       });
 
-      instance.post('/list', async (req, reply) => {
+      instance.post('/list', serialPanListHandler('uc', async (req, reply) => {
         const body = req && typeof req.body === 'object' ? req.body : {};
         const flag = String(body.flag || '').trim();
         if (!flag) {
@@ -1662,7 +1663,7 @@ const apiPlugins = [
           reply.code(502);
           return { ok: false, message: msg.slice(0, 400) };
         }
-      });
+      }));
 
       instance.post('/share/save', async (req, reply) => {
         const body = req && typeof req.body === 'object' ? req.body : {};

@@ -169,78 +169,58 @@ test('compressed cached-script detail can be normalized even without a new inter
     assert.match(response.json().list[0].vod_play_url, /^https:\/\/pan\.baidu\.com\/s\/1shareA/);
 });
 
-test('detail URL navigation expands through the existing proxy/cache in both modes', async t => {
-    const movie = {
-        detailUrl: 'https://movies.example/mv/123.html', name: 'Navigation movie',
-        pic: 'https://movies.example/poster.jpg', year: '2026',
-    };
-    const idFor = data => 'qw:' + Buffer.from(JSON.stringify({ ...movie, ...data })).toString('base64url');
-    const card = (mode, provider, url) => ({
-        vod_id: idFor({ mode, provider, ...(url ? { url } : {}) }),
-        vod_name: provider,
-        ...(provider !== 'collect' ? { vod_tag: 'folder' } : {}),
+test('navigation is returned without child I/O; category and selected leaves use original script routes', async t => {
+    const encodeNav = data => 'nav:' + Buffer.from(JSON.stringify({ detailUrl: 'https://site.example/movie', name: 'Movie', ...data })).toString('base64url');
+    const q = { vod_id: encodeNav({ mode: 'group', provider: 'quark' }), vod_name: 'quark', vod_tag: 'folder' };
+    const native = { vod_id: encodeNav({ mode: 'group', provider: 'collect' }), vod_name: 'Collection' };
+    const shares = ['shareA', 'shareB'].map(id => ({ vod_id: encodeNav({ mode: 'share', provider: 'quark', url: 'https://pan.quark.cn/s/' + id }), vod_name: id }));
+    const fx = await fixture(t, body => {
+        if (body.id === 'film') return { doc: { list: [q, native, null] } };
+        if (body.id === q.vod_id) return { doc: { list: shares, page: 1, pagecount: 1 } };
+        if (body.id === native.vod_id) return { doc: { list: [{ vod_play_from: '蓝光HDR', vod_play_url: 'E1$native-id' }] } };
+        if (body.id === shares[0].vod_id) return { doc: { list: [{ vod_play_from: '夸克网盘', vod_play_url: 'placeholder' }], _catpaw_pan_shares: [{ url: 'https://pan.quark.cn/s/shareA' }] } };
+        return { status: 404, doc: { ok: false, message: 'unexpected request' } };
     });
-    const rootId = idFor({ mode: 'movie' });
-    const groups = ['quark', 'baidu', 'collect', 'guangya'].map(provider => card('group', provider));
-    const shares = [
-        card('share', 'quark', 'https://pan.quark.cn/s/shareA'),
-        card('share', 'quark', 'https://pan.quark.cn/s/shareB?pwd=abcd'),
-        card('share', 'baidu', 'https://pan.baidu.com/s/1shareC?pwd=1234'),
-        card('share', 'guangya', 'https://unsupported.example/share/duck'),
-    ];
-    const nativeId = 'https://cover.example/pic*Author*1:20****opaque-E65';
-    const native = (flag, id) => ({ list: [{
-        vod_id: movie.detailUrl, vod_name: movie.name,
-        vod_play_from: flag, vod_play_url: `Episode$${id}`,
-    }] });
-    const docs = new Map([
-        [rootId, { list: groups }],
-        [groups[0].vod_id, { list: shares.slice(0, 2) }],
-        [groups[1].vod_id, { list: [shares[2]] }],
-        [groups[2].vod_id, native('蓝光HDR', nativeId)],
-        [groups[3].vod_id, { list: [shares[3]] }],
-        [shares[3].vod_id, native('光鸭原画', 'native-duck-id')],
-    ]);
-    const fx = await fixture(t, body => docs.has(body.id)
-        ? { doc: docs.get(body.id) }
-        : { status: 404, doc: { list: [], message: 'unexpected navigation id' } });
-    const detail = () => fx.app.inject({
-        method: 'POST', url: '/aaaaaaaaaa/spider/test/3/detail', payload: { id: rootId },
-    });
-    const detailCalls = () => fx.rawCalls.filter(call => call.path.endsWith('/detail'));
     for (const panMock of [true, false]) {
         fx.setConfig({ pan_mock: panMock });
-        const response = await detail();
-        assert.equal(response.statusCode, 200);
-        const out = response.json();
-        assert.equal(out.pan_mock, panMock);
-        assert.equal(out.cache, false, 'normalized cache entries are mode-specific');
-        assert.equal(out.list.length, 1);
-        assert.equal(out.list[0].vod_id, rootId);
-        assert.equal(out.list[0].vod_name, movie.name);
-        assert.equal(out.list[0].vod_pic, movie.pic);
-        assert.equal(out.list[0].vod_year, movie.year);
-        assert.equal(out.list[0].vod_tag, undefined);
-        assert.equal(out.list[0].vod_play_from, '夸克-shareA$$$夸克-shareB-abcd$$$百度-shareC-1234$$$蓝光HDR$$$光鸭原画');
-        assert.deepEqual(out.list[0].vod_play_url.split('$$$').slice(0, 3), panMock
-            ? ['https://pan.quark.cn/s/shareA', 'https://pan.quark.cn/s/shareB?pwd=abcd', 'https://pan.baidu.com/s/1shareC?pwd=1234']
-            : Array(3).fill(`File$${completeId}`));
-        assert.deepEqual(out.list[0].vod_play_url.split('$$$').slice(-2), [`Episode$${nativeId}`, 'Episode$native-duck-id']);
-        assert.equal(out.message, undefined);
-        assert.equal(detailCalls().length, 6, 'switching owners reuses raw root and nested details');
-        assert.deepEqual(new Set(detailCalls().map(call => call.body.id)), new Set(docs.keys()));
-        assert.equal(fx.panCalls.length, panMock ? 0 : 3);
-        assert.equal((await detail()).json().cache, true);
-        assert.equal(detailCalls().length, 6);
-        assert.equal(fx.panCalls.length, panMock ? 0 : 3);
+        const root = (await fx.detail()).json();
+        assert.equal(root.pan_mock, panMock);
+        assert.equal(root.list.length, 3);
+        assert.equal(root.list[2], null);
+        assert.equal(root.list[0].vod_navigation.action, 'category');
+        assert.equal(root.list[1].vod_navigation.action, 'detail');
+        assert.equal(root.vod.vod_name, 'Movie');
+        assert.equal(fx.panCalls.length, 0);
+        assert.equal((await fx.detail()).json().cache, true);
+        const group = await fx.app.inject({ method: 'POST', url: '/aaaaaaaaaa/spider/test/3/category', payload: root.list[0].vod_navigation.payload });
+        assert.equal(group.statusCode, 200);
+        const cards = group.json();
+        assert.equal(cards.pan_mock, panMock);
+        assert.equal(cards.list.length, 2);
+        assert.equal(cards.list[0].vod_navigation.share_flag, '夸克-shareA');
+        assert.equal(cards.list[0].vod_play_url, undefined);
+        assert.equal(fx.panCalls.length, 0, 'group request must not list all shares');
     }
-    assert.deepEqual(fx.panCalls.map(call => call.path), ['/api/quark/list', '/api/quark/list', '/api/baidu/list']);
-    for (const [flag, id] of [['蓝光HDR', nativeId], ['光鸭原画', 'native-duck-id']]) {
-        const response = await fx.app.inject({
-            method: 'POST', url: '/play',
-            payload: { flag, id, siteApi: '/aaaaaaaaaa/spider/test/3' },
-        });
-        assert.equal(response.json().nativeFlag, flag);
-        assert.equal(response.json().nativeId, id);
-    }
+    const selected = await fx.app.inject({ method: 'POST', url: '/aaaaaaaaaa/spider/test/3/detail', payload: { id: shares[0].vod_id } });
+    assert.equal(selected.json().list[0].vod_play_from, '夸克-shareA');
+    assert.equal(fx.panCalls.length, 1);
+    assert.equal(fx.panCalls[0].path, '/api/quark/list');
+    assert.equal(fx.rawCalls.some(call => call.body.id === shares[1].vod_id), false);
+    assert.equal(fx.rawCalls.filter(call => call.body.id === 'film').length, 1);
+    assert.equal(fx.rawCalls.filter(call => call.body.id === q.vod_id).length, 1);
+    assert.ok(fx.rawCalls.some(call => call.path.endsWith('/category')));
+    const played = await fx.app.inject({ method: 'POST', url: '/play', payload: { flag: '蓝光HDR', id: 'native-id', siteApi: '/aaaaaaaaaa/spider/test/3' } });
+    assert.equal(played.json().nativeFlag, '蓝光HDR');
+    assert.equal(played.json().nativeId, 'native-id');
+});
+
+test('unknown upstream data and errors remain visible on custom navigation routes', async t => {
+    const doc = { list: [null, { vod_id: 'opaque', style: { type: 'list' }, custom: true }], message: 'original diagnostic' };
+    const fx = await fixture(t, () => ({ doc }));
+    const response = await fx.app.inject({ method: 'POST', url: '/aaaaaaaaaa/spider/test/3/resources', payload: { cursor: 'original' } });
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(response.json().list, doc.list);
+    assert.equal(response.json().message, doc.message);
+    assert.equal(fx.rawCalls.at(-1).body.cursor, 'original');
+    assert.equal(fx.panCalls.length, 0);
 });
