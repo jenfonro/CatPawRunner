@@ -5,6 +5,7 @@ import http from 'node:http';
 import { findAvailablePortInRange } from './tool.js';
 import { detectOnlineScriptProtocol } from './onlineScriptAdapters.js';
 import { createRuntimePanCapture } from './runtimePanCapture.js';
+import { isSpiderPanDetailRequest } from './spiderRouteMatcher.js';
 
 const children = new Map(); // id -> { child, entry, entryFn, port, startedAt, healthFailures }
 const starting = new Map(); // id -> Promise<startResult>
@@ -1971,7 +1972,7 @@ export async function startOnlineRuntime({
                   const site = __extractSiteFromReqUrl(req && req.url ? req.url : '');
                   const requestPath = String(req && req.url || '').split('?')[0];
                   const store = { site };
-                  if (/^\\/spider\\/[^/]+\\/\\d+\\/(?!(?:home|search|init|play|proxy)\\/?$)[a-zA-Z][a-zA-Z0-9_-]*\\/?$/.test(requestPath)) store.panShares = new Map();
+                  if ((${isSpiderPanDetailRequest.toString()})(req && req.method, requestPath)) store.panShares = new Map();
                   if (store.panShares) __panCapture.wrapResponse(res, store);
                   return __siteAls ? __siteAls.run(store, () => handle(req, res)) : handle(req, res);
                 };

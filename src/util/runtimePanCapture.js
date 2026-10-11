@@ -55,7 +55,6 @@ export function createRuntimePanCapture({ getStore, extractCreds, placeholderCac
             const base = bases[provider];
             if (!base) return;
             const key = provider + ':' + id;
-            if (store.panShares.size >= 256 && !store.panShares.has(key)) return;
             const previous = store.panShares.get(key);
             store.panShares.set(key, {
                 provider,

@@ -54,7 +54,7 @@ async function fixture(t, rawHandler = () => ({ doc: rawDetail() })) {
     // Stub only provider network I/O. The real router, body parsing, flag
     // dispatch, detail codec and TTL/inflight cache are exercised unchanged.
     app.addHook('preHandler', async (req, reply) => {
-        if (!/^\/api\/(?:baidu|quark|uc|139|189)\/(?:list|play)$/.test(req.url)) return;
+        if (!/^\/api\/(?:baidu|quark|uc|139|189)\/(?:list|play|download|(?:tv|file)\/download)$/.test(req.url)) return;
         panCalls.push({ path: req.url, body: req.body, user: req.headers['x-tv-user'] });
         return reply.send(req.url.endsWith('/list')
             ? { ok: true, vod_play_url: `File$${completeId}` }
@@ -121,7 +121,11 @@ test('two modes reuse raw detail cache but keep normalized mode/account/TV-user 
 
 test('native and unrecognized private IDs retain their script flag and route', async t => {
     const fx = await fixture(t);
-    for (const [flag, id] of [['蓝光HDR', 'opaque-native-id'], ['百度原画', privateId], ['光鸭原画', 'duck-id']]) {
+    const metadataId = 'https://cover.example/pic*Author*1:20****opaque-E65';
+    for (const [flag, id] of [
+        ['蓝光HDR', 'opaque-native-id'], ['百度原画', privateId], ['光鸭原画', 'duck-id'],
+        ['夸克', metadataId], ['UC', metadataId], ['移动', metadataId],
+    ]) {
         const result = await fx.app.inject({
             method: 'POST', url: '/play', payload: { flag, id, siteApi: '/aaaaaaaaaa/spider/test/3' },
         });
@@ -130,6 +134,30 @@ test('native and unrecognized private IDs retain their script flag and route', a
         assert.equal(result.json().nativeId, id);
     }
     assert.equal(fx.panCalls.length, 0);
+});
+
+test('a script-bound hash ID is not inferred to be a standalone account file', async t => {
+    const fx = await fixture(t);
+    const id = 'a'.repeat(32);
+    for (const flag of ['夸克', 'UC']) {
+        const result = await fx.app.inject({
+            method: 'POST', url: '/play', payload: { flag, id, siteApi: '/aaaaaaaaaa/spider/test/3' },
+        });
+        assert.equal(result.statusCode, 200);
+        assert.equal(result.json().nativeId, id);
+    }
+    assert.equal(fx.panCalls.length, 0);
+});
+
+test('explicit standalone account file downloads still use their original built-in path', async t => {
+    const fx = await fixture(t);
+    const id = 'a'.repeat(32);
+    for (const [flag, route] of [['夸克', '/api/quark/download'], ['UC', '/api/uc/tv/download']]) {
+        const result = await fx.app.inject({ method: 'POST', url: '/play', payload: { flag, id } });
+        assert.equal(result.statusCode, 200);
+        assert.equal(fx.panCalls.at(-1).path, route);
+        assert.equal(fx.panCalls.at(-1).body.fid, id);
+    }
 });
 
 test('canonical Tianyi password reaches the existing built-in play accessCode parameter', async t => {
@@ -222,5 +250,44 @@ test('unknown upstream data and errors remain visible on custom navigation route
     assert.deepEqual(response.json().list, doc.list);
     assert.equal(response.json().message, doc.message);
     assert.equal(fx.rawCalls.at(-1).body.cursor, 'original');
+    assert.equal(fx.panCalls.length, 0);
+});
+
+test('ordinary custom operations are not silently cached or rewritten as details', async t => {
+    let calls = 0;
+    const fx = await fixture(t, () => ({ doc: { list: [{ id: ++calls, value: 'native-operation-result' }] } }));
+    for (const action of ['resources', 'refresh']) {
+        const request = { method: 'POST', url: `/aaaaaaaaaa/spider/test/3/${action}`, payload: { cursor: 'same-input' } };
+        const results = [];
+        for (let repeat = 0; repeat < 2; repeat += 1) {
+            const before = calls;
+            const result = await fx.app.inject(request);
+            assert.equal(calls, before + 1, `${action} must retain its original request execution`);
+            results.push({ actual: result.json(), expected: { list: [{ id: calls, value: 'native-operation-result' }] } });
+        }
+        for (const { actual, expected } of results) assert.deepEqual(actual, expected);
+    }
+    assert.equal(fx.panCalls.length, 0);
+});
+
+test('detail adaptation does not impose a new timeout on ordinary cached spider requests', async t => {
+    const doc = { list: [{ vod_id: 'film', vod_name: 'Unchanged search result' }] };
+    const fx = await fixture(t, () => ({ doc }));
+    const timeoutCalls = [];
+    const original = http.ClientRequest.prototype.setTimeout;
+    t.mock.method(http.ClientRequest.prototype, 'setTimeout', function (milliseconds, ...args) {
+        timeoutCalls.push({ path: this.path, milliseconds });
+        return original.call(this, milliseconds, ...args);
+    });
+    for (const action of ['home', 'search']) {
+        const request = { method: 'POST', url: `/aaaaaaaaaa/spider/test/3/${action}`, payload: { wd: 'film' } };
+        const first = await fx.app.inject(request);
+        assert.equal(first.statusCode, 200);
+        assert.deepEqual(first.json().list, doc.list);
+        assert.equal(first.json().pan_mock, undefined);
+        assert.equal((await fx.app.inject(request)).json().cache, true);
+    }
+    assert.deepEqual(timeoutCalls.filter(call => /\/(?:home|search)$/.test(call.path)), [],
+        'a new detail timeout leaked into ordinary home/search forwarding');
     assert.equal(fx.panCalls.length, 0);
 });

@@ -1,4 +1,3 @@
-import { serialPanListHandler } from '../../util/panListQueue.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
@@ -1137,7 +1136,7 @@ const apiPlugins = [
         return { ok: true, hasCookie: !!cookie, features: { transferSupportsFlagId: true } };
       });
 
-      instance.post('/list', serialPanListHandler('baidu', async (req, reply) => {
+      instance.post('/list', async (req, reply) => {
         const body = req && typeof req.body === 'object' ? req.body : {};
         const flag = String(body.flag || '').trim();
         const surl = parseSurlFromFlag(flag);
@@ -1183,7 +1182,7 @@ const apiPlugins = [
           reply.code(502);
           return { ok: false, ...normalizeBaiduErr(e) };
         }
-      }));
+      });
 
       instance.get('/auth/bdstoken', async (req, reply) => {
         const root = await readDbRoot(req.server);

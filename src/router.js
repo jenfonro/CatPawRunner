@@ -12,7 +12,7 @@ import {
     isEligibleSpiderCacheRequest,
 } from './util/runtimeSpiderCache.js';
 import { getSupportedPanProvider, isBuiltinPanPlayId, normalizePanDetailResponse, parsePanShareURL } from './util/panmockDetailCodec.js';
-import { isSpiderCacheRoutePath } from './util/spiderRouteMatcher.js';
+import { isSpiderCacheRoutePath, isSpiderPanDetailRequest } from './util/spiderRouteMatcher.js';
 import { getOnlineRuntimeUpstreamOrigin } from './util/onlineRuntime.js';
 
 const spiderPrefix = '/spider';
@@ -569,7 +569,6 @@ async function fetchBufferedProxyResponse({ request, targetPort, pathToUse, head
             }
         );
         proxyReq.on('error', reject);
-        proxyReq.setTimeout(45000, () => proxyReq.destroy(new Error('脚本详情请求超时')));
         try {
             const method = String(request.method || 'GET').toUpperCase();
             const body = request && Object.prototype.hasOwnProperty.call(request, 'body') ? request.body : undefined;
@@ -687,10 +686,13 @@ export default async function router(fastify) {
                 pickStringField(body, ['url', 'shareUrl', 'shareURL', 'share_url']) ||
                 extractFirstUrl(flag) ||
                 '';
+            const hasScriptRoute = !!pickStringField(body, ['siteApi', 'spiderApi', 'api', 'siteId', 'onlineId', 'runtimeId']);
             // A script's private Base64 play payload must not be fed to a
             // built-in resolver merely because its label contains "百度".
+            // Bare account file IDs remain supported for standalone calls;
+            // a script-bound hash is not evidence of an account file.
             if (playId && !isBuiltinPanPlayId(provider, playId) &&
-                !((provider === 'quark' || provider === 'uc') && looksLikeHexId32(playId))) route = '';
+                !(!hasScriptRoute && (provider === 'quark' || provider === 'uc') && looksLikeHexId32(playId))) route = '';
             if (!playId && !parsePanShareURL(shareUrl)) route = '';
 
             const injectJson = async (url, payload) => {
@@ -1071,7 +1073,7 @@ export default async function router(fastify) {
     // This allows downloaded scripts in `custom_spider/` to expose their own routes while still being accessed from this port.
     const proxyToPort = async function (request, reply, targetPort, urlPath, runtimeId = '') {
         const pathToUse = typeof urlPath === 'string' && urlPath ? urlPath : '/';
-        const wantInjectPanMock = /\/spider\/[^/]+\/\d+\/(?!(?:home|search|init|play|proxy)(?:\?|$))[a-z][a-z0-9_-]*(?:\?|$)/i.test(pathToUse);
+        const wantInjectPanMock = /\/spider\/[^/]+\/\d+\/detail(?:\?|$)/i.test(pathToUse);
         const allowSpiderCache = isEligibleSpiderCacheRequest(request && request.method, pathToUse) && /^[a-f0-9]{10}$/i.test(String(runtimeId || '').trim());
 
         const hopByHop = new Set([
@@ -1101,7 +1103,7 @@ export default async function router(fastify) {
         delete headers['transfer-encoding'];
 
         reply.hijack();
-        if (wantInjectPanMock && String(request.method || '').toUpperCase() === 'POST') {
+        if (isSpiderPanDetailRequest(request.method, pathToUse)) {
             // Raw script details (including captured shares) and normalized
             // details both use the existing bounded TTL/inflight cache.
             const panMock = isPanMockEnabled();

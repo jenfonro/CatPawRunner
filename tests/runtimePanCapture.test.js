@@ -1,9 +1,45 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import fs from 'node:fs';
+import vm from 'node:vm';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import * as zlib from 'node:zlib';
 import { createRuntimePanCapture } from '../src/util/runtimePanCapture.js';
+import * as spiderRoutes from '../src/util/spiderRouteMatcher.js';
+
+test('the actual runtime wrapper scopes new capture to POST detail/category requests', () => {
+    const source = fs.readFileSync(new URL('../src/util/onlineRuntime.js', import.meta.url), 'utf8');
+    const start = source.indexOf('globalThis.__catpaw_runtime_with_request = ');
+    const end = source.indexOf('const __sanitizeSeg', start);
+    assert.ok(start >= 0 && end > start);
+    // Evaluate this actual bootstrap-template fragment with the same route
+    // predicate interpolation. No child script or external network is needed.
+    const generated = new Function('isSpiderPanDetailRequest', `return \`${source.slice(start, end)}\`;`)(
+        spiderRoutes.isSpiderPanDetailRequest,
+    );
+    const als = new AsyncLocalStorage();
+    const context = {
+        globalThis: {}, __siteAls: als,
+        __extractSiteFromReqUrl: () => 'test:3',
+        __panCapture: { wrapResponse: res => { res.wrapped = true; } },
+    };
+    vm.runInNewContext(generated, context);
+    const handle = (_req, res) => ({ captured: !!als.getStore().panShares, wrapped: !!res.wrapped, site: als.getStore().site });
+    const wrap = context.globalThis.__catpaw_runtime_with_request;
+    for (const action of ['home', 'search', 'init', 'play', 'proxy', 'resources', 'refresh']) {
+        assert.deepEqual(wrap({ method: 'POST', url: `/spider/test/3/${action}` }, {}, handle),
+            { captured: false, wrapped: false, site: 'test:3' }, action);
+    }
+    for (const action of ['detail', 'category']) {
+        assert.deepEqual(wrap({ method: 'POST', url: `/spider/test/3/${action}?page=1` }, {}, handle),
+            { captured: true, wrapped: true, site: 'test:3' });
+        for (const method of ['GET', 'PUT']) {
+            assert.deepEqual(wrap({ method, url: `/spider/test/3/${action}` }, {}, handle),
+                { captured: false, wrapped: false, site: 'test:3' }, `${method} ${action}`);
+        }
+    }
+});
 
 async function fixture(t, handler) {
     const als = new AsyncLocalStorage();
@@ -93,6 +129,18 @@ test('concurrent detail requests never share captures; same-share repeated captu
     assert.equal(captures[0][0].password, 'abcd');
     assert.equal(captures[1][0].url, 'https://pan.quark.cn/s/shareB');
     assert.equal(captures[1][0].password, '');
+});
+
+test('capture does not silently discard distinct shares after an arbitrary item count', async t => {
+    const get = await fixture(t, (_req, res, capture) => {
+        for (let index = 0; index < 300; index += 1) record(capture, `share${index}`);
+        record(capture, 'share299', 'abcd');
+        res.end('{"list":[]}');
+    });
+    const captures = JSON.parse((await get()).body)._catpaw_pan_shares;
+    assert.equal(captures.length, 300);
+    assert.equal(captures[299].url, 'https://pan.quark.cn/s/share299');
+    assert.equal(captures[299].password, 'abcd');
 });
 
 test('native play and malformed/non-object detail bodies remain byte-for-byte unchanged', async t => {

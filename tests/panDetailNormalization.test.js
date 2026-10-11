@@ -49,6 +49,50 @@ test('real URL identity, password and mobile hash paths are independent of displ
     assert.deepEqual(extractPanSharesFromSource('百度-1234', ''), []);
 });
 
+test('episode-wrapped mobile hash routes retain every share and leave native routes unchanged', async () => {
+    const urls = [
+        'https://yun.139.com/shareweb/#/w/i/shareA?pwd=1234',
+        'https://caiyun.139.com/shareweb/#/m/i/shareB?passwd=5678',
+    ];
+    const group = urls.map((url, index) => `第${index + 1}集$${url}`).join('#');
+    assert.deepEqual(extractPanSharesFromSource('移动网盘', group).map(share => [share.shareId, share.password]),
+        [['shareA', '1234'], ['shareB', '5678']]);
+    const native = '第1集$https://video.example/shareweb/#/w/i/nativeA';
+    for (const panMock of [false, true]) {
+        const calls = [];
+        const out = await normalizePanDetailResponse(film('移动网盘$$$蓝光HDR', `${group}$$$${native}`), {
+            panMock,
+            listShare: async share => {
+                calls.push([share.shareId, share.password]);
+                return { ok: true, vod_play_url: `File$content*${share.shareId}***Movie.mkv` };
+            },
+        });
+        assert.equal(out.list[0].vod_play_from, '移动-shareA-1234$$$移动-shareB-5678$$$蓝光HDR');
+        assert.deepEqual(out.list[0].vod_play_url.split('$$$'), [
+            ...(panMock
+                ? ['https://caiyun.139.com/m/i?shareA&pwd=1234', 'https://caiyun.139.com/m/i?shareB&pwd=5678']
+                : ['File$content*shareA***Movie.mkv', 'File$content*shareB***Movie.mkv']),
+            native,
+        ]);
+        assert.deepEqual(calls, panMock ? [] : [['shareA', '1234'], ['shareB', '5678']]);
+    }
+});
+
+test('a bare leading share does not swallow later episodes or their passwords', () => {
+    for (const base of ['https://pan.quark.cn/s/', 'https://yun.139.com/shareweb/#/w/i/']) {
+        for (const prefix of ['', '第二集$']) {
+            const group = `${base}shareA?pwd=1234#${prefix}${base}shareB?pwd=5678`;
+            assert.deepEqual(extractPanSharesFromSource('原线路', group).map(share => [share.shareId, share.password]),
+                [['shareA', '1234'], ['shareB', '5678']]);
+        }
+    }
+    const encodedShare = encode({ providerId: 'quark', shareId: 'shareB', pwd: '5678' });
+    assert.deepEqual(extractPanSharesFromSource('夸克网盘', `https://pan.quark.cn/s/shareA?pwd=1234#${encodedShare}`)
+        .map(share => [share.shareId, share.password]), [['shareA', '1234'], ['shareB', '5678']]);
+    const single = extractPanSharesFromSource('夸克网盘', 'https://pan.quark.cn/s/shareA#/?pwd=1234');
+    assert.deepEqual(single.map(share => [share.shareId, share.password]), [['shareA', '1234']]);
+});
+
 test('all five providers keep share identity and optional password in the same flag in both modes', async () => {
     const urls = [
         'https://pan.baidu.com/s/11share-A_b',
@@ -157,6 +201,21 @@ test('only complete compatible IDs dispatch to built-in play, not new script pri
     assert.equal(isBuiltinPanPlayId('139', 'content*link***file.mkv'), true);
     assert.equal(isBuiltinPanPlayId('189', '123*456*file.mkv'), true);
     assert.equal(isBuiltinPanPlayId('189', 'native*opaque*id'), false);
+    for (const provider of ['quark', 'uc', '139']) {
+        assert.equal(isBuiltinPanPlayId(provider, 'https://cover.example/pic*Author*1:20****opaque-E65'), false, provider);
+    }
+});
+
+test('native media metadata under a supported-looking label is neither extracted nor replaced', async () => {
+    const id = 'https://cover.example/pic*Author*1:20****opaque-E65';
+    for (const label of ['夸克', 'UC', '移动']) for (const panMock of [false, true]) {
+        const input = film(label, `第1集$${id}`);
+        assert.deepEqual(extractPanSharesFromSource(label, input.list[0].vod_play_url), [], label);
+        const out = await normalizePanDetailResponse(input, {
+            panMock, listShare: () => assert.fail('unclaimed metadata must not trigger list'),
+        });
+        assert.deepEqual(out.list, input.list);
+    }
 });
 
 test('Tianyi numeric internal IDs are not converted to public share codes without evidence', async () => {

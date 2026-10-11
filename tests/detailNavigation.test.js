@@ -1,7 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { getDetailNavigation, normalizePanDetailResponse } from '../src/util/panmockDetailCodec.js';
-import { runPanListTask } from '../src/util/panListQueue.js';
 
 const movie = { detailUrl: 'https://site.example/movie/1', name: 'Movie', year: '2026' };
 const card = (mode, provider, url, extra = {}) => ({
@@ -79,42 +78,24 @@ test('request-wide captures cannot erase another film or unknown sibling', async
     assert.deepEqual(out.list.slice(1), [b, unknown]);
 });
 
-test('one list per provider, different providers overlap, failures release the queue', async () => {
-    let release, started;
-    const gate = new Promise(resolve => { release = resolve; });
-    const begun = new Promise(resolve => { started = resolve; });
-    const order = [];
-    const first = runPanListTask('baidu', async () => { order.push('a'); started(); await gate; throw Error('expected'); });
-    const caught = first.catch(error => error.message);
-    await begun;
-    const second = runPanListTask('baidu', async () => { order.push('b'); });
-    await runPanListTask('quark', async () => { order.push('q'); });
-    assert.deepEqual(order, ['a', 'q']);
-    release();
-    assert.equal(await caught, 'expected');
-    await second;
-    assert.deepEqual(order, ['a', 'q', 'b']);
-});
-
-test('ordinary complete detail list jobs are grouped by provider, not a global three slots', async () => {
+test('ordinary detail resolves different shares concurrently, including the same provider', async () => {
     const urls = ['https://pan.baidu.com/s/1shareA', 'https://pan.baidu.com/s/1shareB',
         'https://pan.quark.cn/s/shareC', 'https://drive.uc.cn/s/shareD',
         'https://cloud.189.cn/t/shareE', 'https://caiyun.139.com/m/i?shareF'];
     let release;
     const held = new Promise(resolve => { release = resolve; });
-    const active = new Set(), started = [];
+    const started = [];
+    let allStarted = false, timedOut = false;
     const work = normalizePanDetailResponse({ list: [{ vod_play_from: urls.map(() => 'source').join('$$$'),
         vod_play_url: urls.join('$$$') }] }, { panMock: false, listShare: async share => {
-        assert.equal(active.has(share.provider), false);
-        active.add(share.provider); started.push(share.provider);
-        if (started.length === 5) release();
+        started.push(share.shareId);
+        if (started.length === urls.length) { allStarted = true; release(); }
         await held;
-        active.delete(share.provider);
         return { ok: true, vod_play_url: `E$${share.shareId}` };
     } });
-    const timeout = setTimeout(() => release(), 1500);
+    const timeout = setTimeout(() => { timedOut = true; release(); }, 1500);
     try { await work; } finally { clearTimeout(timeout); }
-    assert.equal(new Set(started.slice(0, 5)).size, 5);
+    assert.equal(allStarted && !timedOut, true, 'a same-provider share waited for another list to finish');
     assert.equal(started.length, 6);
 });
 

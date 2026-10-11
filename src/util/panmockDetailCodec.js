@@ -164,13 +164,18 @@ export function extractPanSharesFromSource(flag, group, { placeholders = false }
         }
         if (share && (!found.has(share.key) || (!found.get(share.key).password && share.password))) found.set(share.key, share);
     };
-    const directShare = parsePanShareURL(group);
+    // Keep Mobile's hash route inside its URL, even after an episode title.
+    const parts = clean(group).split(/#(?!\/(?:w\/i|m\/i)\/)/);
+    const hasEpisodeTail = parts.slice(1).some(part =>
+        part.indexOf('$') > 0 || parsePanShareURL(part) || decodeStructuredDetailId(part));
+    // A URL at the start of an episode block must not consume later shares as
+    // its fragment (or append those episodes to the first share's password).
+    const directShare = hasEpisodeTail ? null : parsePanShareURL(group);
     add(directShare);
     add(parsePanShareURL(flag));
     // A mobile share URL can contain a hash route; it is not an episode separator.
     if (directShare) return Array.from(found.values());
     const provider = getSupportedPanProvider(flag);
-    const parts = clean(group).split('#');
     for (const part of parts) {
         const split = part.indexOf('$');
         const title = split >= 0 ? part.slice(0, split) : '';
@@ -208,8 +213,10 @@ export function extractPanSharesFromSource(flag, group, { placeholders = false }
         // Existing complete Quark/UC and Mobile IDs retain share identity.
         // Tianyi numeric share IDs are NOT share codes and cannot be used here.
         const tokens = id.split('*');
-        if ((provider === 'quark' || provider === 'uc') && tokens.length >= 4) add(shareFromId(provider, tokens[0]));
-        if (provider === '139' && tokens.length >= 3) add(shareFromId(provider, tokens[1]));
+        if (isBuiltinPanPlayId(provider, id)) {
+            if (provider === 'quark' || provider === 'uc') add(shareFromId(provider, tokens[0]));
+            if (provider === '139') add(shareFromId(provider, tokens[1]));
+        }
     }
     return Array.from(found.values());
 }
@@ -217,12 +224,13 @@ export function extractPanSharesFromSource(flag, group, { placeholders = false }
 export function isBuiltinPanPlayId(provider, value) {
     const id = clean(value);
     const parts = id.split('*');
+    const token = value => /^[A-Za-z0-9_-]+$/.test(value || '');
     if (provider === 'baidu') {
         const data = decodeStructuredDetailId(id);
         return !!(data && data.surl && data.shareid && data.uk && data.fs_id && !data.providerId);
     }
-    if (provider === 'quark' || provider === 'uc') return parts.length >= 4 && !!parts[0] && !!parts[1] && !!parts[2];
-    if (provider === '139') return parts.length >= 3 && !!parts[0] && !!parts[1];
+    if (provider === 'quark' || provider === 'uc') return parts.length >= 4 && token(parts[0]) && !!parts[1] && token(parts[2]) && !!parts[3];
+    if (provider === '139') return parts.length >= 3 && token(parts[0]) && token(parts[1]);
     if (provider === '189') return parts.length >= 3 && /^\d+$/.test(parts[0]) && /^\d+$/.test(parts[1]);
     return false;
 }
@@ -355,15 +363,9 @@ async function normalizePanDetailItem(item, captured, { panMock, listShare }) {
     const inputs = Array.from(shares.values());
     if (!inputs.length) return { item, diagnostics };
     const supported = new Array(inputs.length);
-    // Independent providers may run together; each provider advances one share
-    // at a time. The actual list entrypoint also gates across detail requests.
-    const queues = new Map();
-    inputs.forEach((share, index) => {
-        if (!queues.has(share.provider)) queues.set(share.provider, []);
-        queues.get(share.provider).push({ share, index });
-    });
-    await Promise.all(Array.from(queues.values(), async queue => {
-      for (const { share, index } of queue) {
+    // Different shares resolve independently, including shares on the same
+    // provider. Existing list caches still coalesce identical requests.
+    await Promise.all(inputs.map(async (share, index) => {
         if (panMock) {
             supported[index] = { flag: share.flag, group: share.url };
         } else {
@@ -377,7 +379,6 @@ async function normalizePanDetailItem(item, captured, { panMock, listShare }) {
                 diagnostics.push(`${share.flag}: ${share.provider === 'baidu' && /errno\s*=\s*-9(?!\d)/i.test(message) ? '分享链接已失效' : message}`);
             }
         }
-      }
     }));
     const native = leaves.filter((item) => !item.inputs.length && !item.captured);
     const groups = [...supported.filter(Boolean), ...native];
