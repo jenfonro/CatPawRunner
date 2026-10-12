@@ -1244,7 +1244,16 @@ export default async function router(fastify) {
                             reply.raw.writeHead(proxyRes.statusCode || 502, outHeaders);
                         } catch (_) {}
                         proxyRes.pipe(reply.raw);
-                        proxyRes.on('end', () => resolve());
+                        proxyRes.on('end', () => {
+                            // Only actual spider routes share automatic init's decoded identity.
+                            // An explicit successful init must not be immediately repeated.
+                            if (runtimeId && pathToUse.startsWith('/spider/') && proxyRes.statusCode >= 200 && proxyRes.statusCode < 300) {
+                                const tail = String(request.params && request.params['*'] || '').replace(/^\/+/, '');
+                                const init = /^spider\/([^/]+)\/(\d+)\/init$/.exec(tail);
+                                if (init) onlineSpiderInited.add(`${runtimeId}:${init[1]}:${init[2]}`);
+                            }
+                            resolve();
+                        });
                         return;
                     }
 

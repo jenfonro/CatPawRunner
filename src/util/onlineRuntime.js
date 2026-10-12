@@ -1895,7 +1895,7 @@ export async function startOnlineRuntime({
 			            try {
 			              let t = String(s == null ? '' : s).trim();
 			              if (!t) return '';
-			              t = t.replace(/\s+/g, '');
+			              t = t.replace(/\\s+/g, '');
 			              t = t.replace(/-/g, '+').replace(/_/g, '/');
 			              const mod = t.length % 4;
 			              if (mod === 2) t += '==';
@@ -1929,8 +1929,7 @@ export async function startOnlineRuntime({
 			            } catch (_) {}
 			            return typeof body === 'string' ? body.trim() : '';
 			          })();
-			          const dec = __aesDec(encBody);
-			          const obj = __tryParseJson(dec) || {};
+			          const obj = jsonBody || __tryParseJson(__aesDec(encBody)) || {};
 			          const req = obj && typeof obj === 'object' ? (obj.getOutLinkInfoReq || obj.dlFromOutLinkReq || obj.dlFromOutLinkReqV3 || null) : null;
 			          const linkID = req && typeof req === 'object' ? String(req.linkID || '').trim() : '';
 			          const pCaID = req && typeof req === 'object' ? String(req.pCaID || '').trim() : '';
@@ -2322,7 +2321,7 @@ export async function startOnlineRuntime({
 				          try {
 				            let t = String(s == null ? '' : s).trim();
 				            if (!t) return '';
-				            t = t.replace(/\s+/g, '');
+				            t = t.replace(/\\s+/g, '');
 				            t = t.replace(/-/g, '+').replace(/_/g, '/');
 				            const mod = t.length % 4;
 				            if (mod === 2) t += '==';
@@ -2355,9 +2354,9 @@ export async function startOnlineRuntime({
 				        const parseOutlinkReq = () => {
 				          try {
 				            const parsedBody = __tryParseJson(bodyLike);
+				            const plainJson = !!parsedBody && typeof parsedBody === 'object' && !Array.isArray(parsedBody);
 				            const enc = typeof parsedBody === 'string' ? parsedBody : typeof bodyLike === 'string' ? bodyLike.trim() : '';
-				            const dec = __aesDec(enc);
-				            const obj = __tryParseJson(dec) || {};
+				            const obj = plainJson ? parsedBody : __tryParseJson(__aesDec(enc)) || {};
 				            const req = obj && typeof obj === 'object' ? obj.getOutLinkInfoReq : null;
 				            const linkID = req && typeof req === 'object' ? String(req.linkID || '').trim() : '';
 				            const pCaID = req && typeof req === 'object' ? String(req.pCaID || '').trim() : '';
@@ -2365,14 +2364,14 @@ export async function startOnlineRuntime({
 				              req && typeof req === 'object'
 				                ? String(req.passwd || req.passwdStr || req.password || req.pwd || '').trim()
 				                : '';
-				            return { linkID, pCaID, passwd };
+				            return { linkID, pCaID, passwd, plainJson };
 				          } catch (_) {
 				            return { linkID: '', pCaID: '', passwd: '' };
 				          }
 				        };
 
 				        if (isOutLinkInfo) {
-				          const { linkID, pCaID, passwd } = parseOutlinkReq();
+				          const { linkID, pCaID, passwd, plainJson } = parseOutlinkReq();
 				          try {
 				            const k = String(linkID || '').trim();
 				            if (k) __placeholderCache['139'].set(k, { shareCode: k, password: String(passwd || '').trim() });
@@ -2403,8 +2402,9 @@ export async function startOnlineRuntime({
 				              ],
 				            },
 				          };
-				          const enc = __aesEnc(JSON.stringify(outObj));
-				          return { kind: 'outlink_info', payload: JSON.stringify(enc) };
+				          // Match the script's protocol: newer clients use plain JSON,
+				          // while older clients expect a JSON-wrapped AES string.
+				          return { kind: 'outlink_info', payload: JSON.stringify(plainJson ? outObj : __aesEnc(JSON.stringify(outObj))) };
 				        }
 
 				        return {
@@ -4210,6 +4210,7 @@ export async function startOnlineRuntime({
         'livetovod',
         'server',
       ].forEach(ensureObj);
+      if (typeof srv.config.baidu.cookie !== 'string') srv.config.baidu.cookie = '';
       if (!Array.isArray(srv.config.pans.list)) srv.config.pans.list = [];
       if (!Array.isArray(srv.config.sites.list)) srv.config.sites.list = [];
       if (typeof srv.config.server.url !== 'string') srv.config.server.url = '';
